@@ -1,0 +1,7 @@
+web3==6.19.0
+psycopg2-binary
+python-dotenv
+cryptography
+requests
+tenacity
+supabase
