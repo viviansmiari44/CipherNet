@@ -1,0 +1,11 @@
+2026-07-06 14:18:06,282 - duster - WARNING - supabase-py not installed; Telegram per-user notifications disabled.
+2026-07-06 14:18:07,706 - duster - INFO - Connected to RPC: https://bnb-mainnet.g.alchemy.com/v2/EbId-iiFkDb4bcjlJpkE4
+2026-07-06 14:18:07,737 - duster - INFO - Source wallet: 0x2eE784F2AC9926B6637A02120E0F3E76D3B40025
+2026-07-06 14:18:07,917 - duster - INFO - BNB balance: 5.25E-7 BNB
+2026-07-06 14:18:09,038 - duster - INFO - USDC balance: 0.000000 USDC
+2026-07-06 14:18:09,038 - duster - INFO - USDT balance: 0.000000 USDT
+2026-07-06 14:18:09,040 - duster - ERROR - vault_bsc.txt not found.
+2026-07-06 14:18:09,040 - duster - ERROR - No addresses found in vault.txt
+2026-07-06 14:18:24,089 - duster - WARNING - supabase-py not installed; Telegram per-user notifications disabled.
+2026-07-06 14:18:24,776 - duster - INFO - Connected to RPC: https://bnb-mainnet.g.alchemy.com/v2/EbId-iiFkDb4bcjlJpkE4
+2026-07-06 14:18:24,779 - duster - ERROR - vault_bsc.txt not found.
