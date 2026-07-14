@@ -95,5 +95,12 @@ module.exports = {
       autorestart: true,
       max_memory_restart: '500M',
     },
+    {
+      name: 'webhook',
+      script: 'webhook-server.js',
+      env: { NODE_ENV: 'production' },
+      autorestart: true,
+      max_memory_restart: '500M',
+    },
   ],
 };

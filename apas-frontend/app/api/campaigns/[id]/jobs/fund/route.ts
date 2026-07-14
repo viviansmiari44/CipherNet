@@ -2,9 +2,6 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getAuthUser } from '@app-lib/auth';
 import { createServerSupabaseClient } from '@app-lib/supabaseServer';
 import { decrypt } from '@app-lib/encryption';
-import { spawn } from 'node:child_process';
-import path from 'node:path';
-import fs from 'fs';
 import { sendAlert } from '@app-lib/notifier';
 
 export async function POST(
@@ -64,54 +61,25 @@ export async function POST(
   // Send "started" notification
   await sendAlert(`🚀 Funding job started for chain ${campaign.chain} (Job ID: ${job.id})`, 'info', id);
 
-  // ✅ Correct path: batch_fund.py (root)
-  const scriptPath = path.resolve(process.cwd(), '../batch_fund.py');
-  const projectRoot = path.resolve(process.cwd(), '..');
-
-  if (!fs.existsSync(scriptPath)) {
-    console.error('[fund] Script not found:', scriptPath);
-    await sendAlert(`❌ Funding job failed: Script not found at ${scriptPath}`, 'error', id);
-    return NextResponse.json({ error: 'Script not found' }, { status: 500 });
+  // ─── Send webhook ───
+  const webhookUrl = `${process.env.WEBHOOK_BASE_URL}/webhook/job`;
+  try {
+    await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jobId: job.id,
+        campaignId: campaign.id,
+        chain: campaign.chain,
+        type: 'fund',
+        fundingPrivateKey: fundingKey, // encrypted or plain? The backend expects it; we send it here.
+      }),
+    });
+    console.log(`[fund] Webhook sent to ${webhookUrl}`);
+  } catch (err) {
+    console.error('[fund] Webhook error:', err);
+    await sendAlert(`⚠️ Funding job scheduled but webhook delivery failed. The job may not run.`, 'error', id);
   }
-
-  console.log(`[fund] Spawning: python3 ${scriptPath} --job-id ${job.id}`);
-
-  const child = spawn('python3', [scriptPath, '--job-id', job.id], {
-    env: {
-      ...process.env,
-      CHAIN: campaign.chain,
-      SOURCE_PRIVATE_KEY: fundingKey,
-      NEXT_PUBLIC_SUPABASE_URL: process.env.NEXT_PUBLIC_SUPABASE_URL,
-      SUPABASE_SERVICE_ROLE_KEY: process.env.SUPABASE_SERVICE_ROLE_KEY,
-    },
-    cwd: projectRoot,
-    detached: true,
-    stdio: 'pipe',
-  });
-
-  child.stdout.on('data', (data) => {
-    console.log(`[fund stdout] ${data.toString().trim()}`);
-  });
-
-  child.stderr.on('data', (data) => {
-    console.error(`[fund stderr] ${data.toString().trim()}`);
-  });
-
-  child.on('error', async (err) => {
-    console.error('[fund] Spawn error:', err);
-    await sendAlert(`❌ Funding job failed: Spawn error - ${err.message}`, 'error', id);
-  });
-
-  child.on('close', async (code) => {
-    console.log(`[fund] Process exited with code ${code}`);
-    if (code !== 0) {
-      await sendAlert(`❌ Funding job failed: Process exited with code ${code} for campaign ${campaign.chain}`, 'error', id);
-    } else {
-      await sendAlert(`✅ Funding job completed successfully for campaign ${campaign.chain}`, 'info', id);
-    }
-  });
-
-  child.unref();
 
   return NextResponse.json(
     { jobId: job.id, message: `Funding started for chain ${campaign.chain}` },
