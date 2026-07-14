@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { supabase } from '@/lib/supabaseClient';
+import { supabase } from '@app-lib/supabaseClient';
 import { useRouter } from 'next/navigation';
 import { 
   ArrowLeft, Copy, Check, Clock, AlertCircle, CheckCircle, Loader2, 

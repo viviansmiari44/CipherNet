@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getAuthUser } from '@/lib/auth';
-import { createServerSupabaseClient } from '@/lib/supabaseServer';
+import { getAuthUser } from '@app-lib/auth';
+import { createServerSupabaseClient } from '@app-lib/supabaseServer';
 
 // Updated to accept any thenable/builder and safely convert it to a Promise
 const fetchWithTimeout = async (promise: any, ms: number) => {

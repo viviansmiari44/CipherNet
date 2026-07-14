@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getAuthUser } from '@/lib/auth';
-import { supabase } from '@/lib/supabaseClient';
-import { supabaseService } from '@/lib/supabaseService'; // ✅ import service role
+import { getAuthUser } from '@app-lib/auth';
+import { supabase } from '@app-lib/supabaseClient';
+import { supabaseService } from '@app-lib/supabaseService'; // ✅ import service role
 
 export async function PUT(
   req: NextRequest,

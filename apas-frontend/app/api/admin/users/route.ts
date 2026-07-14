@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getAuthUser } from '@/lib/auth';
-import { createServerSupabaseClient } from '@/lib/supabaseServer';
-import { supabaseService } from '@/lib/supabaseService';
+import { getAuthUser } from '@app-lib/auth';
+import { createServerSupabaseClient } from '@app-lib/supabaseServer';
+import { supabaseService } from '@app-lib/supabaseService';
 
 export async function GET(req: NextRequest) {
   console.log('[admin] Route /api/admin/users called');

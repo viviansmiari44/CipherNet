@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getAuthUser } from '@/lib/auth';
-import { createServerSupabaseClient } from '@/lib/supabaseServer';
+import { getAuthUser } from '@app-lib/auth';
+import { createServerSupabaseClient } from '@app-lib/supabaseServer';
 
 export async function GET(
   req: NextRequest,

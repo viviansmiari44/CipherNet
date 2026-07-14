@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { supabase } from '@/lib/supabaseClient';
+import { supabase } from '@app-lib/supabaseClient';
 
 export default function NewCampaignPage() {
   const router = useRouter();

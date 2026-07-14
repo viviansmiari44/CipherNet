@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getAuthUser } from '@/lib/auth';
-import { createServerSupabaseClient } from '@/lib/supabaseServer';
-import { encrypt } from '@/lib/encryption';
+import { getAuthUser } from '@app-lib/auth';
+import { createServerSupabaseClient } from '@app-lib/supabaseServer';
+import { encrypt } from '@app-lib/encryption';
 
 export async function POST(req: NextRequest) {
   try {

@@ -1,5 +1,5 @@
 // Re-export the root notifier with a type that accepts string campaign IDs.
-import { sendAlert as originalSendAlert } from '../../lib/notifier.js';
+import { sendAlert as originalSendAlert } from '@app-lib/notifier.js';
 
 // The original function accepts a string for campaignId (plus null/undefined),
 // so we cast it to the type that matches our usage.

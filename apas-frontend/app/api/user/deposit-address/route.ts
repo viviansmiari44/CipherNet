@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getAuthUser } from '@/lib/auth';
-import { supabaseService } from '@/lib/supabaseService';
-import { getDepositAddress } from '@/lib/hdWallet';
+import { getAuthUser } from '@app-lib/auth';
+import { supabaseService } from '@app-lib/supabaseService';
+import { getDepositAddress } from '@app-lib/hdWallet';
 
 // ────────────────────────────────────────────────────────────────
 // ALCHEMY REGISTRATION

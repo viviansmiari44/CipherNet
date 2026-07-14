@@ -1,4 +1,4 @@
-import { createServerSupabaseClient } from '@/lib/supabaseServer';
+import { createServerSupabaseClient } from '@app-lib/supabaseServer';
 import TrapsList from '@/components/TrapsList';
 import JobButtons from '@/components/JobButtons';
 import BalanceCard from '@/components/BalanceCard';

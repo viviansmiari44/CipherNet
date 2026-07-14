@@ -1,11 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getAuthUser } from '@/lib/auth';
-import { createServerSupabaseClient } from '@/lib/supabaseServer';
-import { decrypt } from '@/lib/encryption';
+import { getAuthUser } from '@app-lib/auth';
+import { createServerSupabaseClient } from '@app-lib/supabaseServer';
+import { decrypt } from '@app-lib/encryption';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import fs from 'fs';
-import { sendAlert } from '@/lib/notifier';
+import { sendAlert } from '@app-lib/notifier';
 
 export async function POST(
   req: NextRequest,

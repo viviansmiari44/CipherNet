@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
-import { supabase } from '@/lib/supabaseClient';
+import { supabase } from '@app-lib/supabaseClient';
 import Link from 'next/link';
 import { Settings, Shield, LogOut, User } from 'lucide-react';
 import CreditsCard from '@/components/CreditsCard';
