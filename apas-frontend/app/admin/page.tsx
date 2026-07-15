@@ -248,6 +248,15 @@ export default function AdminPage() {
         >
          Pending Users
         </Link>
+
+        <Link
+            href="/admin/clore"
+            className={`text-sm font-medium transition-colors ${
+                pathname === '/admin/clore' ? 'text-blue-400' : 'text-gray-400 hover:text-white'
+            }`}
+            >
+            ⚙️ Clore
+            </Link>
         </div>
 
         {/* Table */}

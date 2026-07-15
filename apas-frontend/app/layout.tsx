@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "TrapForge – Address Poisoning as a Service",
+  title: "CypherNet – Address Poisoning as a Service",
   description: "Automated address poisoning and trap management for Web3 security professionals.",
   icons: {
     icon: "/favicon.ico",
