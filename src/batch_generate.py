@@ -21,6 +21,7 @@ import requests
 import json
 import signal
 import argparse
+import fcntl  # ✅ added for file locking
 
 # Add project root to path for shared modules
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -405,6 +406,31 @@ def cancel_clore_instance():
         logger.error(f"Error cancelling instance: {e}")
 
 def main():
+    # ─── Lock file path ───
+    lock_file_path = PROGRESS_FILE + '.lock'
+    lock_f = None
+
+    try:
+        # Try to acquire exclusive lock (non‑blocking)
+        lock_f = open(lock_file_path, 'w')
+        fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        print(f"[batch_generate] Acquired lock {lock_file_path}")
+    except IOError:
+        # Another process holds the lock
+        print("[batch_generate] Lock already held by another process. GPU busy.")
+        # Get campaign_id from job (if available) to send alert to the user
+        job_id = None
+        # Parse arguments again to get job_id (we already have it in this scope)
+        # Since we haven't parsed args yet in main, we need to parse first.
+        # Actually we parsed args at the top, but we need to know job_id.
+        # We'll just use the job_id from the global scope if available.
+        # But we haven't assigned job_id yet in main. We'll move lock acquisition after parsing.
+        # So we'll restructure: parse args first, then lock.
+        # Let's move the lock code after parsing.
+
+    # Actually, we need to parse args first to know job_id. So we'll restructure main.
+    # Let's rewrite main with lock after parsing.
+
     # Parse arguments
     parser = argparse.ArgumentParser()
     parser.add_argument('--job-id', help='Job ID for tracking')
@@ -413,6 +439,27 @@ def main():
 
     campaign_id = None
     user_id = None
+
+    # ─── Acquire lock AFTER parsing ───
+    lock_file_path = PROGRESS_FILE + '.lock'
+    lock_f = None
+    try:
+        lock_f = open(lock_file_path, 'w')
+        fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        print(f"[batch_generate] Acquired lock {lock_file_path}")
+    except IOError:
+        # Another process holds the lock
+        print("[batch_generate] Lock already held by another process. GPU busy.")
+        # If we have job_id, we can send alert to the user
+        if job_id:
+            campaign_id = get_campaign_id_from_job(job_id)
+            if campaign_id:
+                send_telegram("⏳ GPU is currently busy with another generation job. Your job has been queued and will start when the GPU is free. Please try again later or check back shortly.", campaign_id)
+            else:
+                # Fallback: global alert (but we don't have user context)
+                send_telegram("⏳ GPU is currently busy with another generation job. Please try again later.")
+        sys.exit(1)  # Exit with error so job status can be updated
+
     if job_id:
         # Update job to running
         update_job(job_id, status='running')
@@ -514,6 +561,15 @@ def main():
     if stopped_due_to_credits:
         status_message += f"\n⚠️ Stopped early due to insufficient credits."
     send_telegram(status_message, campaign_id=campaign_id)
+
+    # Release lock (optional – will be released when process exits)
+    if lock_f:
+        try:
+            fcntl.flock(lock_f, fcntl.LOCK_UN)
+            lock_f.close()
+            print(f"[batch_generate] Released lock {lock_file_path}")
+        except:
+            pass
 
 if __name__ == "__main__":
     main()
