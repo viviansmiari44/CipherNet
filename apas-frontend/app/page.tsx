@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { Shield, Zap, Coins, Layers, ArrowRight, CheckCircle, TrendingUp, Wallet, DollarSign, Users } from "lucide-react";
+import { Shield, Zap, Coins, Layers, ArrowRight, CheckCircle, TrendingUp, Wallet, DollarSign, Users, Info } from "lucide-react";
 
 export default function Home() {
   return (
@@ -13,19 +13,23 @@ export default function Home() {
           </span>
         </div>
         <div className="flex items-center gap-4">
-          <Link
-            href="/login"
-            className="text-sm text-gray-300 hover:text-white transition-colors hidden sm:inline"
-          >
-            Log In
-          </Link>
-          <Link
-            href="/register"
-            className="text-sm px-4 py-2 bg-gradient-to-r from-blue-600 to-purple-600 rounded-lg hover:from-blue-500 hover:to-purple-500 transition-all shadow-lg shadow-blue-500/25"
-          >
-            Get Started
-          </Link>
-        </div>
+<Link
+  href="/how-it-works"
+  className="inline-flex items-center gap-2 px-5 py-2.5 border border-blue-500/40 rounded-xl text-sm font-medium text-blue-400 hover:bg-blue-500/20 hover:border-blue-400 hover:text-blue-300 transition-all duration-200 shadow-[0_0_15px_rgba(59,130,246,0.15)]"
+>
+  <Info className="w-4 h-4" />
+  How It Works
+</Link>
+  <Link href="/login" className="text-sm text-gray-300 hover:text-white transition-colors hidden sm:inline">
+    Log In
+  </Link>
+  <Link
+    href="/register"
+    className="text-sm px-4 py-2 bg-gradient-to-r from-blue-600 to-purple-600 rounded-lg hover:from-blue-500 hover:to-purple-500 transition-all shadow-lg shadow-blue-500/25"
+  >
+    Get Started
+  </Link>
+</div>
       </nav>
 
       {/* ── Hero ── */}
@@ -215,6 +219,13 @@ export default function Home() {
           </div>
           <p>&copy; {new Date().getFullYear()} CipherNet. All rights reserved.</p>
           <div className="flex gap-4">
+            <Link
+  href="/how-it-works"
+  className="inline-flex items-center gap-2 px-5 py-2.5 border border-blue-500/40 rounded-xl text-sm font-medium text-blue-400 hover:bg-blue-500/20 hover:border-blue-400 hover:text-blue-300 transition-all duration-200 shadow-[0_0_15px_rgba(59,130,246,0.15)]"
+>
+  <Info className="w-4 h-4" />
+  How It Works
+</Link>
             <a href="#" className="hover:text-gray-300 transition-colors">Privacy</a>
             <a href="#" className="hover:text-gray-300 transition-colors">Terms</a>
             <a href="#" className="hover:text-gray-300 transition-colors">Support</a>
