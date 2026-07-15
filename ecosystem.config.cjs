@@ -97,7 +97,7 @@ module.exports = {
     },
     {
       name: 'webhook',
-      script: 'webhook-server.js',
+      script: 'webhook-server.cjs',
       env: { NODE_ENV: 'production' },
       autorestart: true,
       max_memory_restart: '500M',
