@@ -66,7 +66,9 @@ export async function POST(
   try {
     await fetch(webhookUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json',
+      'x-webhook-secret': process.env.WEBHOOK_SECRET || '',
+       },
       body: JSON.stringify({
         jobId: job.id,
         campaignId: campaign.id,

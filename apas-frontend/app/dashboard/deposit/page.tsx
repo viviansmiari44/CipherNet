@@ -460,7 +460,7 @@ export default function DepositPage() {
       {/* Info */}
       <div className="mt-6 bg-gray-800/50 backdrop-blur-sm border border-gray-700 rounded-2xl p-4 text-xs text-gray-400 space-y-1">
         <p>• Automatic deposits: credited after <span className="text-white font-medium">6 confirmations</span> (~1-2 minutes).</p>
-        <p>• Manual deposit requests: reviewed by admin, usually within 24 hours.</p>
+        <p>• Manual deposit requests: reviewed by admin, usually within 20 minutes.</p>
           <p>
             • Minimum deposit: <span className="text-white font-medium">$50</span> equivalent – 
             <span className="text-blue-400"> enough to power RTX 5090 GPU renting. Can generate upto 50 Traps</span>
