@@ -1,16 +1,22 @@
-import pg from 'pg';
 import { appendFile, readFile } from 'fs/promises';
+import { createClient } from '@supabase/supabase-js';
 
 import { config } from '../lib/config.js';
 import logger from '../lib/logger.js';
 import { sendAlert, formatAlert } from '../lib/notifier.js';
 import { setupGracefulShutdown, onShutdown } from '../lib/shutdown.js';
 
-const { Pool } = pg;
+// ─── Supabase client ───
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+if (!supabaseUrl || !supabaseKey) {
+  console.error('[observer] Missing Supabase credentials. Exiting.');
+  process.exit(1);
+}
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 // --- Configuration from central config ---
 const {
-  db,
   files,
 } = config;
 
@@ -20,15 +26,6 @@ const chainCfg = config.getChainConfig ? config.getChainConfig() : null;
 const chainId = chainCfg?.chainId || 1;
 
 logger.info(`[Multi‑chain] Observer running for chain: ${chainName} (ID: ${chainId})`);
-
-// --- Database pool ---
-const pool = new Pool({
-  user: db.user,
-  host: db.host,
-  database: db.database,
-  password: db.password,
-  port: db.port,
-});
 
 // --- Qualified pairs polling interval (default 10 minutes) ---
 const QUALIFIED_POLL_INTERVAL_MS = parseInt(
@@ -44,10 +41,10 @@ const BLOCKS_30_DAYS_MAP = {
 };
 const BLOCKS_30_DAYS = BLOCKS_30_DAYS_MAP[chainName] || 216000n;
 
-// FIX 2: Mutex lock to prevent overlapping database queries
+// Mutex lock to prevent overlapping database queries
 let isFetching = false;
 
-// --- Helper: retry wrapper for DB queries ---
+// --- Helper: retry wrapper for DB queries (now using supabase.rpc) ---
 async function withRetry(fn, context, maxAttempts = 3, baseDelay = 1000) {
   let lastError;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -97,44 +94,44 @@ async function fetchPendingTargets() {
       logger.info('No existing pending file found, starting fresh.');
     }
 
-    // 2. Get the max block number for this chain from the database
-    const maxBlockQuery = `
-      SELECT MAX(block_number) AS max_block
-      FROM token_transfers
-      WHERE chain_id = $1
-    `;
-    const maxBlockResult = await pool.query(maxBlockQuery, [chainId]);
-    const maxBlock = maxBlockResult.rows[0]?.max_block;
-    
-    if (!maxBlock) {
+    // 2. Get the max block number for this chain from Supabase
+    const { data: maxBlockData, error: maxBlockError } = await supabase
+      .from('token_transfers')
+      .select('block_number')
+      .eq('chain_id', chainId)
+      .order('block_number', { ascending: false })
+      .limit(1);
+
+    if (maxBlockError || !maxBlockData || maxBlockData.length === 0) {
       logger.info('No transfers found in database for this chain yet.');
       return;
     }
-    
+
+    const maxBlock = maxBlockData[0].block_number;
     const maxBlockBigInt = BigInt(maxBlock);
     
-    // FIX 3: Safe threshold calculation preventing negative block numbers
     const blockDiff = Number(maxBlockBigInt - BLOCKS_30_DAYS);
     const thresholdBlock = Math.max(0, blockDiff);
 
-    const query = `
-      SELECT sender, receiver, COUNT(*) as freq, MAX(block_number) as last_block
-      FROM token_transfers
-      WHERE chain_id = $1
-        AND value::NUMERIC > 0
-      GROUP BY sender, receiver
-      HAVING COUNT(*) >= 7 AND MAX(block_number) >= $2
-      ORDER BY freq DESC, last_block DESC;
-    `;
-    const result = await pool.query(query, [chainId, thresholdBlock]);
+    // 3. Call the SQL function via RPC
+    const { data: rows, error: rpcError } = await supabase
+      .rpc('fetch_pending_targets', {
+        chain_id_param: chainId,
+        threshold_block: thresholdBlock,
+      });
 
-    if (result.rows.length === 0) {
+    if (rpcError) {
+      logger.error(`RPC error: ${rpcError.message}`);
+      return;
+    }
+
+    if (!rows || rows.length === 0) {
       logger.info('No qualified pairs found in this run.');
       return;
     }
 
     const newLines = [];
-    for (const row of result.rows) {
+    for (const row of rows) {
       const cp = row.receiver.toLowerCase();
       const v = row.sender.toLowerCase();
       const key = `${cp}|${v}`;
@@ -173,10 +170,8 @@ async function startObserver() {
   logger.info(`Polling interval: ${QUALIFIED_POLL_INTERVAL_MS / 1000} seconds`);
   logger.info(`30‑day block window for ${chainName}: ${BLOCKS_30_DAYS} blocks`);
 
-  // Run immediately on start
   await fetchPendingTargets();
 
-  // Then schedule periodic runs
   setInterval(async () => {
     try {
       await fetchPendingTargets();
@@ -190,9 +185,8 @@ async function startObserver() {
 setupGracefulShutdown();
 
 onShutdown(async () => {
-  logger.info('Closing database connections...');
-  await pool.end();
-  logger.info('Database closed.');
+  logger.info('Observer shutting down gracefully.');
+  // No database pool to close – Supabase client handles it automatically.
 });
 
 // --- Start ---

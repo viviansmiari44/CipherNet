@@ -1,12 +1,19 @@
 import 'dotenv/config';
 import { createPublicClient, http, parseAbiItem } from 'viem'; 
 import { mainnet, bsc, polygon } from 'viem/chains';
-import pg from 'pg';
+import { createClient } from '@supabase/supabase-js';
 
 import { config } from '../lib/config.js';
 import logger from '../lib/logger.js';
 
-const { Pool } = pg;
+// ─── Supabase client ───
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+if (!supabaseUrl || !supabaseKey) {
+  console.error('[collector] Missing Supabase credentials. Exiting.');
+  process.exit(1);
+}
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 // --- MULTI‑CHAIN: get chain‑specific configs (with legacy fallback) ---
 const chainName = config.chain || 'ethereum';
@@ -32,15 +39,6 @@ const chainRpc = chainCfg?.rpc || process.env.NODE_RPC_URL;
 
 logger.info(`[Multi‑chain] Collector started on ${chainName} (${viemChain.name}), RPC: ${chainRpc}`);
 
-// 1. Initialize Database Connection
-const pool = new Pool({
-  user: process.env.DB_USER,
-  host: process.env.DB_HOST,
-  database: process.env.DB_NAME,
-  password: String(process.env.DB_PASSWORD),
-  port: process.env.DB_PORT,
-});
-
 // 2. Connect to the RPC node via HTTPS
 const client = createPublicClient({
   chain: viemChain,
@@ -56,9 +54,7 @@ const transferEvent = parseAbiItem(
 let MONITORED_TOKENS = {};
 
 if (chainCfg && chainCfg.tokens) {
-  // Build from chain config tokens
   for (const [symbol, address] of Object.entries(chainCfg.tokens)) {
-    // Determine decimals: we can set defaults based on symbol
     let decimals = 18;
     if (symbol === 'USDC' || symbol === 'USDT' || symbol === 'BUSD') {
       decimals = 6;
@@ -68,7 +64,6 @@ if (chainCfg && chainCfg.tokens) {
     MONITORED_TOKENS[address.toLowerCase()] = { symbol, decimals };
   }
 } else {
-  // Fallback to hardcoded Ethereum mainnet tokens
   MONITORED_TOKENS = {
     '0xdac17f958d2ee523a2206206994597c13d831ec7': { symbol: 'USDT', decimals: 6 },
     '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48': { symbol: 'USDC', decimals: 6 },
@@ -78,14 +73,11 @@ if (chainCfg && chainCfg.tokens) {
 }
 
 // ─── Updated threshold: $5,000 USD equivalent ───
-// For native tokens, we set a fixed wei value (~3 native tokens, adjust via env if needed)
-// Override with CHAIN_NATIVE_THRESHOLD_WEI env var
 const NATIVE_THRESHOLD_WEI = BigInt(
   process.env[`${chainName.toUpperCase()}_NATIVE_THRESHOLD_WEI`] || '3000000000000000000'
-); // 3 native tokens (approx $5k at $1,666 per token)
+); // 3 native tokens
 const NATIVE_ADDRESS = '0x0000000000000000000000000000000000000000';
 
-// Keep track of the last block we saw in memory and execution state
 let lastProcessedBlock = 0n; 
 let isProcessing = false;
 
@@ -94,7 +86,6 @@ async function startCollector() {
   console.log(`[+] Monitoring assets: ${Object.values(MONITORED_TOKENS).map(t => t.symbol).join(', ')} and Native ${nativeSymbol}`);
   console.log(`[+] Filtering dust: Only saving transfers >= $5,000 equivalent (${NATIVE_THRESHOLD_WEI} wei native)`);
 
-  // Run this check exactly every 4 seconds (adjust for slower chains if needed)
   setInterval(async () => {
     if (isProcessing) return;
     isProcessing = true;
@@ -112,7 +103,6 @@ async function startCollector() {
         for (let i = lastProcessedBlock + 1n; i <= currentBlock; i++) {
           console.log(`\n[!] Block ${i} mined! Fetching transfer logs and block transactions...`);
           
-          // Fetch ERC-20 logs
           const logs = await client.getLogs({
             event: transferEvent,
             address: Object.keys(MONITORED_TOKENS),
@@ -120,18 +110,15 @@ async function startCollector() {
             toBlock: i,
           });
 
-          // Fetch full block transactions to process native transfers
           const blockWithTx = await client.getBlock({
             blockNumber: i,
             includeTransactions: true,
           });
 
-          const values = [];
-          const queryPlaceholders = [];
-          let counter = 1;
+          const insertData = [];
           let ingestedCount = 0;
 
-          // Process ERC-20 Logs
+          // ─── Process ERC-20 Logs ───
           if (logs.length > 0) {
             logs.forEach((log) => {
               if (!log.args || !log.args.from || !log.args.to || !log.args.value) return; 
@@ -140,55 +127,62 @@ async function startCollector() {
               const tokenMeta = MONITORED_TOKENS[tokenAddress];
               if (!tokenMeta) return;
 
-              // ─── $5,000 threshold ───
               const minTransferValue = 5000n * (10n ** BigInt(tokenMeta.decimals));
               if (log.args.value < minTransferValue) return;
 
               ingestedCount++;
-              queryPlaceholders.push(`($${counter++}, $${counter++}, $${counter++}, $${counter++}, $${counter++}, $${counter++}, $${counter++})`);
-              values.push(
-                log.transactionHash,
-                Number(i),
-                tokenAddress,       
-                log.args.from.toLowerCase(),     
-                log.args.to.toLowerCase(),       
-                log.args.value.toString(),
-                chainId
-              );
+              insertData.push({
+                transaction_hash: log.transactionHash,
+                block_number: Number(i),
+                token_address: tokenAddress,
+                sender: log.args.from.toLowerCase(),
+                receiver: log.args.to.toLowerCase(),
+                value: log.args.value.toString(),
+                chain_id: chainId,
+              });
             });
           }
 
-          // Process Native transfers (ETH, BNB, MATIC, etc.)
+          // ─── Process Native transfers ───
           if (blockWithTx && blockWithTx.transactions) {
             for (const tx of blockWithTx.transactions) {
               if (tx.value && tx.value >= NATIVE_THRESHOLD_WEI && tx.to) {
                 if (!tx.from || !tx.to) continue;
 
                 ingestedCount++;
-                queryPlaceholders.push(`($${counter++}, $${counter++}, $${counter++}, $${counter++}, $${counter++}, $${counter++}, $${counter++})`);
-                values.push(
-                  tx.hash,
-                  Number(i),
-                  NATIVE_ADDRESS,
-                  tx.from.toLowerCase(),
-                  tx.to.toLowerCase(),
-                  tx.value.toString(),
-                  chainId
-                );
+                insertData.push({
+                  transaction_hash: tx.hash,
+                  block_number: Number(i),
+                  token_address: NATIVE_ADDRESS,
+                  sender: tx.from.toLowerCase(),
+                  receiver: tx.to.toLowerCase(),
+                  value: tx.value.toString(),
+                  chain_id: chainId,
+                });
               }
             }
           }
 
-          if (values.length > 0) {
-            const query = `
-              INSERT INTO token_transfers 
-              (transaction_hash, block_number, token_address, sender, receiver, value, chain_id) 
-              VALUES ${queryPlaceholders.join(', ')}
-              ON CONFLICT (transaction_hash) DO NOTHING;
-            `;
-            
-            await pool.query(query, values);
-            console.log(`[+] Block ${i}: Successfully ingested ${ingestedCount} high-value transfers (ERC-20 + Native ${nativeSymbol}).`);
+          // ─── Insert into Supabase ───
+          if (insertData.length > 0) {
+            try {
+              const { error } = await supabase
+                .from('token_transfers')
+                .insert(insertData);
+
+              if (error) {
+                // 23505 = unique violation (duplicate transaction_hash)
+                if (error.code === '23505') {
+                  console.log(`[-] Some transfers already exist in the database. Skipping duplicates.`);
+                } else {
+                  console.error('[collector] Insert error:', error);
+                }
+              } else {
+                console.log(`[+] Block ${i}: Successfully ingested ${ingestedCount} high-value transfers (ERC-20 + Native ${nativeSymbol}).`);
+              }
+            } catch (err) {
+              console.error('[collector] Insert exception:', err);
+            }
           } else {
             console.log(`[-] Block ${i}: No transfers met the $5,000 threshold criteria.`);
           }
