@@ -239,7 +239,7 @@ export default function HowItWorksPage() {
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
           <div className="bg-gray-800/40 backdrop-blur-sm border border-gray-700 rounded-2xl p-6">
             <h4 className="text-white font-medium">Do I need my own GPU?</h4>
-            <p className="text-gray-400 text-sm mt-2">No. We rent GPU capacity from Clore.ai on demand – you only pay per generated key.</p>
+            <p className="text-gray-400 text-sm mt-2">No. We rent GPU capacity on demand – you only pay per generated key.</p>
           </div>
           <div className="bg-gray-800/40 backdrop-blur-sm border border-gray-700 rounded-2xl p-6">
             <h4 className="text-white font-medium">Which chains are supported?</h4>
