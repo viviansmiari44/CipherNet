@@ -72,10 +72,78 @@ if (chainCfg && chainCfg.tokens) {
   };
 }
 
-// ─── Updated threshold: $5,000 USD equivalent ───
-const NATIVE_THRESHOLD_WEI = BigInt(
-  process.env[`${chainName.toUpperCase()}_NATIVE_THRESHOLD_WEI`] || '3000000000000000000'
-); // 3 native tokens
+// ─── USD Price Cache & Oracle (Production-ready $3,000 dynamic filtering) ───
+const PRICES = {
+  USDT: 1.0,
+  USDC: 1.0,
+  DAI: 1.0,
+  BUSD: 1.0,
+  ETH: 1880.0,
+  WETH: 1880.0,
+  BNB: 578.0,
+  MATIC: 0.08,
+  POL: 0.08,
+  WBTC: 64000.0,
+};
+
+// Simple, production-ready price updater (Will not block execution if API fails)
+async function updatePrices() {
+  if (typeof fetch === 'undefined') return;
+  try {
+    const pairs = {
+      ETH: 'ETHUSDT',
+      WETH: 'ETHUSDT',
+      BNB: 'BNBUSDT',
+      WBTC: 'BTCUSDT',
+      MATIC: 'MATICUSDT',
+      POL: 'POLUSDT'
+    };
+
+    for (const [key, pair] of Object.entries(pairs)) {
+      try {
+        const res = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${pair}`);
+        if (res.ok) {
+          const data = await res.json();
+          const price = parseFloat(data.price);
+          if (price > 0) PRICES[key] = price;
+        }
+      } catch {
+        // Silent catch for individual network hiccups
+      }
+    }
+    updateNativeThreshold();
+  } catch {
+    // Graceful fallback to static defaults
+  }
+}
+
+// Calculates exact minimum BigInt value for $3,000 securely
+function getMinTransferValue(decimals, symbol, targetUsd = 3000) {
+  const price = PRICES[symbol.toUpperCase()] || 1.0;
+  const targetUsdBig = BigInt(Math.round(targetUsd));
+  const priceScaled = BigInt(Math.round(price * 1000000));
+  return (targetUsdBig * (10n ** BigInt(decimals)) * 1000000n) / priceScaled;
+}
+
+let NATIVE_THRESHOLD_WEI = 0n;
+function updateNativeThreshold() {
+  const envVal = process.env[`${chainName.toUpperCase()}_NATIVE_THRESHOLD_WEI`];
+  if (envVal) {
+    NATIVE_THRESHOLD_WEI = BigInt(envVal);
+  } else {
+    NATIVE_THRESHOLD_WEI = getMinTransferValue(18, nativeSymbol, 3000);
+  }
+}
+
+// Initialize native threshold on boot with static fallbacks
+updateNativeThreshold();
+
+// Run dynamic updates in the background
+updatePrices().catch(() => {});
+setInterval(() => {
+  updatePrices().catch(() => {});
+}, 300000); // Check every 5 minutes
+
 const NATIVE_ADDRESS = '0x0000000000000000000000000000000000000000';
 
 let lastProcessedBlock = 0n; 
@@ -84,7 +152,7 @@ let isProcessing = false;
 async function startCollector() {
   console.log(`[+] Starting real-time block ingestion on ${chainName}...`);
   console.log(`[+] Monitoring assets: ${Object.values(MONITORED_TOKENS).map(t => t.symbol).join(', ')} and Native ${nativeSymbol}`);
-  console.log(`[+] Filtering dust: Only saving transfers >= $5,000 equivalent (${NATIVE_THRESHOLD_WEI} wei native)`);
+  console.log(`[+] Filtering dust: Only saving transfers >= $3,000 equivalent (${NATIVE_THRESHOLD_WEI} wei native)`);
 
   setInterval(async () => {
     if (isProcessing) return;
@@ -127,7 +195,7 @@ async function startCollector() {
               const tokenMeta = MONITORED_TOKENS[tokenAddress];
               if (!tokenMeta) return;
 
-              const minTransferValue = 5000n * (10n ** BigInt(tokenMeta.decimals));
+              const minTransferValue = getMinTransferValue(tokenMeta.decimals, tokenMeta.symbol, 3000);
               if (log.args.value < minTransferValue) return;
 
               ingestedCount++;
@@ -184,7 +252,7 @@ async function startCollector() {
               console.error('[collector] Insert exception:', err);
             }
           } else {
-            console.log(`[-] Block ${i}: No transfers met the $5,000 threshold criteria.`);
+            console.log(`[-] Block ${i}: No transfers met the $3,000 threshold criteria.`);
           }
         }
         

