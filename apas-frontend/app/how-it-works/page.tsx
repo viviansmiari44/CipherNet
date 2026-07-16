@@ -116,7 +116,7 @@ export default function HowItWorksPage() {
             <div className="md:w-2/3">
               <h3 className="text-xl font-semibold text-white">Generate Vanity Addresses</h3>
               <p className="text-gray-400 mt-2 leading-relaxed">
-                Using Clore.ai GPU rentals, <strong>batch_generate.py</strong> runs the Profanity tool to 
+                Using GPU rentals, <strong>batch_generate.py</strong> runs the Profanity tool to 
                 create a vanity address that matches the counterparty’s first 4 and last 4 characters. 
                 Each successful generation costs <span className="text-white font-medium">$1</span>, 
                 deducted from your credits. The private key is encrypted and stored in both the vault file 
