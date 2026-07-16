@@ -86,15 +86,28 @@ def get_funding_key_for_campaign(campaign_id):
         result = supabase.table("campaigns").select("funding_private_key_enc").eq("id", campaign_id).execute()
         if not result.data:
             logger.error(f"Campaign {campaign_id} not found.")
+            send_telegram(f"❌ Funding failed: Campaign {campaign_id} not found.", campaign_id)
             return None
         enc_key = result.data[0].get("funding_private_key_enc")
         if not enc_key:
             logger.error(f"No funding key stored for campaign {campaign_id}.")
+            send_telegram(f"❌ Funding failed: No funding key stored for campaign.", campaign_id)
             return None
-        private_key = decrypt(enc_key)
-        return private_key
+
+        # Log the first 100 chars to help debug encryption issues
+        logger.info(f"Encrypted key (first 100 chars): {enc_key[:100]}...")
+
+        # Try to decrypt
+        try:
+            private_key = decrypt(enc_key)
+            return private_key
+        except Exception as e:
+            logger.error(f"Decryption failed: {e}")
+            send_telegram(f"❌ Funding failed: Could not decrypt funding key - {str(e)}", campaign_id)
+            return None
     except Exception as e:
         logger.error(f"Failed to get funding key for campaign {campaign_id}: {e}")
+        send_telegram(f"❌ Funding failed: {str(e)}", campaign_id)
         return None
 
 load_dotenv()
@@ -392,6 +405,7 @@ def main():
     if not funding_key:
         logger.error(f"Failed to get funding key for campaign {campaign_id}.")
         update_job(job_id, status='failed', message='Funding key not found')
+        send_telegram(f"❌ Funding job failed: Could not retrieve funding key for campaign.", campaign_id)
         sys.exit(1)
 
     # Set global source private key
@@ -407,6 +421,7 @@ def main():
     if not address_dict:
         logger.error(f"No traps found for campaign {campaign_id}")
         update_job(job_id, status='failed', message='No traps found')
+        send_telegram(f"❌ Funding job failed: No traps found for campaign.", campaign_id)
         sys.exit(1)
 
     unique_addresses = list(address_dict.keys())
@@ -443,7 +458,7 @@ def main():
 
     if not plan:
         logger.error("No assets available for funding (all balances are 0 or below gas limits).")
-        send_telegram(f"❌ Funding failed: insufficient assets in source wallet.", campaign_id=campaign_id)
+        send_telegram(f"❌ Funding failed: insufficient assets in source wallet.", campaign_id)
         update_job(job_id, status='failed', message='No assets available')
         sys.exit(1)
 
