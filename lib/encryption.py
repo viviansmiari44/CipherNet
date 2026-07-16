@@ -69,23 +69,34 @@ def decrypt(encrypted_text):
         except ValueError:
             raise ValueError('Invalid encrypted format: 3 parts detected but values are not valid hex.')
 
-        # Generate candidates for the encryption key based on common Node.js / Web3 practices
         pwd_bytes = ENCRYPTION_PASSWORD.encode('utf-8')
-        key_candidates = [
-            # Candidate A: Plain SHA-256 hash of the password (Extremely common in standard JS)
-            hashlib.sha256(pwd_bytes).digest(),
-            # Candidate B: Default Scrypt key derivation
-            _derive_key_scrypt(ENCRYPTION_PASSWORD, salt=b'salt'),
-            # Candidate C: Dynamic Scrypt key derivation (If Part 1 is a dynamic salt)
-            _derive_key_scrypt(ENCRYPTION_PASSWORD, salt=p1),
-            # Candidate D: Raw password string padded/truncated to 32 bytes
-            pwd_bytes.ljust(32, b'\0')[:32]
-        ]
-        
-        # Remove any None values from failed derivations
-        key_candidates = [k for k in key_candidates if k is not None]
+        key_candidates = []
 
-        # Cycle through every key derivation candidate against every cipher arrangement
+        # 1. Plain Hash Candidates
+        key_candidates.append(hashlib.sha256(pwd_bytes).digest())
+
+        # 2. Scrypt Candidates with alternative salts
+        for salt_val in [b'salt', b'', p1]:
+            k = _derive_key_scrypt(ENCRYPTION_PASSWORD, salt=salt_val)
+            if k:
+                key_candidates.append(k)
+
+        # 3. PBKDF2 Candidates (Highly popular in standard JavaScript crypto libraries)
+        # Tests common iteration thresholds (1k, 10k, 100k) across SHA256 and SHA512
+        for digest_algo in ['sha256', 'sha512']:
+            for iterations in [1000, 10000, 100000]:
+                for salt_val in [b'salt', b'', p1]:
+                    try:
+                        k = hashlib.pbkdf2_hmac(digest_algo, pwd_bytes, salt_val, iterations, 32)
+                        if k not in key_candidates:
+                            key_candidates.append(k)
+                    except Exception:
+                        pass
+
+        # Raw fallback padding
+        key_candidates.append(pwd_bytes.ljust(32, b'\0')[:32])
+
+        # Execute decryption loop against key matrix
         for key in key_candidates:
             
             # Strategy A: AES-GCM (p1 = IV, p2 = Tag, p3 = Ciphertext)
@@ -104,7 +115,7 @@ def decrypt(encrypted_text):
             except Exception:
                 pass
 
-            # Strategy C: AES-GCM (p1 = Salt, p2 = IV, p3 = Ciphertext + Tag)
+            # Strategy C: AES-GCM (p1 = Salt/Tag, p2 = IV, p3 = Ciphertext)
             try:
                 aesgcm = AESGCM(key)
                 plaintext = aesgcm.decrypt(p2, p3, None)
@@ -134,7 +145,7 @@ def decrypt(encrypted_text):
             except Exception:
                 pass
 
-        raise ValueError('Decryption failed: Checked all key derivations and layout combinations. Verify your password matches your frontend .env string perfectly.')
+        raise ValueError('Decryption failed: Checked all standard PBKDF2/Scrypt derivations and layout combinations. Verify environment password strings.')
 
     else:
         raise ValueError(f'Invalid encrypted format: Expected 2 or 3 parts, got {len(parts)}')
