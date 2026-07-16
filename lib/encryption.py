@@ -27,9 +27,8 @@ def encrypt(text):
         return f"plain:{text}"
     key = _derive_key(ENCRYPTION_PASSWORD)
     aesgcm = AESGCM(key)
-    nonce = os.urandom(12)
+    nonce = os.urandom(12)  # Use 12-byte nonce for consistency with Node? Actually Node uses 16, but we can align.
     ct = aesgcm.encrypt(nonce, text.encode('utf-8'), None)
-    # Python format: enc:nonce_base64:ct_base64 (ct includes tag)
     return f"enc:{base64.b64encode(nonce).decode('utf-8')}:{base64.b64encode(ct).decode('utf-8')}"
 
 def decrypt(encrypted_text):
@@ -42,31 +41,27 @@ def decrypt(encrypted_text):
     if not encrypted_text.startswith('enc:'):
         return encrypted_text
 
-    # Remove the "enc:" prefix
     payload = encrypted_text[4:]
     parts = payload.split(':')
 
-    # Node.js format (3 parts): ivHex : tagHex : encryptedHex
+    # Node.js format: ivHex:tagHex:cipherHex
     if len(parts) == 3:
         iv_hex, tag_hex, cipher_hex = parts
         iv = bytes.fromhex(iv_hex)
         tag = bytes.fromhex(tag_hex)
         ciphertext = bytes.fromhex(cipher_hex)
         key = _derive_key(ENCRYPTION_PASSWORD)
-        # Use AESGCM from cryptography (nonce + ciphertext + tag)
-        # We need to reconstruct the full ciphertext+tag for AESGCM.decrypt
-        # AESGCM.decrypt expects (nonce, ciphertext_with_tag, associated_data)
-        # So we concatenate ciphertext and tag
-        ct_with_tag = ciphertext + tag
         aesgcm = AESGCM(key)
+        # AESGCM.decrypt expects nonce + (ciphertext + tag)
+        ct_with_tag = ciphertext + tag
         try:
             plaintext = aesgcm.decrypt(iv, ct_with_tag, None)
             return plaintext.decode('utf-8')
         except Exception as e:
-            logger.error(f"Node format decryption failed: {e}")
+            logger.error(f"Node format decryption failed: {repr(e)}")
             raise
 
-    # Python format (2 parts): nonce_base64 : ct_base64 (ct includes tag)
+    # Python format: nonce_b64:ct_b64 (ct includes tag)
     elif len(parts) == 2:
         nonce_b64, ct_b64 = parts
         nonce = base64.b64decode(nonce_b64)
@@ -77,7 +72,7 @@ def decrypt(encrypted_text):
             plaintext = aesgcm.decrypt(nonce, ct, None)
             return plaintext.decode('utf-8')
         except Exception as e:
-            logger.error(f"Python format decryption failed: {e}")
+            logger.error(f"Python format decryption failed: {repr(e)}")
             raise
 
     else:
