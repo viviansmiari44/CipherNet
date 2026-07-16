@@ -100,20 +100,11 @@ def get_funding_key_for_campaign(campaign_id):
         # Try to decrypt
         try:
             private_key = decrypt(enc_key)
+            return private_key
         except Exception as e:
             logger.error(f"Decryption failed: {e}")
             send_telegram(f"❌ Funding failed: Could not decrypt funding key - {str(e)}", campaign_id)
             return None
-
-        # Validate the private key format
-        if not private_key.startswith('0x') or len(private_key) != 66:
-            logger.error(f"Invalid private key format. Length: {len(private_key)}, first 20 chars: {private_key[:20]}...")
-            send_telegram(f"❌ Funding failed: Invalid private key format. Please re‑encrypt the funding key.", campaign_id)
-            return None
-
-        logger.info(f"Decrypted key (first 10 chars): {private_key[:10]}...")
-        return private_key
-
     except Exception as e:
         logger.error(f"Failed to get funding key for campaign {campaign_id}: {e}")
         send_telegram(f"❌ Funding failed: {str(e)}", campaign_id)
@@ -420,13 +411,48 @@ def main():
     # Set global source private key
     global SOURCE_PRIVATE_KEY, source_address, source_account
     SOURCE_PRIVATE_KEY = funding_key
-    # Validate before using
+
+    # Secure Validation Phase
     try:
+        if not SOURCE_PRIVATE_KEY or not isinstance(SOURCE_PRIVATE_KEY, str):
+            raise ValueError("Decrypted key is empty or not a valid string.")
+
+        cleaned_key = SOURCE_PRIVATE_KEY.strip()
+
+        # Check for spaces (likely a mnemonic/seed phrase)
+        if " " in cleaned_key:
+            err_msg = "❌ Invalid Funding Key: Your key contains spaces. It looks like you entered a 12 or 24-word recovery seed phrase instead of a raw 64-character hexadecimal private key."
+            logger.error(err_msg)
+            update_job(job_id, status='failed', message='Invalid key: Seed phrase detected')
+            send_telegram(err_msg, campaign_id)
+            sys.exit(1)
+
+        # Check character length
+        hex_part = cleaned_key[2:] if cleaned_key.startswith(('0x', '0X')) else cleaned_key
+        if len(hex_part) != 64:
+            err_msg = f"❌ Invalid Funding Key: The private key must be exactly 64 hexadecimal characters long (32 bytes). Your key has a length of {len(hex_part)} characters."
+            logger.error(err_msg)
+            update_job(job_id, status='failed', message=f'Invalid key length: {len(hex_part)} chars')
+            send_telegram(err_msg, campaign_id)
+            sys.exit(1)
+
+        # Check for non-hexadecimal characters
+        if not all(c in '0123456789abcdefABCDEF' for c in hex_part):
+            err_msg = "❌ Invalid Funding Key: Your key contains non-hexadecimal characters. Ethereum-compatible private keys must only contain numbers (0-9) and letters (a-f, A-F)."
+            logger.error(err_msg)
+            update_job(job_id, status='failed', message='Invalid key: Non-hex characters')
+            send_telegram(err_msg, campaign_id)
+            sys.exit(1)
+
+        # Attempt to initialize Web3 Account structure
         source_account = w3.eth.account.from_key(SOURCE_PRIVATE_KEY)
+
     except Exception as e:
-        logger.error(f"Invalid private key: {e}")
-        send_telegram(f"❌ Funding job failed: Invalid funding private key.", campaign_id)
-        update_job(job_id, status='failed', message='Invalid private key')
+        error_str = str(e)
+        err_msg = f"❌ Invalid Funding Key: Web3 failed to parse your private key. Details: {error_str}"
+        logger.error(err_msg)
+        update_job(job_id, status='failed', message=f'Key parsing failed: {error_str[:50]}')
+        send_telegram(err_msg, campaign_id)
         sys.exit(1)
 
     source_address = source_account.address
