@@ -213,7 +213,7 @@ def fetch_pending_pairs():
             .select('id, counterparty, victim')\
             .eq('chain', CHAIN)\
             .eq('processed', False)\
-            .order('id', ascending=True)\
+            .order('id')\
             .execute()
         return [(row['id'], row['counterparty'].lower(), row['victim'].lower()) for row in result.data]
     except Exception as e:
