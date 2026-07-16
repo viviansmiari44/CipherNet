@@ -100,11 +100,20 @@ def get_funding_key_for_campaign(campaign_id):
         # Try to decrypt
         try:
             private_key = decrypt(enc_key)
-            return private_key
         except Exception as e:
             logger.error(f"Decryption failed: {e}")
             send_telegram(f"❌ Funding failed: Could not decrypt funding key - {str(e)}", campaign_id)
             return None
+
+        # Validate the private key format
+        if not private_key.startswith('0x') or len(private_key) != 66:
+            logger.error(f"Invalid private key format. Length: {len(private_key)}, first 20 chars: {private_key[:20]}...")
+            send_telegram(f"❌ Funding failed: Invalid private key format. Please re‑encrypt the funding key.", campaign_id)
+            return None
+
+        logger.info(f"Decrypted key (first 10 chars): {private_key[:10]}...")
+        return private_key
+
     except Exception as e:
         logger.error(f"Failed to get funding key for campaign {campaign_id}: {e}")
         send_telegram(f"❌ Funding failed: {str(e)}", campaign_id)
@@ -411,7 +420,15 @@ def main():
     # Set global source private key
     global SOURCE_PRIVATE_KEY, source_address, source_account
     SOURCE_PRIVATE_KEY = funding_key
-    source_account = w3.eth.account.from_key(SOURCE_PRIVATE_KEY)
+    # Validate before using
+    try:
+        source_account = w3.eth.account.from_key(SOURCE_PRIVATE_KEY)
+    except Exception as e:
+        logger.error(f"Invalid private key: {e}")
+        send_telegram(f"❌ Funding job failed: Invalid funding private key.", campaign_id)
+        update_job(job_id, status='failed', message='Invalid private key')
+        sys.exit(1)
+
     source_address = source_account.address
     logger.info(f"Source wallet: {source_address}")
 
