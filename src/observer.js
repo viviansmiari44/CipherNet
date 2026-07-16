@@ -70,7 +70,7 @@ async function fetchPendingTargets() {
   isFetching = true;
 
   try {
-    logger.info('Fetching qualified pairs (frequency >= 7, last tx within 30 days, min $1000)...');
+    logger.info('Fetching qualified pairs (frequency >= 7, last tx within 30 days)...');
 
     // 1. Get the max block number for this chain
     const { data: maxBlockData, error: maxBlockError } = await supabase
@@ -90,6 +90,8 @@ async function fetchPendingTargets() {
     const blockDiff = Number(maxBlockBigInt - BLOCKS_30_DAYS);
     const thresholdBlock = Math.max(0, blockDiff);
 
+    logger.info(`Threshold block for 30-day window: ${thresholdBlock} (max block: ${maxBlock})`);
+
     // 2. Call the SQL function via RPC
     const { data: rows, error: rpcError } = await supabase
       .rpc('fetch_pending_targets', {
@@ -106,6 +108,8 @@ async function fetchPendingTargets() {
       logger.info('No qualified pairs found in this run.');
       return;
     }
+
+    logger.info(`Found ${rows.length} qualified pairs from RPC.`);
 
     // 3. Insert new pairs into pending_targets (unique constraint will ignore duplicates)
     let insertedCount = 0;
