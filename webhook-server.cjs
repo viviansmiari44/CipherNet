@@ -143,6 +143,11 @@ app.post('/webhook/job', async (req, res) => {
       scriptPath = path.join(projectRoot, 'src', 'batch_generate.py');
       args = ['--job-id', jobId];
 
+        // ─── Add max-keys if provided ───
+      if (req.body.maxKeys) {
+        args.push('--max-keys', String(req.body.maxKeys));
+      }
+
       // ─── Fetch Clore config from Supabase and inject into env ───
       try {
         const cloreConfig = await getCloreConfig();

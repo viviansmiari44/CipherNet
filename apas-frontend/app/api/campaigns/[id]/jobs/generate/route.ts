@@ -14,6 +14,10 @@ export async function POST(
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
+  // ─── Parse request body for maxKeys ───
+  const body = await req.json().catch(() => ({}));
+  const maxKeys = body.maxKeys ? parseInt(body.maxKeys, 10) : undefined;
+
   const supabase = await createServerSupabaseClient();
 
   // ─── Check user credits ───
@@ -58,7 +62,7 @@ export async function POST(
     return NextResponse.json({ error: jobError.message }, { status: 500 });
   }
 
-  // ✅ Send "started" notification immediately
+  // ✅ Send "started" notification
   await sendAlert(`🚀 Generate job started for chain ${campaign.chain} (Job ID: ${job.id})`, 'info', id);
 
   // ─── Send webhook to backend ───
@@ -66,16 +70,16 @@ export async function POST(
   try {
     await fetch(webhookUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json',
-      'x-webhook-secret': process.env.WEBHOOK_SECRET || '',
-       },
+      headers: {
+        'Content-Type': 'application/json',
+        'x-webhook-secret': process.env.WEBHOOK_SECRET || '',
+      },
       body: JSON.stringify({
         jobId: job.id,
         campaignId: campaign.id,
         chain: campaign.chain,
         type: 'generate',
-        // Any extra data needed by the backend script:
-        // For generate, we pass nothing extra.
+        maxKeys, // ✅ pass the user‑specified limit
       }),
     });
     console.log(`[generate] Webhook sent to ${webhookUrl}`);

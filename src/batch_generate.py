@@ -405,37 +405,26 @@ def cancel_clore_instance():
     except Exception as e:
         logger.error(f"Error cancelling instance: {e}")
 
-def main():
-    # ─── Lock file path ───
-    lock_file_path = PROGRESS_FILE + '.lock'
-    lock_f = None
-
+# ─── NEW: Check if job has been cancelled ───
+def is_job_cancelled(job_id):
+    if not supabase:
+        return False
     try:
-        # Try to acquire exclusive lock (non‑blocking)
-        lock_f = open(lock_file_path, 'w')
-        fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        print(f"[batch_generate] Acquired lock {lock_file_path}")
-    except IOError:
-        # Another process holds the lock
-        print("[batch_generate] Lock already held by another process. GPU busy.")
-        # Get campaign_id from job (if available) to send alert to the user
-        job_id = None
-        # Parse arguments again to get job_id (we already have it in this scope)
-        # Since we haven't parsed args yet in main, we need to parse first.
-        # Actually we parsed args at the top, but we need to know job_id.
-        # We'll just use the job_id from the global scope if available.
-        # But we haven't assigned job_id yet in main. We'll move lock acquisition after parsing.
-        # So we'll restructure: parse args first, then lock.
-        # Let's move the lock code after parsing.
+        result = supabase.table('jobs').select('status').eq('id', job_id).execute()
+        if result.data:
+            return result.data[0].get('status') == 'cancelled'
+    except Exception:
+        pass
+    return False
 
-    # Actually, we need to parse args first to know job_id. So we'll restructure main.
-    # Let's rewrite main with lock after parsing.
-
-    # Parse arguments
+def main():
+    # ─── Parse arguments ───
     parser = argparse.ArgumentParser()
     parser.add_argument('--job-id', help='Job ID for tracking')
+    parser.add_argument('--max-keys', type=int, help='Maximum number of keys to generate')
     args = parser.parse_args()
     job_id = args.job_id
+    max_keys = args.max_keys
 
     campaign_id = None
     user_id = None
@@ -448,20 +437,16 @@ def main():
         fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
         print(f"[batch_generate] Acquired lock {lock_file_path}")
     except IOError:
-        # Another process holds the lock
         print("[batch_generate] Lock already held by another process. GPU busy.")
-        # If we have job_id, we can send alert to the user
         if job_id:
             campaign_id = get_campaign_id_from_job(job_id)
             if campaign_id:
                 send_telegram("⏳ GPU is currently busy with another generation job. Your job has been queued and will start when the GPU is free. Please try again later or check back shortly.", campaign_id)
             else:
-                # Fallback: global alert (but we don't have user context)
                 send_telegram("⏳ GPU is currently busy with another generation job. Please try again later.")
-        sys.exit(1)  # Exit with error so job status can be updated
+        sys.exit(1)
 
     if job_id:
-        # Update job to running
         update_job(job_id, status='running')
         print(f"[batch_generate] Job {job_id} set to running")
         campaign_id = get_campaign_id_from_job(job_id)
@@ -505,24 +490,34 @@ def main():
         logger.info(f"Resuming from counterparty {start_index+1} of {total}")
         pending = pending[start_index:]
 
-    # 4. Start GPU (if needed) – commented out
-    # if not start_clore_instance():
-    #     logger.error("Failed to start Clore instance. Exiting.")
-    #     sys.exit(1)
-
-    # 5. Process with per-key credit checks
+    # 4. Process with per-key credit checks, max-keys, and cancellation
     fee_per_key = float(os.getenv("FEE_PER_KEY", "1.0"))
     success_count = 0
     stopped_due_to_credits = False
+    stopped_due_to_cancellation = False
+    reached_max_keys = False
 
     for idx, (cp, victim) in enumerate(pending, start=start_index+1):
-        # Check credit before attempting to generate next key
+        # ─── Check cancellation ───
+        if job_id and is_job_cancelled(job_id):
+            logger.info("Job cancelled by user. Exiting.")
+            send_telegram("🛑 Generation cancelled by user.", campaign_id)
+            stopped_due_to_cancellation = True
+            break
+
+        # ─── Check max-keys limit ───
+        if max_keys and success_count >= max_keys:
+            logger.info(f"Reached max keys limit ({max_keys}). Stopping.")
+            reached_max_keys = True
+            break
+
+        # ─── Check credit ───
         if campaign_id and user_id:
             credits = get_user_credits(user_id)
             if credits < fee_per_key:
                 logger.info(f"Insufficient credits to generate more keys. Generated {success_count} keys so far. Stopping.")
                 stopped_due_to_credits = True
-                break  # exit loop
+                break
 
         logger.info(f"[{idx}/{total}] Generating key for counterparty {cp} (victim: {victim})...")
         try:
@@ -531,7 +526,6 @@ def main():
                 save_key_to_vault(cp, victim, key, campaign_id)
                 success_count += 1
                 write_progress(idx)
-                # Deduct fee after successful generation (if campaign context exists)
                 if campaign_id and user_id:
                     deduct_key_fee(user_id, job_id, campaign_id, fee_per_key)
                 if job_id:
@@ -549,10 +543,14 @@ def main():
 
     # Final job status update
     if job_id:
-        if success_count == total and not stopped_due_to_credits:
+        if success_count == total and not stopped_due_to_credits and not stopped_due_to_cancellation and not reached_max_keys:
             update_job(job_id, status='completed', progress=total, message='All done')
         elif stopped_due_to_credits:
             update_job(job_id, status='completed', progress=success_count, message=f'Partial: {success_count}/{total} keys (insufficient credits)')
+        elif stopped_due_to_cancellation:
+            update_job(job_id, status='cancelled', progress=success_count, message=f'Cancelled by user after {success_count} keys')
+        elif reached_max_keys:
+            update_job(job_id, status='completed', progress=success_count, message=f'Completed: {success_count} keys (user limit)')
         else:
             update_job(job_id, status='failed', progress=success_count, message=f'{success_count}/{total} succeeded')
 
@@ -560,9 +558,13 @@ def main():
     status_message = f"🏁 Batch generation complete\nChain: {CHAIN}\nProcessed: {total} targets\nGenerated: {success_count} keys"
     if stopped_due_to_credits:
         status_message += f"\n⚠️ Stopped early due to insufficient credits."
+    elif stopped_due_to_cancellation:
+        status_message += f"\n🛑 Stopped by user."
+    elif reached_max_keys:
+        status_message += f"\n✅ Reached user-defined limit of {max_keys} keys."
     send_telegram(status_message, campaign_id=campaign_id)
 
-    # Release lock (optional – will be released when process exits)
+    # Release lock
     if lock_f:
         try:
             fcntl.flock(lock_f, fcntl.LOCK_UN)
