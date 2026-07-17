@@ -31,7 +31,7 @@ export async function GET(req: NextRequest) {
 
   console.log('[admin] Access granted for user:', user.id);
 
-  // ✅ Include credits column
+  // ✅ Fetch users with credits
   const { data: users, error } = await supabaseService
     .from('users')
     .select('id, email, profit_split_percent, telegram_bot_token, telegram_chat_id, created_at, credits')
@@ -42,6 +42,43 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 
-  console.log(`[admin] Fetched ${users?.length || 0} users`);
+  // ─── Compute per‑chain trap counts per user ───
+  // 1. Fetch all campaigns (with user_id and chain)
+  const { data: campaigns } = await supabaseService
+    .from('campaigns')
+    .select('id, user_id, chain');
+
+  // 2. Fetch all traps (only campaign_id needed)
+  const { data: traps } = await supabaseService
+    .from('traps')
+    .select('campaign_id');
+
+  // Build campaign_id → { user_id, chain }
+  const campaignInfo: Record<string, { user_id: string; chain: string }> = {};
+  for (const camp of campaigns || []) {
+    campaignInfo[camp.id] = { user_id: camp.user_id, chain: camp.chain };
+  }
+
+  // Count traps per user, per chain
+  const userChainCounts: Record<string, Record<string, number>> = {};
+  for (const trap of traps || []) {
+    const info = campaignInfo[trap.campaign_id];
+    if (info) {
+      if (!userChainCounts[info.user_id]) {
+        userChainCounts[info.user_id] = {};
+      }
+      userChainCounts[info.user_id][info.chain] =
+        (userChainCounts[info.user_id][info.chain] || 0) + 1;
+    }
+  }
+
+  // Attach to each user
+  for (const u of users || []) {
+    const counts = userChainCounts[u.id] || {};
+    (u as any).trap_counts = counts;
+    (u as any).total_traps = Object.values(counts).reduce((a, b) => a + b, 0);
+  }
+
+  console.log(`[admin] Fetched ${users?.length || 0} users with chain‑specific trap counts`);
   return NextResponse.json(users);
 }

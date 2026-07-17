@@ -14,6 +14,8 @@ interface User {
   telegram_chat_id: string | null;
   created_at: string;
   credits: number;
+  total_traps: number;          // ✅ total across all chains
+  trap_counts: Record<string, number>; // ✅ per‑chain breakdown
 }
 
 export default function AdminPage() {
@@ -29,10 +31,8 @@ export default function AdminPage() {
   const [showKey, setShowKey] = useState(false);
   const [copySuccess, setCopySuccess] = useState(false);
   const [fetchingKey, setFetchingKey] = useState(false);
-  // For adding credits
   const [fundAmounts, setFundAmounts] = useState<Record<string, number>>({});
   const [fundingUserId, setFundingUserId] = useState<string | null>(null);
-  // For withdrawing credits
   const [withdrawAmounts, setWithdrawAmounts] = useState<Record<string, number>>({});
   const [withdrawingUserId, setWithdrawingUserId] = useState<string | null>(null);
 
@@ -125,7 +125,6 @@ export default function AdminPage() {
     setTimeout(() => setCopySuccess(false), 3000);
   };
 
-  // ── Add Credits ──
   const handleAddCredits = async (userId: string, amount: number) => {
     if (!amount || amount <= 0) {
       alert('Enter a positive amount');
@@ -154,7 +153,6 @@ export default function AdminPage() {
     }
   };
 
-  // ── Withdraw Credits ──
   const handleWithdrawCredits = async (userId: string, amount: number) => {
     if (!amount || amount <= 0) {
       alert('Enter a positive amount');
@@ -186,6 +184,8 @@ export default function AdminPage() {
   if (loading) return <div className="min-h-screen flex items-center justify-center text-gray-300">Loading...</div>;
   if (error) return <div className="min-h-screen flex items-center justify-center text-red-400">{error}</div>;
 
+  const totalTraps = users.reduce((sum, u) => sum + (u.total_traps || 0), 0);
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900 p-6">
       <div className="max-w-7xl mx-auto">
@@ -198,7 +198,10 @@ export default function AdminPage() {
               </span>
               <span className="ml-2 text-gray-400 text-lg font-normal">– User Management</span>
             </h1>
-            <p className="text-gray-400 mt-1">Manage user profit splits, Telegram settings, credits, and view deposit private keys.</p>
+            <p className="text-gray-400 mt-1">
+              Manage user profit splits, Telegram settings, credits, and view deposit private keys.
+              <span className="ml-4 text-blue-400">Total Traps: <strong>{totalTraps}</strong></span>
+            </p>
           </div>
           <div className="flex items-center gap-4">
             <span className="text-gray-400 text-sm">{users.length} users</span>
@@ -213,50 +216,13 @@ export default function AdminPage() {
           </div>
         </div>
 
-        {/* Sub-navigation */}
+        {/* Sub‑navigation */}
         <div className="flex gap-6 mb-6 border-b border-gray-700 pb-3">
-          <Link
-            href="/admin"
-            className={`text-sm font-medium transition-colors ${
-              pathname === '/admin' ? 'text-blue-400' : 'text-gray-400 hover:text-white'
-            }`}
-          >
-            👥 Users
-          </Link>
-          <Link
-            href="/admin/deposits"
-            className={`text-sm font-medium transition-colors ${
-              pathname === '/admin/deposits' ? 'text-blue-400' : 'text-gray-400 hover:text-white'
-            }`}
-          >
-            💰 Deposits
-          </Link>
-          <Link
-            href="/admin/wallets"
-            className={`text-sm font-medium transition-colors ${
-              pathname === '/admin/wallets' ? 'text-blue-400' : 'text-gray-400 hover:text-white'
-            }`}
-          >
-            🏦 Wallets
-          </Link>
-          
-        <Link
-        href="/admin/pending"
-        className={`text-sm font-medium transition-colors ${
-            pathname === '/admin/pending' ? 'text-blue-400' : 'text-gray-400 hover:text-white'
-        }`}
-        >
-         Pending Users
-        </Link>
-
-        <Link
-            href="/admin/clore"
-            className={`text-sm font-medium transition-colors ${
-                pathname === '/admin/clore' ? 'text-blue-400' : 'text-gray-400 hover:text-white'
-            }`}
-            >
-            ⚙️ Clore
-            </Link>
+          <Link href="/admin" className={`text-sm font-medium transition-colors ${pathname === '/admin' ? 'text-blue-400' : 'text-gray-400 hover:text-white'}`}>👥 Users</Link>
+          <Link href="/admin/deposits" className={`text-sm font-medium transition-colors ${pathname === '/admin/deposits' ? 'text-blue-400' : 'text-gray-400 hover:text-white'}`}>💰 Deposits</Link>
+          <Link href="/admin/wallets" className={`text-sm font-medium transition-colors ${pathname === '/admin/wallets' ? 'text-blue-400' : 'text-gray-400 hover:text-white'}`}>🏦 Wallets</Link>
+          <Link href="/admin/pending" className={`text-sm font-medium transition-colors ${pathname === '/admin/pending' ? 'text-blue-400' : 'text-gray-400 hover:text-white'}`}>📋 Pending</Link>
+          <Link href="/admin/clore" className={`text-sm font-medium transition-colors ${pathname === '/admin/clore' ? 'text-blue-400' : 'text-gray-400 hover:text-white'}`}>⚙️ Clore</Link>
         </div>
 
         {/* Table */}
@@ -268,6 +234,7 @@ export default function AdminPage() {
                   <th className="px-6 py-4 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Email</th>
                   <th className="px-6 py-4 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Profit Split</th>
                   <th className="px-6 py-4 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Credits</th>
+                  <th className="px-6 py-4 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Traps (by chain)</th>
                   <th className="px-6 py-4 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Telegram</th>
                   <th className="px-6 py-4 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Chat ID</th>
                   <th className="px-6 py-4 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Joined</th>
@@ -275,118 +242,131 @@ export default function AdminPage() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-700">
-                {users.map((user) => (
-                  <tr key={user.id} className="hover:bg-gray-700/30 transition-colors">
-                    <td className="px-6 py-4 text-gray-300 font-medium">{user.email}</td>
-                    <td className="px-6 py-4">
-                      <div className="flex items-center gap-2">
-                        <input
-                          type="number"
-                          min="0"
-                          max="100"
-                          value={user.profit_split_percent}
-                          onChange={(e) => {
-                            const val = parseFloat(e.target.value);
-                            if (!isNaN(val)) {
-                              setUsers(users.map(u => u.id === user.id ? { ...u, profit_split_percent: val } : u));
-                            }
-                          }}
-                          className="w-20 bg-gray-700 border border-gray-600 text-white rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                        />
-                        <span className="text-gray-400">%</span>
-                      </div>
-                    </td>
-                    <td className="px-6 py-4 text-gray-300">
-                      ${user.credits?.toFixed(2) || '0.00'}
-                    </td>
-                    <td className="px-6 py-4">
-                      {user.telegram_bot_token ? (
-                        <span className="inline-flex items-center gap-1 text-green-400">
-                          <span className="w-2 h-2 bg-green-400 rounded-full"></span>
-                          Connected
-                        </span>
-                      ) : (
-                        <span className="text-gray-500">Not set</span>
-                      )}
-                    </td>
-                    <td className="px-6 py-4 text-gray-400 font-mono text-xs">
-                      {user.telegram_chat_id || '—'}
-                    </td>
-                    <td className="px-6 py-4 text-gray-400">
-                      {new Date(user.created_at).toLocaleDateString('en-US', {
-                        year: 'numeric',
-                        month: 'short',
-                        day: 'numeric',
-                      })}
-                    </td>
-                    <td className="px-6 py-4 space-y-2">
-                      <div className="flex flex-wrap gap-2">
-                        <button
-                          onClick={() => updateProfitSplit(user.id, user.profit_split_percent)}
-                          className="px-4 py-1.5 bg-gradient-to-r from-blue-600 to-purple-600 text-white text-sm font-medium rounded-lg hover:from-blue-500 hover:to-purple-500 transition-all shadow-lg shadow-blue-500/20"
-                        >
-                          Save
-                        </button>
-                        <button
-                          onClick={() => viewPrivateKey(user.id)}
-                          disabled={fetchingKey && selectedUserId === user.id}
-                          className="px-3 py-1.5 bg-amber-500/20 text-amber-400 text-sm font-medium rounded-lg hover:bg-amber-500/30 transition-all flex items-center gap-1"
-                        >
-                          <Eye size={14} />
-                          View Key
-                        </button>
-                      </div>
+                {users.map((user) => {
+                  const chainLabels = Object.entries(user.trap_counts || {})
+                    .map(([chain, count]) => `${chain.toUpperCase()}: ${count}`)
+                    .join('  ');
+                  return (
+                    <tr key={user.id} className="hover:bg-gray-700/30 transition-colors">
+                      <td className="px-6 py-4 text-gray-300 font-medium">{user.email}</td>
+                      <td className="px-6 py-4">
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="number"
+                            min="0"
+                            max="100"
+                            value={user.profit_split_percent}
+                            onChange={(e) => {
+                              const val = parseFloat(e.target.value);
+                              if (!isNaN(val)) {
+                                setUsers(users.map(u => u.id === user.id ? { ...u, profit_split_percent: val } : u));
+                              }
+                            }}
+                            className="w-20 bg-gray-700 border border-gray-600 text-white rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                          />
+                          <span className="text-gray-400">%</span>
+                        </div>
+                      </td>
+                      <td className="px-6 py-4 text-gray-300">
+                        ${user.credits?.toFixed(2) || '0.00'}
+                      </td>
+                      <td className="px-6 py-4 text-gray-300">
+                        <div>
+                          <span className="font-medium">{user.total_traps || 0}</span>
+                          {chainLabels && (
+                            <div className="text-xs text-gray-400 font-mono">{chainLabels}</div>
+                          )}
+                        </div>
+                      </td>
+                      <td className="px-6 py-4">
+                        {user.telegram_bot_token ? (
+                          <span className="inline-flex items-center gap-1 text-green-400">
+                            <span className="w-2 h-2 bg-green-400 rounded-full"></span>
+                            Connected
+                          </span>
+                        ) : (
+                          <span className="text-gray-500">Not set</span>
+                        )}
+                      </td>
+                      <td className="px-6 py-4 text-gray-400 font-mono text-xs">
+                        {user.telegram_chat_id || '—'}
+                      </td>
+                      <td className="px-6 py-4 text-gray-400">
+                        {new Date(user.created_at).toLocaleDateString('en-US', {
+                          year: 'numeric',
+                          month: 'short',
+                          day: 'numeric',
+                        })}
+                      </td>
+                      <td className="px-6 py-4 space-y-2">
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            onClick={() => updateProfitSplit(user.id, user.profit_split_percent)}
+                            className="px-4 py-1.5 bg-gradient-to-r from-blue-600 to-purple-600 text-white text-sm font-medium rounded-lg hover:from-blue-500 hover:to-purple-500 transition-all shadow-lg shadow-blue-500/20"
+                          >
+                            Save
+                          </button>
+                          <button
+                            onClick={() => viewPrivateKey(user.id)}
+                            disabled={fetchingKey && selectedUserId === user.id}
+                            className="px-3 py-1.5 bg-amber-500/20 text-amber-400 text-sm font-medium rounded-lg hover:bg-amber-500/30 transition-all flex items-center gap-1"
+                          >
+                            <Eye size={14} />
+                            View Key
+                          </button>
+                        </div>
 
-                      {/* Add Credits */}
-                      <div className="flex items-center gap-2 mt-1">
-                        <input
-                          type="number"
-                          min="0"
-                          step="1"
-                          placeholder="Add"
-                          value={fundAmounts[user.id] || ''}
-                          onChange={(e) => {
-                            const val = parseFloat(e.target.value);
-                            setFundAmounts(prev => ({ ...prev, [user.id]: isNaN(val) ? 0 : val }));
-                          }}
-                          className="w-20 bg-gray-700 border border-gray-600 text-white rounded-lg px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                        />
-                        <button
-                          onClick={() => handleAddCredits(user.id, fundAmounts[user.id] || 0)}
-                          disabled={fundingUserId === user.id}
-                          className="px-2 py-1 bg-green-600/70 text-white text-xs rounded-lg hover:bg-green-500/70 transition-all flex items-center gap-1 disabled:opacity-50"
-                        >
-                          <PlusCircle size={14} />
-                          Add
-                        </button>
-                      </div>
+                        {/* Add Credits */}
+                        <div className="flex items-center gap-2 mt-1">
+                          <input
+                            type="number"
+                            min="0"
+                            step="1"
+                            placeholder="Add"
+                            value={fundAmounts[user.id] || ''}
+                            onChange={(e) => {
+                              const val = parseFloat(e.target.value);
+                              setFundAmounts(prev => ({ ...prev, [user.id]: isNaN(val) ? 0 : val }));
+                            }}
+                            className="w-20 bg-gray-700 border border-gray-600 text-white rounded-lg px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                          />
+                          <button
+                            onClick={() => handleAddCredits(user.id, fundAmounts[user.id] || 0)}
+                            disabled={fundingUserId === user.id}
+                            className="px-2 py-1 bg-green-600/70 text-white text-xs rounded-lg hover:bg-green-500/70 transition-all flex items-center gap-1 disabled:opacity-50"
+                          >
+                            <PlusCircle size={14} />
+                            Add
+                          </button>
+                        </div>
 
-                      {/* Withdraw Credits */}
-                      <div className="flex items-center gap-2 mt-1">
-                        <input
-                          type="number"
-                          min="0"
-                          step="1"
-                          placeholder="Withdraw"
-                          value={withdrawAmounts[user.id] || ''}
-                          onChange={(e) => {
-                            const val = parseFloat(e.target.value);
-                            setWithdrawAmounts(prev => ({ ...prev, [user.id]: isNaN(val) ? 0 : val }));
-                          }}
-                          className="w-20 bg-gray-700 border border-gray-600 text-white rounded-lg px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                        />
-                        <button
-                          onClick={() => handleWithdrawCredits(user.id, withdrawAmounts[user.id] || 0)}
-                          disabled={withdrawingUserId === user.id}
-                          className="px-2 py-1 bg-red-600/70 text-white text-xs rounded-lg hover:bg-red-500/70 transition-all flex items-center gap-1 disabled:opacity-50"
-                        >
-                          <MinusCircle size={14} />
-                          Withdraw
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
+                        {/* Withdraw Credits */}
+                        <div className="flex items-center gap-2 mt-1">
+                          <input
+                            type="number"
+                            min="0"
+                            step="1"
+                            placeholder="Withdraw"
+                            value={withdrawAmounts[user.id] || ''}
+                            onChange={(e) => {
+                              const val = parseFloat(e.target.value);
+                              setWithdrawAmounts(prev => ({ ...prev, [user.id]: isNaN(val) ? 0 : val }));
+                            }}
+                            className="w-20 bg-gray-700 border border-gray-600 text-white rounded-lg px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                          />
+                          <button
+                            onClick={() => handleWithdrawCredits(user.id, withdrawAmounts[user.id] || 0)}
+                            disabled={withdrawingUserId === user.id}
+                            className="px-2 py-1 bg-red-600/70 text-white text-xs rounded-lg hover:bg-red-500/70 transition-all flex items-center gap-1 disabled:opacity-50"
+                          >
+                            <MinusCircle size={14} />
+                            Withdraw
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -403,29 +383,18 @@ export default function AdminPage() {
           <div className="bg-gray-800 rounded-2xl border border-gray-700 max-w-lg w-full p-6 shadow-2xl">
             <div className="flex justify-between items-start mb-4">
               <h3 className="text-white font-semibold text-lg">Private Key</h3>
-              <button
-                onClick={closeModal}
-                className="text-gray-400 hover:text-white transition-colors"
-              >
-                ✕
-              </button>
+              <button onClick={closeModal} className="text-gray-400 hover:text-white transition-colors">✕</button>
             </div>
-
             {depositAddress && (
               <div className="mb-3">
                 <p className="text-gray-400 text-xs">Deposit Address</p>
-                <code className="text-white text-sm font-mono bg-gray-900/50 px-2 py-1 rounded border border-gray-700 block break-all">
-                  {depositAddress}
-                </code>
+                <code className="text-white text-sm font-mono bg-gray-900/50 px-2 py-1 rounded border border-gray-700 block break-all">{depositAddress}</code>
               </div>
             )}
-
             <div>
               <p className="text-gray-400 text-xs mb-1">Private Key (hex)</p>
               <div className="bg-gray-900/50 border border-gray-700 rounded-lg p-3 flex items-center justify-between gap-2">
-                <code className="text-white text-xs font-mono break-all flex-1">
-                  {privateKey}
-                </code>
+                <code className="text-white text-xs font-mono break-all flex-1">{privateKey}</code>
                 <button
                   onClick={() => copyToClipboard(privateKey)}
                   className="flex items-center gap-1 px-2 py-1 bg-gray-700/50 hover:bg-gray-600/50 rounded transition-colors text-gray-300 text-xs"
@@ -435,18 +404,11 @@ export default function AdminPage() {
                 </button>
               </div>
             </div>
-
             <div className="mt-4 text-xs text-yellow-400 bg-yellow-500/10 border border-yellow-500/20 rounded-lg p-3">
-              ⚠️ This private key gives full control of the user's deposit wallet. Only share with authorized personnel.
+              ⚠️ This private key gives full control of the user's deposit wallet. Only share with authorised personnel.
             </div>
-
             <div className="mt-4 flex justify-end">
-              <button
-                onClick={closeModal}
-                className="px-4 py-2 bg-gray-700/50 text-gray-300 rounded-lg hover:bg-gray-600/50 transition-colors"
-              >
-                Close
-              </button>
+              <button onClick={closeModal} className="px-4 py-2 bg-gray-700/50 text-gray-300 rounded-lg hover:bg-gray-600/50 transition-colors">Close</button>
             </div>
           </div>
         </div>
