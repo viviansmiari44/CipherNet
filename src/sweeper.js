@@ -66,6 +66,23 @@ let lastNoBalanceAlertTime = 0;
 const BALANCE_DETECTED_COOLDOWN_MS = 1 * 60 * 60 * 1000; // Alert max once every 1 hour per token/trap if unswept
 const lastBalanceAlertTimes = new Map(); 
 
+// --- Helper: check if job is cancelled ---
+async function isJobCancelled(jobId) {
+  if (!jobId || !supabaseService) return false;
+  try {
+    const { data, error } = await supabaseService
+      .from('jobs')
+      .select('status')
+      .eq('id', jobId)
+      .single();
+    if (error) throw error;
+    return data?.status === 'cancelled';
+  } catch (err) {
+    logger.error(`Failed to check job cancellation: ${err.message}`);
+    return false;
+  }
+}
+
 // --- Helper: update job status ---
 async function updateJob(status, progress = null, total = null, message = null) {
   if (!jobId || !supabaseService) return;
@@ -907,6 +924,13 @@ async function sweepBatch() {
     let anySwept = false;
     try {
       for (const c of clients) {
+        // --- Check if job has been cancelled ---
+        if (jobId && await isJobCancelled(jobId)) {
+          logger.info(`Job ${jobId} cancelled by user. Stopping sweep loop immediately.`);
+          isSweeping = false;
+          return;
+        }
+
         const victim = trapToVictim.get(c.trapAddress.toLowerCase()) || null;
         const swept = await sweepAddress(c.client, c.trapAddress, safeWallet, victim);
         if (swept) anySwept = true;
@@ -937,6 +961,11 @@ async function sweepBatch() {
 
   const scheduleNext = () => {
     setTimeout(async () => {
+      // --- Check cancellation before scheduling next run ---
+      if (jobId && await isJobCancelled(jobId)) {
+        logger.info(`Job ${jobId} has been cancelled – stopping loop schedules.`);
+        return;
+      }
       await runSweep();
       scheduleNext();
     }, pollIntervalMs);

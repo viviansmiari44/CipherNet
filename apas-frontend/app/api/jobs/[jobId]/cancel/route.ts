@@ -16,10 +16,10 @@ export async function POST(
 
   const supabase = await createServerSupabaseClient();
 
-  // Verify the job belongs to a campaign owned by the user
+  // Fetch job details (including type)
   const { data: job, error: jobError } = await supabase
     .from('jobs')
-    .select('campaign_id, status')
+    .select('campaign_id, status, type')
     .eq('id', jobId)
     .single();
 
@@ -54,8 +54,10 @@ export async function POST(
     return NextResponse.json({ error: updateError.message }, { status: 500 });
   }
 
-  // Send alert to user
-  await sendAlert(`🛑 Generate job ${jobId} has been cancelled.`, 'info', job.campaign_id);
+  // Send alert to user with the job type (with safe fallback string handling)
+  const typeString = job.type || 'sweep';
+  const typeLabel = typeString.charAt(0).toUpperCase() + typeString.slice(1);
+  await sendAlert(`🛑 ${typeLabel} job ${jobId} has been cancelled.`, 'info', job.campaign_id);
 
   return NextResponse.json({ success: true });
 }
