@@ -428,149 +428,157 @@ def main():
     job_id = args.job_id
 
     campaign_id = None
-    if job_id:
-        logger.info(f"Running with job tracking for job_id: {job_id}")
-        update_job(job_id, status="running", message="Initializing batch funding job...")
-        campaign_id = get_campaign_id_from_job(job_id)
+    try:
+        if job_id:
+            logger.info(f"Running with job tracking for job_id: {job_id}")
+            update_job(job_id, status="running", message="Initializing batch funding job...")
+            campaign_id = get_campaign_id_from_job(job_id)
 
-    # 1. Fetch & decrypt source funding key
-    funding_key = None
-    if campaign_id:
-        funding_key = get_funding_key_for_campaign(campaign_id)
-        if not funding_key:
+        # 1. Fetch & decrypt source funding key
+        funding_key = None
+        if campaign_id:
+            funding_key = get_funding_key_for_campaign(campaign_id)
+            if not funding_key:
+                if job_id:
+                    update_job(job_id, status="failed", message="Could not retrieve or decrypt funding key.")
+                sys.exit(1)
+        else:
+            funding_key = os.getenv("FUNDING_PRIVATE_KEY")
+            if not funding_key:
+                logger.error("No funding private key found in environment or database.")
+                send_telegram("❌ Funding failed: No funding private key found in environment.", campaign_id)
+                sys.exit(1)
+
+        source_account = w3.eth.account.from_key(funding_key)
+        source_address = source_account.address
+        logger.info(f"Funding source address: {source_address}")
+
+        # 2. Extract targets (DB or local fallback)
+        traps = {}
+        if campaign_id:
+            traps = extract_addresses_from_db(campaign_id)
+        else:
+            traps = extract_addresses_from_file("vault.txt")
+
+        if not traps:
+            logger.critical("No trap addresses loaded. Exiting.")
             if job_id:
-                update_job(job_id, status="failed", message="Could not retrieve or decrypt funding key.")
-            sys.exit(1)
-    else:
-        funding_key = os.getenv("FUNDING_PRIVATE_KEY")
-        if not funding_key:
-            logger.error("No funding private key found in environment or database.")
-            send_telegram("❌ Funding failed: No funding private key found in environment.", campaign_id)
+                update_job(job_id, status="failed", message="No trap addresses loaded.")
+            send_telegram("❌ Funding failed: No trap addresses loaded.", campaign_id)
             sys.exit(1)
 
-    source_account = w3.eth.account.from_key(funding_key)
-    source_address = source_account.address
-    logger.info(f"Funding source address: {source_address}")
+        unique_addresses = list(traps.keys())
 
-    # 2. Extract targets (DB or local fallback)
-    traps = {}
-    if campaign_id:
-        traps = extract_addresses_from_db(campaign_id)
-    else:
-        traps = extract_addresses_from_file("vault.txt")
+        # Handle test mode early so tracking counts are accurate
+        if test_mode:
+            logger.info("[TEST MODE] Slicing execution down to first trap address only.")
+            unique_addresses = unique_addresses[:1]
 
-    if not traps:
-        logger.critical("No trap addresses loaded. Exiting.")
-        if job_id:
-            update_job(job_id, status="failed", message="No trap addresses loaded.")
-        send_telegram("❌ Funding failed: No trap addresses loaded.", campaign_id)
-        sys.exit(1)
+        num_targets = len(unique_addresses)
+        logger.info(f"Targeting {num_targets} unique trap addresses")
 
-    unique_addresses = list(traps.keys())
+        # 3. Pull balances
+        native_bal = w3.eth.get_balance(source_address)
+        usdc_bal = get_token_balance(source_address, "USDC")
+        native_usdc_bal = get_token_balance(source_address, "USDC_NATIVE")
+        usdt_bal = get_token_balance(source_address, "USDT")
 
-    # Handle test mode early so tracking counts are accurate
-    if test_mode:
-        logger.info("[TEST MODE] Slicing execution down to first trap address only.")
-        unique_addresses = unique_addresses[:1]
+        logger.info(f"Source Native Balance: {w3.from_wei(native_bal, 'ether')} {NATIVE_SYMBOL}")
+        logger.info(f"Source USDC Balance: {usdc_bal / 1e6} USDC")
+        if "USDC_NATIVE" in TOKEN_CONFIG:
+            logger.info(f"Source USDC_NATIVE Balance: {native_usdc_bal / 1e6} USDC_NATIVE")
+        logger.info(f"Source USDT Balance: {usdt_bal / 1e6} USDT")
 
-    num_targets = len(unique_addresses)
-    logger.info(f"Targeting {num_targets} unique trap addresses")
+        # 4. Generate plan
+        assets_to_send = 0
+        if usdc_bal > 0: assets_to_send += 1
+        if "USDC_NATIVE" in TOKEN_CONFIG and native_usdc_bal > 0: assets_to_send += 1
+        if usdt_bal > 0: assets_to_send += 1
+        
+        txs_per_address = (1 if native_bal > 0 else 0) + assets_to_send
+        total_txs = txs_per_address * num_targets
 
-    # 3. Pull balances
-    native_bal = w3.eth.get_balance(source_address)
-    usdc_bal = get_token_balance(source_address, "USDC")
-    native_usdc_bal = get_token_balance(source_address, "USDC_NATIVE")
-    usdt_bal = get_token_balance(source_address, "USDT")
-
-    logger.info(f"Source Native Balance: {w3.from_wei(native_bal, 'ether')} {NATIVE_SYMBOL}")
-    logger.info(f"Source USDC Balance: {usdc_bal / 1e6} USDC")
-    if "USDC_NATIVE" in TOKEN_CONFIG:
-        logger.info(f"Source USDC_NATIVE Balance: {native_usdc_bal / 1e6} USDC_NATIVE")
-    logger.info(f"Source USDT Balance: {usdt_bal / 1e6} USDT")
-
-    # 4. Generate plan
-    assets_to_send = 0
-    if usdc_bal > 0: assets_to_send += 1
-    if "USDC_NATIVE" in TOKEN_CONFIG and native_usdc_bal > 0: assets_to_send += 1
-    if usdt_bal > 0: assets_to_send += 1
-    
-    txs_per_address = (1 if native_bal > 0 else 0) + assets_to_send
-    total_txs = txs_per_address * num_targets
-
-    plan = compute_funding_plan(num_targets, native_bal, usdc_bal, native_usdc_bal, usdt_bal, total_txs)
-    if not plan:
-        logger.critical("No assets to distribute or gas balance too low.")
-        if job_id:
-            update_job(job_id, status="failed", message="No assets to distribute or native balance is too low for gas.")
-        send_telegram("❌ Funding failed: No assets to distribute or native balance is too low for gas.", campaign_id)
-        sys.exit(1)
-
-    logger.info(f"Funding Plan computed: {plan}")
-
-    # Correct tracking count representation after test-mode slicing
-    total_expected = len(plan) * num_targets
-    if job_id:
-        update_job(job_id, total=total_expected, progress=0)
-
-    # 5. Non-interactive input bypass check
-    is_interactive = sys.stdin.isatty() and not job_id
-    if is_interactive:
-        print(f"\n[!] Ready to broadcast {total_expected} transactions to {num_targets} addresses.")
-        print("Press Enter to continue or Ctrl+C to cancel...")
-        try:
-            input()
-        except KeyboardInterrupt:
-            logger.info("Operation cancelled by user.")
-            sys.exit(0)
-    else:
-        logger.info("Non-interactive run detected. Skipping confirmation prompt.")
-
-    setup_graceful_shutdown()
-
-    # 6. Execute transactions sequentially
-    current_nonce = w3.eth.get_transaction_count(source_address, "pending")
-    total_ok = 0
-    tx_count = 0
-
-    for addr in unique_addresses:
-        for asset, amount, decimals in plan:
-            logger.info(f"Sending {amount / (10**decimals)} {asset} to {addr} (Nonce: {current_nonce})")
-            
-            tx_hash, nonce_consumed = send_funding(
-                source_address=source_address,
-                private_key=funding_key,
-                to_address=addr,
-                asset=asset,
-                amount_units=amount,
-                nonce=current_nonce
-            )
-
-            if nonce_consumed:
-                current_nonce += 1
-
-            if tx_hash:
-                total_ok += 1
-            
-            tx_count += 1
+        plan = compute_funding_plan(num_targets, native_bal, usdc_bal, native_usdc_bal, usdt_bal, total_txs)
+        if not plan:
+            logger.critical("No assets to distribute or gas balance too low.")
             if job_id:
-                update_job(job_id, progress=tx_count, message=f"Processed {tx_count}/{total_expected} transfers")
-            
-            # Anti-spam cool-down
-            time.sleep(0.5)
+                update_job(job_id, status="failed", message="No assets to distribute or native balance is too low for gas.")
+            send_telegram("❌ Funding failed: No assets to distribute or native balance is too low for gas.", campaign_id)
+            sys.exit(1)
 
-    # 7. Complete job status mapping
-    if total_ok == total_expected:
+        logger.info(f"Funding Plan computed: {plan}")
+
+        # Correct tracking count representation after test-mode slicing
+        total_expected = len(plan) * num_targets
         if job_id:
-            update_job(job_id, status="completed", progress=total_expected, message="Batch funding completed successfully.")
-        send_telegram(f"✅ Batch funding completed successfully. Sent {total_ok}/{total_expected} transactions.", campaign_id)
-    elif total_ok > 0:
+            update_job(job_id, total=total_expected, progress=0)
+
+        # 5. Non-interactive input bypass check
+        is_interactive = sys.stdin.isatty() and not job_id
+        if is_interactive:
+            print(f"\n[!] Ready to broadcast {total_expected} transactions to {num_targets} addresses.")
+            print("Press Enter to continue or Ctrl+C to cancel...")
+            try:
+                input()
+            except KeyboardInterrupt:
+                logger.info("Operation cancelled by user.")
+                sys.exit(0)
+        else:
+            logger.info("Non-interactive run detected. Skipping confirmation prompt.")
+
+        setup_graceful_shutdown()
+
+        # 6. Execute transactions sequentially
+        current_nonce = w3.eth.get_transaction_count(source_address, "pending")
+        total_ok = 0
+        tx_count = 0
+
+        for addr in unique_addresses:
+            for asset, amount, decimals in plan:
+                logger.info(f"Sending {amount / (10**decimals)} {asset} to {addr} (Nonce: {current_nonce})")
+                
+                tx_hash, nonce_consumed = send_funding(
+                    source_address=source_address,
+                    private_key=funding_key,
+                    to_address=addr,
+                    asset=asset,
+                    amount_units=amount,
+                    nonce=current_nonce
+                )
+
+                if nonce_consumed:
+                    current_nonce += 1
+
+                if tx_hash:
+                    total_ok += 1
+                
+                tx_count += 1
+                if job_id:
+                    update_job(job_id, progress=tx_count, message=f"Processed {tx_count}/{total_expected} transfers")
+                
+                # Anti-spam cool-down
+                time.sleep(0.5)
+
+        # 7. Complete job status mapping
+        if total_ok == total_expected:
+            if job_id:
+                update_job(job_id, status="completed", progress=total_expected, message="Batch funding completed successfully.")
+            send_telegram(f"✅ Batch funding completed successfully. Sent {total_ok}/{total_expected} transactions.", campaign_id)
+        elif total_ok > 0:
+            if job_id:
+                update_job(job_id, status="completed", progress=total_ok, message=f"Partial completion: {total_ok}/{total_expected} succeeded.")
+            send_telegram(f"⚠️ Batch funding partially completed. {total_ok}/{total_expected} transactions succeeded.", campaign_id)
+        else:
+            if job_id:
+                update_job(job_id, status="failed", message="All batch transactions failed.")
+            send_telegram(f"❌ Batch funding failed. All {total_expected} transactions failed.", campaign_id)
+
+    except Exception as e:
+        logger.critical(f"Unhandled exception in batch funding: {e}", exc_info=True)
         if job_id:
-            update_job(job_id, status="completed", progress=total_ok, message=f"Partial completion: {total_ok}/{total_expected} succeeded.")
-        send_telegram(f"⚠️ Batch funding partially completed. {total_ok}/{total_expected} transactions succeeded.", campaign_id)
-    else:
-        if job_id:
-            update_job(job_id, status="failed", message="All batch transactions failed.")
-        send_telegram(f"❌ Batch funding failed. All {total_expected} transactions failed.", campaign_id)
+            update_job(job_id, status="failed", message=f"Unhandled error: {str(e)}")
+        send_telegram(f"❌ Batch funding failed with unexpected error: {str(e)}", campaign_id)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
