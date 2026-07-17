@@ -32,13 +32,13 @@ const QUALIFIED_POLL_INTERVAL_MS = parseInt(
   10
 );
 
-// --- Chain‑specific block count for 30 days (approximate) ---
-const BLOCKS_30_DAYS_MAP = {
-  ethereum: 216000n,   // ~13s blocks
-  bsc:      864000n,   // ~3s blocks
-  polygon:  1296000n,  // ~2s blocks
+// --- Chain‑specific block count for 40 days (approximate) ---
+const BLOCKS_40_DAYS_MAP = {
+  ethereum: 288000n,   // ~13s blocks
+  bsc:      1152000n,  // ~3s blocks
+  polygon:  1728000n,  // ~2s blocks
 };
-const BLOCKS_30_DAYS = BLOCKS_30_DAYS_MAP[chainName] || 216000n;
+const BLOCKS_40_DAYS = BLOCKS_40_DAYS_MAP[chainName] || 288000n;
 
 let isFetching = false;
 
@@ -71,7 +71,7 @@ async function fetchPendingTargets() {
   isFetching = true;
 
   try {
-    logger.info('Fetching qualified pairs (frequency >= 7, last tx within 30 days)...');
+    logger.info('Fetching qualified pairs (frequency >= 7, last tx within 40 days)...');
 
     // 1. Get the max block number for this chain (using retry)
     const maxBlockData = await withRetry(async () => {
@@ -93,10 +93,10 @@ async function fetchPendingTargets() {
 
     const maxBlock = maxBlockData[0].block_number;
     const maxBlockBigInt = BigInt(maxBlock);
-    const blockDiff = Number(maxBlockBigInt - BLOCKS_30_DAYS);
+    const blockDiff = Number(maxBlockBigInt - BLOCKS_40_DAYS);
     const thresholdBlock = Math.max(0, blockDiff);
 
-    logger.info(`Threshold block for 30-day window: ${thresholdBlock} (max block: ${maxBlock})`);
+    logger.info(`Threshold block for 40-day window: ${thresholdBlock} (max block: ${maxBlock})`);
 
     // 2. Call the SQL function via RPC (using retry)
     const rows = await withRetry(async () => {
@@ -156,7 +156,7 @@ async function fetchPendingTargets() {
 async function startObserver() {
   logger.info('Starting qualified‑targets poller (continuous mode)');
   logger.info(`Polling interval: ${QUALIFIED_POLL_INTERVAL_MS / 1000} seconds`);
-  logger.info(`30‑day block window for ${chainName}: ${BLOCKS_30_DAYS} blocks`);
+  logger.info(`40‑day block window for ${chainName}: ${BLOCKS_40_DAYS} blocks`);
 
   await fetchPendingTargets();
 
