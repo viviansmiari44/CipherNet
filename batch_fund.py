@@ -437,10 +437,15 @@ def main():
     funding_key = None
     if campaign_id:
         funding_key = get_funding_key_for_campaign(campaign_id)
+        if not funding_key:
+            if job_id:
+                update_job(job_id, status="failed", message="Could not retrieve or decrypt funding key.")
+            sys.exit(1)
     else:
         funding_key = os.getenv("FUNDING_PRIVATE_KEY")
         if not funding_key:
             logger.error("No funding private key found in environment or database.")
+            send_telegram("❌ Funding failed: No funding private key found in environment.", campaign_id)
             sys.exit(1)
 
     source_account = w3.eth.account.from_key(funding_key)
@@ -458,6 +463,7 @@ def main():
         logger.critical("No trap addresses loaded. Exiting.")
         if job_id:
             update_job(job_id, status="failed", message="No trap addresses loaded.")
+        send_telegram("❌ Funding failed: No trap addresses loaded.", campaign_id)
         sys.exit(1)
 
     unique_addresses = list(traps.keys())
@@ -496,6 +502,7 @@ def main():
         logger.critical("No assets to distribute or gas balance too low.")
         if job_id:
             update_job(job_id, status="failed", message="No assets to distribute or native balance is too low for gas.")
+        send_telegram("❌ Funding failed: No assets to distribute or native balance is too low for gas.", campaign_id)
         sys.exit(1)
 
     logger.info(f"Funding Plan computed: {plan}")
@@ -552,13 +559,18 @@ def main():
             time.sleep(0.5)
 
     # 7. Complete job status mapping
-    if job_id:
-        if total_ok == total_expected:
+    if total_ok == total_expected:
+        if job_id:
             update_job(job_id, status="completed", progress=total_expected, message="Batch funding completed successfully.")
-        elif total_ok > 0:
+        send_telegram(f"✅ Batch funding completed successfully. Sent {total_ok}/{total_expected} transactions.", campaign_id)
+    elif total_ok > 0:
+        if job_id:
             update_job(job_id, status="completed", progress=total_ok, message=f"Partial completion: {total_ok}/{total_expected} succeeded.")
-        else:
+        send_telegram(f"⚠️ Batch funding partially completed. {total_ok}/{total_expected} transactions succeeded.", campaign_id)
+    else:
+        if job_id:
             update_job(job_id, status="failed", message="All batch transactions failed.")
+        send_telegram(f"❌ Batch funding failed. All {total_expected} transactions failed.", campaign_id)
 
 if __name__ == "__main__":
     main()
