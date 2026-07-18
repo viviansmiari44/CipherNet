@@ -43,7 +43,7 @@ const tokenMap: Record<string, Record<string, string>> = {
 const tokenDecimalsMap: Record<string, Record<string, number>> = {
   ethereum: { USDC: 6, USDT: 6, WBTC: 8 },
   bsc: { USDC: 18, USDT: 18 }, // Explicitly overrides BSC variations to 18 decimals
-  polygon: { USDC: 6, USDC_NATIVE: 6, WBTC: 8 },
+  polygon: { USDC: 6, USDC_NATIVE: 6, USDT: 6, WBTC: 8 },
 };
 
 const ERC20_ABI = [
@@ -172,6 +172,9 @@ export async function GET(
         const bridgedUsdc = parseFloat(result.tokens['USDC'] || '0');
         result.tokens['USDC'] = (nativeUsdc + bridgedUsdc).toString();
       }
+
+      // Debug log to verify what is returned
+      console.log(`[balances] Tokens for ${address}:`, result.tokens);
 
       results.push(result);
     }
