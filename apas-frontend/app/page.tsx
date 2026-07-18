@@ -43,7 +43,7 @@ export default function Home() {
               <span>v2.0 – Fully Automated</span>
             </div>
             <h1 className="text-4xl md:text-5xl lg:text-6xl font-bold leading-tight">
-              Deploy <span className="bg-gradient-to-r from-blue-400 to-purple-400 bg-clip-text text-transparent">Poison Traps</span> at Scale
+              Deploy <span className="bg-gradient-to-r from-blue-400 to-purple-400 bg-clip-text text-transparent">Address Poison</span> at Scale
             </h1>
             <p className="mt-4 text-lg text-gray-400 max-w-xl mx-auto lg:mx-0">
               Automatically generate vanity addresses, monitor on-chain activity, and sweep funds — all from a single dashboard.
