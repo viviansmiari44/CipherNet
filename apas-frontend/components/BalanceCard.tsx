@@ -5,8 +5,8 @@ import { Coins, DollarSign, Wallet, TrendingUp } from 'lucide-react';
 
 interface Balance {
   trapAddress: string;
-  native: { raw: string; formatted: string };
-  tokens: Record<string, { raw: string; formatted: string }>;
+  native: string; // ✅ string, not an object
+  tokens: Record<string, string>; // ✅ string values
 }
 
 export default function BalanceCard({ campaignId }: { campaignId: string }) {
@@ -44,9 +44,9 @@ export default function BalanceCard({ campaignId }: { campaignId: string }) {
   const totalTokens: Record<string, number> = {};
 
   for (const b of balances) {
-    totalNative += parseFloat(b.native.formatted || '0');
-    for (const [symbol, data] of Object.entries(b.tokens || {})) {
-      totalTokens[symbol] = (totalTokens[symbol] || 0) + parseFloat(data.formatted || '0');
+    totalNative += parseFloat(b.native || '0');
+    for (const [symbol, value] of Object.entries(b.tokens || {})) {
+      totalTokens[symbol] = (totalTokens[symbol] || 0) + parseFloat(value || '0');
     }
   }
 
@@ -71,25 +71,32 @@ export default function BalanceCard({ campaignId }: { campaignId: string }) {
     assetList.push({ symbol, amount, icon: getIcon(symbol) });
   }
 
+  // Filter out assets with zero balance (optional, but cleans up the UI)
+  const filteredAssets = assetList.filter(item => item.amount > 0);
+
   return (
     <div className="bg-gray-800/50 backdrop-blur-sm border border-gray-700 rounded-2xl p-6 mb-6">
       <h3 className="text-white font-semibold text-lg mb-4">Balance Overview</h3>
-      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
-        {assetList.map((item) => (
-          <div
-            key={item.symbol}
-            className="bg-gray-900/50 rounded-xl p-4 border border-gray-700 flex flex-col items-start"
-          >
-            <div className="flex items-center gap-2 mb-1">
-              {item.icon}
-              <span className="text-gray-400 text-sm">{item.symbol}</span>
+      {filteredAssets.length === 0 ? (
+        <p className="text-gray-400 text-sm">No positive balances found.</p>
+      ) : (
+        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
+          {filteredAssets.map((item) => (
+            <div
+              key={item.symbol}
+              className="bg-gray-900/50 rounded-xl p-4 border border-gray-700 flex flex-col items-start"
+            >
+              <div className="flex items-center gap-2 mb-1">
+                {item.icon}
+                <span className="text-gray-400 text-sm">{item.symbol}</span>
+              </div>
+              <p className="text-white text-xl font-bold">
+                {item.amount.toFixed(6)}
+              </p>
             </div>
-            <p className="text-white text-xl font-bold">
-              {item.amount.toFixed(6)}
-            </p>
-          </div>
-        ))}
-      </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
