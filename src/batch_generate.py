@@ -361,6 +361,25 @@ def is_job_cancelled(job_id):
         pass
     return False
 
+# ─── NEW: Failure tracking and alert throttling ───
+_failure_count = 0
+_last_failure_alert_time = 0
+_FAILURE_ALERT_COOLDOWN = 60  # seconds
+
+def send_failure_alert(campaign_id, counterparty, error_msg=None):
+    """Send a Telegram alert for a key generation failure, but throttle to avoid spam."""
+    global _failure_count, _last_failure_alert_time
+    _failure_count += 1
+    now = time.time()
+    if now - _last_failure_alert_time >= _FAILURE_ALERT_COOLDOWN:
+        msg = f"⚠️ Key generation failed for {counterparty}"
+        if error_msg:
+            msg += f"\nError: {error_msg}"
+        send_telegram(msg, campaign_id)
+        _last_failure_alert_time = now
+    # Always log the failure
+    logger.warning(f"Key generation failed for {counterparty} (total failures: {_failure_count})")
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--job-id', help='Job ID for tracking')
@@ -396,6 +415,11 @@ def main():
             user_id = get_user_id_from_campaign(campaign_id)
 
     setup_graceful_shutdown()
+
+    # Reset failure counter per run
+    global _failure_count, _last_failure_alert_time
+    _failure_count = 0
+    _last_failure_alert_time = 0
 
     # 1. Load already processed counterparties
     processed = load_processed_counterparties()
@@ -469,10 +493,13 @@ def main():
                     update_job(job_id, progress=idx)
                 mark_pair_processed(pair_id)
             else:
+                # ─── NEW: Notify on failure ───
                 logger.warning(f"Failed to generate key for {cp}")
+                send_failure_alert(campaign_id, cp, "No key found after SSH timeout")
         except Exception as e:
+            # ─── NEW: Notify on exception ───
             logger.error(f"Error processing {cp}: {e}")
-            # Continue to next key
+            send_failure_alert(campaign_id, cp, str(e))
 
     logger.info(f"Generated {success_count} keys out of {total}.")
 
@@ -492,7 +519,7 @@ def main():
         else:
             update_job(job_id, status='failed', progress=success_count, message=f'{success_count}/{total} succeeded')
 
-    # Telegram alert
+    # ─── Send final alert with failure summary ───
     status_message = f"🏁 Batch generation complete\nChain: {CHAIN}\nProcessed: {total} targets\nGenerated: {success_count} keys"
     if stopped_due_to_credits:
         status_message += f"\n⚠️ Stopped early due to insufficient credits."
@@ -500,7 +527,9 @@ def main():
         status_message += f"\n🛑 Stopped by user."
     elif reached_max_keys:
         status_message += f"\n✅ Reached user-defined limit of {max_keys} keys."
-    send_telegram(status_message, campaign_id=campaign_id)
+    if _failure_count > 0:
+        status_message += f"\n❌ {_failure_count} key generation failures."
+    send_telegram(status_message, campaign_id)
 
     # Release lock
     if lock_f:
