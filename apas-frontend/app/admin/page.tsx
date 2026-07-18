@@ -70,20 +70,26 @@ export default function AdminPage() {
     checkAdminAndFetch();
   }, [router]);
 
-  const updateProfitSplit = async (userId: string, newPercent: number) => {
+ const updateProfitSplit = async (userId: string, newPercent: number) => {
+  try {
     const res = await fetch(`/api/admin/users/${userId}/profit-split`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ profitSplitPercent: newPercent }),
     });
+
     if (res.ok) {
       const updated = await res.json();
       setUsers(users.map(u => u.id === userId ? { ...u, profit_split_percent: updated.profit_split_percent } : u));
+      alert(`✅ Profit split updated to ${newPercent}% for ${updated.email}`);
     } else {
       const json = await res.json();
-      alert(json.error || 'Update failed');
+      alert(`❌ Error: ${json.error || 'Update failed'}`);
     }
-  };
+  } catch (err) {
+    alert('❌ Network error: Could not connect to server');
+  }
+};
 
   const handleRefresh = () => {
     fetchUsers(false);
