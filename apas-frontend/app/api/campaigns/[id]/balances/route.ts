@@ -16,23 +16,25 @@ const tokenMap: Record<string, Record<string, string>> = {
     USDT: '0x55d398326f99059fF775485246999027B3197955',
   },
   polygon: {
-    USDC: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174',
+    USDC: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174',      // bridged USDC
+    USDC_NATIVE: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359', // native USDC
     USDT: '0xc2132D05D31c914a87C6611C10748AEb04B58e8F',
   },
 };
 
-// ─── Token decimals per chain (overrides the generic assumption) ───
+// ─── Token decimals per chain ───
 const tokenDecimalsMap: Record<string, Record<string, number>> = {
   ethereum: {
     USDC: 6,
     USDT: 6,
   },
   bsc: {
-    USDC: 18, // BSC bridged USDC uses 18 decimals
-    USDT: 18, // BSC bridged USDT uses 18 decimals
+    USDC: 18,
+    USDT: 18,
   },
   polygon: {
     USDC: 6,
+    USDC_NATIVE: 6,
     USDT: 6,
   },
 };
@@ -144,9 +146,9 @@ export async function GET(
             args: [address],
           }) as bigint;
 
-          // Use the chain‑specific decimals, fallback to 18
           const decimals = decimalsForChain[symbol] ?? 18;
           result.tokens[symbol] = formatUnits(balance, decimals);
+          console.log(`[balances] ${symbol} balance for ${address}: ${formatUnits(balance, decimals)}`);
         } catch (e) {
           const errMsg = e instanceof Error ? e.message : String(e);
           console.warn(`[balances] Token ${symbol} failed for ${address}:`, errMsg);
