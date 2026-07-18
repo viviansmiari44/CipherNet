@@ -92,7 +92,7 @@ export default function Home() {
             <div className="w-12 h-12 rounded-xl bg-blue-500/20 flex items-center justify-center mx-auto mb-4">
               <Users className="w-6 h-6 text-blue-400" />
             </div>
-            <h3 className="text-white font-semibold text-lg">$2,000 One‑Time Setup</h3>
+            <h3 className="text-white font-semibold text-lg">$500 One‑Time Setup</h3>
             <p className="text-gray-400 text-sm mt-2">
               Pay once to activate your account and gain full access to the entire ecosystem — no monthly fees.
             </p>
