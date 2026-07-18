@@ -305,7 +305,7 @@ export default function TrapsList({
 
                       {/* Actions */}
                       <td className="px-4 py-3">
-                        <button
+                        {/* <button
                           onClick={() => copyPrivateKey(trap.id, trap.trap_address)}
                           disabled={isCopying}
                           className="flex items-center gap-1 px-2 py-1 text-xs bg-gray-700/50 hover:bg-gray-600/50 rounded transition-colors disabled:opacity-50"
@@ -321,7 +321,7 @@ export default function TrapsList({
                               <span>Copy Key</span>
                             </>
                           )}
-                        </button>
+                        </button> */}
                       </td>
                     </tr>
                   );
