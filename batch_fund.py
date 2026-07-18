@@ -396,7 +396,7 @@ def send_funding(source_address, private_key, to_address, asset, amount_units, n
 
         # Sign & Broadcast (The absolute point of no return for nonce consumption!)
         signed = w3.eth.account.sign_transaction(tx, private_key)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
         logger.info(f"Broadcasted TX: {tx_hash.hex()} (Nonce: {nonce})")
 
     except Exception as e:
