@@ -90,8 +90,8 @@ export default async function CampaignPage({ params }: { params: Promise<{ id: s
 
       <BalanceCard campaignId={id} />
       <div className="mt-8">
-       <TrapsList campaignId={id} />
-      </div>
+  <TrapsList traps={traps || []} campaignId={id} />
+</div>
     </div>
   );
 }

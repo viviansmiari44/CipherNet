@@ -20,13 +20,15 @@ interface Balance {
 export default function TrapsList({
   campaignId,
   initialBalances = [],
+  traps: initialTraps = [], // ✅ added optional traps prop
 }: {
   campaignId: string;
   initialBalances?: Balance[];
+  traps?: Trap[]; // ✅ new optional prop
 }) {
   // ─── State ───
-  const [traps, setTraps] = useState<Trap[]>([]);
-  const [total, setTotal] = useState(0);
+  const [traps, setTraps] = useState<Trap[]>(initialTraps);
+  const [total, setTotal] = useState(initialTraps.length);
   const [limit] = useState(20);
   const [offset, setOffset] = useState(0);
   const [balances, setBalances] = useState<Record<string, Balance>>(() => {
@@ -36,7 +38,7 @@ export default function TrapsList({
     }
     return map;
   });
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(initialTraps.length === 0);
   const [refreshing, setRefreshing] = useState(false);
   const [copying, setCopying] = useState<Record<string, boolean>>({});
 

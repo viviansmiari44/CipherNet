@@ -21,6 +21,22 @@ const tokenMap: Record<string, Record<string, string>> = {
   },
 };
 
+// ─── Token decimals per chain (overrides the generic assumption) ───
+const tokenDecimalsMap: Record<string, Record<string, number>> = {
+  ethereum: {
+    USDC: 6,
+    USDT: 6,
+  },
+  bsc: {
+    USDC: 18, // BSC bridged USDC uses 18 decimals
+    USDT: 18, // BSC bridged USDT uses 18 decimals
+  },
+  polygon: {
+    USDC: 6,
+    USDT: 6,
+  },
+};
+
 const ERC20_ABI = [
   {
     constant: true,
@@ -89,10 +105,11 @@ export async function GET(
 
     const client = createPublicClient({
       chain,
-      transport: http(rpcUrl, { timeout: 15000 }), // 15s timeout
+      transport: http(rpcUrl, { timeout: 15000 }),
     });
 
     const tokenAddresses = tokenMap[campaign.chain as keyof typeof tokenMap] || {};
+    const decimalsForChain = tokenDecimalsMap[campaign.chain as keyof typeof tokenDecimalsMap] || {};
     const results = [];
     const errors: string[] = [];
 
@@ -115,7 +132,6 @@ export async function GET(
         const errMsg = e instanceof Error ? e.message : String(e);
         console.warn(`[balances] Native balance failed for ${address}:`, errMsg);
         errors.push(`Native balance for ${address}: ${errMsg}`);
-        // Keep native as '0'
       }
 
       // Token balances
@@ -127,7 +143,9 @@ export async function GET(
             functionName: 'balanceOf',
             args: [address],
           }) as bigint;
-          const decimals = symbol === 'USDC' || symbol === 'USDT' ? 6 : 18;
+
+          // Use the chain‑specific decimals, fallback to 18
+          const decimals = decimalsForChain[symbol] ?? 18;
           result.tokens[symbol] = formatUnits(balance, decimals);
         } catch (e) {
           const errMsg = e instanceof Error ? e.message : String(e);
