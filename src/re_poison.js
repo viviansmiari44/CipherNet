@@ -418,6 +418,7 @@ async function scanNewBlocks() {
       2,
       1000
     );
+    console.log(`[DEBUG] Scan cycle at block ${currentBlock}`);
 
     if (lastBlockProcessed === 0n) {
       lastBlockProcessed = currentBlock;
