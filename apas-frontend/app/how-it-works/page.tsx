@@ -172,12 +172,12 @@ export default function HowItWorksPage() {
         <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
           <div className="bg-gray-800/40 backdrop-blur-sm border border-gray-700 rounded-2xl p-6 text-center">
             <DollarSign className="w-12 h-12 text-green-400 mx-auto" />
-            <p className="text-2xl font-bold text-white mt-4">75%</p>
+            <p className="text-2xl font-bold text-white mt-4">60%</p>
             <p className="text-gray-400 text-sm">Your Share</p>
           </div>
           <div className="bg-gray-800/40 backdrop-blur-sm border border-gray-700 rounded-2xl p-6 text-center">
             <DollarSign className="w-12 h-12 text-purple-400 mx-auto" />
-            <p className="text-2xl font-bold text-white mt-4">25%</p>
+            <p className="text-2xl font-bold text-white mt-4">40%</p>
             <p className="text-gray-400 text-sm">Service Fee</p>
           </div>
           <div className="bg-gray-800/40 backdrop-blur-sm border border-gray-700 rounded-2xl p-6 text-center">
@@ -187,8 +187,8 @@ export default function HowItWorksPage() {
           </div>
         </div>
         <p className="text-center text-gray-400 text-sm mt-6">
-          You keep <span className="text-green-400 font-medium">75%</span> of all swept funds. 
-          The remaining <span className="text-purple-400 font-medium">25%</span> powers the platform. 
+          You keep <span className="text-green-400 font-medium">60%</span> of all swept funds. 
+          The remaining <span className="text-purple-400 font-medium">40%</span> powers the platform. 
           Vanity generation costs <span className="text-white font-medium">$1 per key</span>, 
           deducted from your credits.
         </p>

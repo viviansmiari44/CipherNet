@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import { supabase } from '@app-lib/supabaseClient';
 import { useRouter, usePathname } from 'next/navigation';
 import Link from 'next/link';
-import { RefreshCw, Eye, Copy, Check, PlusCircle, MinusCircle } from 'lucide-react';
+import { RefreshCw, Eye, Copy, Check, PlusCircle, MinusCircle, Wallet } from 'lucide-react';
 
 interface User {
   id: string;
@@ -14,8 +14,9 @@ interface User {
   telegram_chat_id: string | null;
   created_at: string;
   credits: number;
-  total_traps: number;          // ✅ total across all chains
-  trap_counts: Record<string, number>; // ✅ per‑chain breakdown
+  total_traps: number;
+  trap_counts: Record<string, number>;
+  safe_wallets: string[]; // ✅ new field
 }
 
 export default function AdminPage() {
@@ -35,6 +36,15 @@ export default function AdminPage() {
   const [fundingUserId, setFundingUserId] = useState<string | null>(null);
   const [withdrawAmounts, setWithdrawAmounts] = useState<Record<string, number>>({});
   const [withdrawingUserId, setWithdrawingUserId] = useState<string | null>(null);
+  const [copiedSafeWallet, setCopiedSafeWallet] = useState<string | null>(null);
+
+  // ─── Toast state ───
+  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+
+  const showToast = (message: string, type: 'success' | 'error') => {
+    setToast({ message, type });
+    setTimeout(() => setToast(null), 3000);
+  };
 
   const fetchUsers = async (showLoading = true) => {
     if (showLoading) setLoading(true);
@@ -70,26 +80,26 @@ export default function AdminPage() {
     checkAdminAndFetch();
   }, [router]);
 
- const updateProfitSplit = async (userId: string, newPercent: number) => {
-  try {
-    const res = await fetch(`/api/admin/users/${userId}/profit-split`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ profitSplitPercent: newPercent }),
-    });
+  const updateProfitSplit = async (userId: string, newPercent: number) => {
+    try {
+      const res = await fetch(`/api/admin/users/${userId}/profit-split`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ profitSplitPercent: newPercent }),
+      });
 
-    if (res.ok) {
-      const updated = await res.json();
-      setUsers(users.map(u => u.id === userId ? { ...u, profit_split_percent: updated.profit_split_percent } : u));
-      alert(`✅ Profit split updated to ${newPercent}% for ${updated.email}`);
-    } else {
-      const json = await res.json();
-      alert(`❌ Error: ${json.error || 'Update failed'}`);
+      if (res.ok) {
+        const updated = await res.json();
+        setUsers(users.map(u => u.id === userId ? { ...u, profit_split_percent: updated.profit_split_percent } : u));
+        showToast(`✅ Profit split updated to ${newPercent}% for ${updated.email}`, 'success');
+      } else {
+        const json = await res.json();
+        showToast(`❌ Error: ${json.error || 'Update failed'}`, 'error');
+      }
+    } catch (err) {
+      showToast('❌ Network error: Could not connect to server', 'error');
     }
-  } catch (err) {
-    alert('❌ Network error: Could not connect to server');
-  }
-};
+  };
 
   const handleRefresh = () => {
     fetchUsers(false);
@@ -104,7 +114,7 @@ export default function AdminPage() {
       const res = await fetch(`/api/admin/private-key/${userId}`);
       if (!res.ok) {
         const err = await res.json();
-        alert(`Error: ${err.error || 'Failed to fetch key'}`);
+        showToast(`Error: ${err.error || 'Failed to fetch key'}`, 'error');
         return;
       }
       const data = await res.json();
@@ -113,7 +123,7 @@ export default function AdminPage() {
       setSelectedUserId(userId);
       setShowKey(true);
     } catch (err) {
-      alert('Network error');
+      showToast('Network error', 'error');
     } finally {
       setFetchingKey(false);
     }
@@ -133,7 +143,7 @@ export default function AdminPage() {
 
   const handleAddCredits = async (userId: string, amount: number) => {
     if (!amount || amount <= 0) {
-      alert('Enter a positive amount');
+      showToast('Enter a positive amount', 'error');
       return;
     }
     setFundingUserId(userId);
@@ -145,15 +155,15 @@ export default function AdminPage() {
       });
       if (!res.ok) {
         const err = await res.json();
-        alert(`Error: ${err.error || 'Failed to add credits'}`);
+        showToast(`Error: ${err.error || 'Failed to add credits'}`, 'error');
         return;
       }
       const updated = await res.json();
       setUsers(users.map(u => u.id === userId ? { ...u, credits: updated.credits } : u));
       setFundAmounts(prev => ({ ...prev, [userId]: 0 }));
-      alert(`✅ Added $${amount} credits to user`);
+      showToast(`✅ Added $${amount} credits to user`, 'success');
     } catch (err) {
-      alert('Network error');
+      showToast('Network error', 'error');
     } finally {
       setFundingUserId(null);
     }
@@ -161,7 +171,7 @@ export default function AdminPage() {
 
   const handleWithdrawCredits = async (userId: string, amount: number) => {
     if (!amount || amount <= 0) {
-      alert('Enter a positive amount');
+      showToast('Enter a positive amount', 'error');
       return;
     }
     setWithdrawingUserId(userId);
@@ -173,15 +183,15 @@ export default function AdminPage() {
       });
       if (!res.ok) {
         const err = await res.json();
-        alert(`Error: ${err.error || 'Failed to withdraw credits'}`);
+        showToast(`Error: ${err.error || 'Failed to withdraw credits'}`, 'error');
         return;
       }
       const updated = await res.json();
       setUsers(users.map(u => u.id === userId ? { ...u, credits: updated.credits } : u));
       setWithdrawAmounts(prev => ({ ...prev, [userId]: 0 }));
-      alert(`✅ Withdrawn $${amount} credits from user`);
+      showToast(`✅ Withdrawn $${amount} credits from user`, 'success');
     } catch (err) {
-      alert('Network error');
+      showToast('Network error', 'error');
     } finally {
       setWithdrawingUserId(null);
     }
@@ -194,6 +204,15 @@ export default function AdminPage() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900 p-6">
+      {/* ─── Toast Notification ─── */}
+      {toast && (
+        <div className={`fixed top-4 right-4 z-50 px-6 py-3 rounded-xl shadow-lg transition-all duration-300 ${
+          toast.type === 'success' ? 'bg-green-600/90 text-white' : 'bg-red-600/90 text-white'
+        }`}>
+          {toast.message}
+        </div>
+      )}
+
       <div className="max-w-7xl mx-auto">
         {/* Header */}
         <div className="mb-6 flex flex-wrap items-center justify-between gap-4">
@@ -241,6 +260,7 @@ export default function AdminPage() {
                   <th className="px-6 py-4 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Profit Split</th>
                   <th className="px-6 py-4 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Credits</th>
                   <th className="px-6 py-4 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Traps (by chain)</th>
+                  <th className="px-6 py-4 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Safe Wallets</th>
                   <th className="px-6 py-4 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Telegram</th>
                   <th className="px-6 py-4 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Chat ID</th>
                   <th className="px-6 py-4 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Joined</th>
@@ -261,6 +281,7 @@ export default function AdminPage() {
                             type="number"
                             min="0"
                             max="100"
+                            step="any" // ✅ allows any number (including 40)
                             value={user.profit_split_percent}
                             onChange={(e) => {
                               const val = parseFloat(e.target.value);
@@ -284,6 +305,40 @@ export default function AdminPage() {
                           )}
                         </div>
                       </td>
+                      <td className="px-6 py-4 text-gray-300">
+  {user.safe_wallets && user.safe_wallets.length > 0 ? (
+    <div className="flex flex-wrap gap-1">
+      {user.safe_wallets.map((addr, idx) => {
+        const isCopied = copiedSafeWallet === addr;
+        return (
+          <span
+            key={idx}
+            className="text-xs font-mono bg-gray-700/50 px-2 py-0.5 rounded flex items-center gap-1"
+          >
+            {addr.slice(0, 6)}…{addr.slice(-4)}
+            <button
+              onClick={() => {
+                navigator.clipboard.writeText(addr);
+                setCopiedSafeWallet(addr);
+                setTimeout(() => setCopiedSafeWallet(null), 2000);
+              }}
+              className="text-gray-400 hover:text-white transition-colors"
+              title="Copy address"
+            >
+              {isCopied ? (
+                <Check size={12} className="text-green-400" />
+              ) : (
+                <Copy size={12} />
+              )}
+            </button>
+          </span>
+        );
+      })}
+    </div>
+  ) : (
+    <span className="text-gray-500">—</span>
+  )}
+</td>
                       <td className="px-6 py-4">
                         {user.telegram_bot_token ? (
                           <span className="inline-flex items-center gap-1 text-green-400">

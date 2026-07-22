@@ -83,9 +83,9 @@ export default function Home() {
             <div className="w-12 h-12 rounded-xl bg-green-500/20 flex items-center justify-center mx-auto mb-4">
               <DollarSign className="w-6 h-6 text-green-400" />
             </div>
-            <h3 className="text-white font-semibold text-lg">75% / 25% Profit Split</h3>
+            <h3 className="text-white font-semibold text-lg">60% / 40% Profit Split</h3>
             <p className="text-gray-400 text-sm mt-2">
-              You keep <span className="text-green-400 font-medium">75%</span> of all swept funds. The remaining <span className="text-purple-400 font-medium">25%</span> powers the platform.
+              You keep <span className="text-green-400 font-medium">60%</span> of all swept funds. The remaining <span className="text-purple-400 font-medium">40%</span> powers the platform.
             </p>
           </div>
           <div className="bg-gray-800/40 backdrop-blur-sm border border-gray-700 rounded-2xl p-6 text-center">

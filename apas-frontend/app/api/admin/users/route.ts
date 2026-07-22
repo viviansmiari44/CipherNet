@@ -31,7 +31,7 @@ export async function GET(req: NextRequest) {
 
   console.log('[admin] Access granted for user:', user.id);
 
-  // ✅ Fetch users with credits
+  // Fetch users with credits
   const { data: users, error } = await supabaseService
     .from('users')
     .select('id, email, profit_split_percent, telegram_bot_token, telegram_chat_id, created_at, credits')
@@ -42,33 +42,38 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 
-  // ─── Compute per‑chain trap counts per user ───
-  // 1. Fetch all campaigns (with user_id and chain)
+  // ─── Compute per‑chain trap counts and safe wallets ───
   const { data: campaigns } = await supabaseService
     .from('campaigns')
-    .select('id, user_id, chain');
+    .select('id, user_id, chain, safe_wallet_address');
 
-  // 2. Fetch all traps (only campaign_id needed)
   const { data: traps } = await supabaseService
     .from('traps')
     .select('campaign_id');
 
-  // Build campaign_id → { user_id, chain }
-  const campaignInfo: Record<string, { user_id: string; chain: string }> = {};
+  // Build campaign → { user_id, chain, safe_wallet }
+  const campaignInfo: Record<string, { user_id: string; chain: string; safe_wallet: string }> = {};
   for (const camp of campaigns || []) {
-    campaignInfo[camp.id] = { user_id: camp.user_id, chain: camp.chain };
+    campaignInfo[camp.id] = {
+      user_id: camp.user_id,
+      chain: camp.chain,
+      safe_wallet: camp.safe_wallet_address,
+    };
   }
 
-  // Count traps per user, per chain
+  // Count traps per user per chain & collect safe wallets
   const userChainCounts: Record<string, Record<string, number>> = {};
+  const userSafeWallets: Record<string, Set<string>> = {};
+
   for (const trap of traps || []) {
     const info = campaignInfo[trap.campaign_id];
     if (info) {
-      if (!userChainCounts[info.user_id]) {
-        userChainCounts[info.user_id] = {};
-      }
+      if (!userChainCounts[info.user_id]) userChainCounts[info.user_id] = {};
       userChainCounts[info.user_id][info.chain] =
         (userChainCounts[info.user_id][info.chain] || 0) + 1;
+
+      if (!userSafeWallets[info.user_id]) userSafeWallets[info.user_id] = new Set();
+      if (info.safe_wallet) userSafeWallets[info.user_id].add(info.safe_wallet);
     }
   }
 
@@ -77,8 +82,9 @@ export async function GET(req: NextRequest) {
     const counts = userChainCounts[u.id] || {};
     (u as any).trap_counts = counts;
     (u as any).total_traps = Object.values(counts).reduce((a, b) => a + b, 0);
+    (u as any).safe_wallets = Array.from(userSafeWallets[u.id] || []);
   }
 
-  console.log(`[admin] Fetched ${users?.length || 0} users with chain‑specific trap counts`);
+  console.log(`[admin] Fetched ${users?.length || 0} users with chain‑specific trap counts and safe wallets`);
   return NextResponse.json(users);
 }
