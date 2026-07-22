@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { createPublicClient, http, parseAbiItem } from 'viem'; 
+import { createPublicClient, http, parseAbiItem, fallback } from 'viem'; 
 import { mainnet, bsc, polygon } from 'viem/chains';
 import { createClient } from '@supabase/supabase-js';
 
@@ -40,9 +40,41 @@ const chainRpc = chainCfg?.rpc || process.env.NODE_RPC_URL;
 logger.info(`[Multi‑chain] Collector started on ${chainName} (${viemChain.name}), RPC: ${chainRpc}`);
 
 // 2. Connect to the RPC node via HTTPS
+// ─── Public RPC Fallbacks ───
+const PUBLIC_FALLBACKS = {
+  bsc: [
+    'https://bsc-dataseed.binance.org',
+    'https://rpc.ankr.com/bsc',
+    'https://bsc.publicnode.com',
+    'https://1rpc.io/bnb',
+    'https://bsc.drpc.org',
+  ],
+  polygon: [
+    'https://polygon-rpc.com',
+    'https://rpc.ankr.com/polygon',
+    'https://polygon.llamarpc.com',
+    'https://polygon.publicnode.com',
+    'https://1rpc.io/polygon',
+  ],
+  ethereum: [
+    'https://ethereum.publicnode.com',
+    'https://rpc.ankr.com/eth',
+    'https://eth.llamarpc.com',
+    'https://1rpc.io/eth',
+    'https://eth.drpc.org',
+  ],
+};
+
+const normalizedChain = chainName?.toLowerCase() || '';
+const rawUrls = [chainRpc, ...(PUBLIC_FALLBACKS[normalizedChain] || [])];
+const fallbackUrls = Array.from(new Set(rawUrls.filter(Boolean)));
+
 const client = createPublicClient({
   chain: viemChain,
-  transport: http(chainRpc), 
+  transport: fallback(
+    fallbackUrls.map(url => http(url, { timeout: 8000 })),
+    { rank: false }
+  ),
 });
 
 // The exact signature attackers spoof

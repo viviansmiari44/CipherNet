@@ -126,39 +126,81 @@ class POAHTTPProvider(Web3.HTTPProvider):
                     response['result']['extraData'] = '0x' + extra_bytes[:32].hex()
         return response
 
-# --- RPC setup ---
+# Handle POA middleware import across different web3.py versions
+try:
+    from web3.middleware import geth_poa_middleware
+except ImportError:
+    try:
+        from web3.middleware import ExtraDataToPOAMiddleware as geth_poa_middleware
+    except ImportError:
+        geth_poa_middleware = None
+
+
+# ─── Public RPC fallbacks (Verified High-Availability Nodes) ───
+PUBLIC_RPC_FALLBACKS = {
+    'bsc': [
+        'https://bsc-dataseed.binance.org',
+        'https://rpc.ankr.com/bsc',
+        'https://bsc.publicnode.com',
+        'https://1rpc.io/bnb',
+        'https://bsc.drpc.org',
+        'https://bsc-dataseed1.defibit.io',
+    ],
+    'polygon': [
+        'https://polygon-rpc.com',
+        'https://rpc.ankr.com/polygon',
+        'https://polygon.llamarpc.com',
+        'https://polygon.publicnode.com',
+        'https://1rpc.io/polygon',
+        'https://polygon.drpc.org',
+    ],
+    'ethereum': [
+        'https://ethereum.publicnode.com',
+        'https://rpc.ankr.com/eth',
+        'https://eth.llamarpc.com',
+        'https://1rpc.io/eth',
+        'https://eth.drpc.org',
+    ],
+}
+
 def get_web3():
-    rpc_urls = [
-        RPC_URL,
-        config.DUSTER_RPC_URL,
-        os.getenv("DUSTER_RPC_URL"),
-        os.getenv("NODE_RPC_URL"),
-    ] + config.FALLBACK_RPC_URLS
-    rpc_urls = [url for url in rpc_urls if url]
+    # Helper lambda to safely extract config/env variables if defined
+    get_var = lambda name: getattr(config, name, None) or os.getenv(name)
+
+    # Build ordered list: primary first, then public fallbacks
+    raw_urls = [
+        get_var("RPC_URL"),
+        get_var("DUSTER_RPC_URL"),
+        get_var("NODE_RPC_URL"),
+    ] + getattr(config, "FALLBACK_RPC_URLS", []) + PUBLIC_RPC_FALLBACKS.get(CHAIN.lower(), [])
+
+    # Filter out None, empty strings, and duplicates while preserving order
+    rpc_urls = list(dict.fromkeys([url for url in raw_urls if url]))
 
     print(f'[DEBUG] Trying {len(rpc_urls)} RPC URLs...')
+
     for url in rpc_urls:
         try:
             print(f'[DEBUG] Connecting to {url}...')
-            if CHAIN.lower() in ('bsc', 'polygon'):
-                provider = POAHTTPProvider(url)
-                print(f'[DEBUG] Using POAHTTPProvider for chain={CHAIN}')
-            else:
-                provider = Web3.HTTPProvider(url)
-
+            
+            # Use HTTPProvider for connections
+            provider = Web3.HTTPProvider(url, request_kwargs={'timeout': 10})
             w3 = Web3(provider)
+
             if w3.is_connected():
-                if geth_poa_middleware is not None:
+                # Inject POA middleware if required for BSC/Polygon
+                if CHAIN.lower() in ('bsc', 'polygon') and geth_poa_middleware is not None:
                     try:
                         w3.middleware_onion.inject(geth_poa_middleware, layer=0)
                     except Exception as e:
-                        print(f'[DEBUG] Could not inject official POA middleware: {e}')
+                        print(f'[DEBUG] POA middleware injection skipped/failed: {e}')
 
                 logger.info(f"Connected to RPC: {url}")
                 return w3
         except Exception as e:
-            print(f'[DEBUG] Failed: {e}')
+            print(f'[DEBUG] Connection failed for {url}: {e}')
             continue
+
     logger.critical("No RPC connection available.")
     sys.exit(1)
 

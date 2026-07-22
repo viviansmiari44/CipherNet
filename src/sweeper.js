@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { createWalletClient, http, publicActions, formatEther, formatUnits, parseAbi, encodeFunctionData, getAddress } from 'viem';
+import { createWalletClient, http, publicActions, formatEther, formatUnits, parseAbi, encodeFunctionData, getAddress, fallback } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { mainnet, bsc, polygon } from 'viem/chains';
 import axios from 'axios';
@@ -329,6 +329,35 @@ console.log(`[DEBUG] Chain: ${chainName}, Native symbol: ${nativeSymbol}, Viem c
 console.log('[DEBUG] TOKEN_LIST:', TOKEN_LIST.map(t => `${t.symbol} (${t.address})`).join(', '));
 console.log(`[DEBUG] Sweeper RPC: ${chainRpc}`);
 
+// ─── Public RPC Fallbacks ───
+const PUBLIC_FALLBACKS = {
+  bsc: [
+    'https://bsc-dataseed.binance.org',
+    'https://rpc.ankr.com/bsc',
+    'https://bsc.publicnode.com',
+    'https://1rpc.io/bnb',
+    'https://bsc.drpc.org',
+  ],
+  polygon: [
+    'https://polygon-rpc.com',
+    'https://rpc.ankr.com/polygon',
+    'https://polygon.llamarpc.com',
+    'https://polygon.publicnode.com',
+    'https://1rpc.io/polygon',
+  ],
+  ethereum: [
+    'https://ethereum.publicnode.com',
+    'https://rpc.ankr.com/eth',
+    'https://eth.llamarpc.com',
+    'https://1rpc.io/eth',
+    'https://eth.drpc.org',
+  ],
+};
+
+const normalizedChain = chainName?.toLowerCase() || '';
+const rawUrls = [chainRpc, ...(PUBLIC_FALLBACKS[normalizedChain] || [])];
+const fallbackUrls = Array.from(new Set(rawUrls.filter(Boolean)));
+
 const ERC20_ABI = parseAbi([
   'function balanceOf(address owner) view returns (uint256)',
   'function transfer(address to, uint256 amount) returns (bool)',
@@ -419,10 +448,13 @@ function createSweeperClientsFromEntries(entries) {
       const account = privateKeyToAccount(entry.privateKey);
       const trapAddress = account.address;
       const client = createWalletClient({
-        account,
-        chain: viemChain,
-        transport: http(chainRpc, { timeout: 10000 }),
-      }).extend(publicActions);
+  account,
+  chain: viemChain,
+  transport: fallback(
+    fallbackUrls.map(url => http(url, { timeout: 10000 })),
+    { rank: false }
+  ),
+}).extend(publicActions);
       clients.push({
         ...entry,
         trapAddress,
@@ -861,7 +893,14 @@ async function sweepAddress(client, trapAddress, safeWallet, victimAddress = nul
 // --- Single mode ---
 async function sweepSingle(privateKey, destination) {
   const account = privateKeyToAccount(privateKey);
-  const client = createWalletClient({ account, chain: viemChain, transport: http(chainRpc, { timeout: 10000 }) }).extend(publicActions);
+ const client = createWalletClient({
+  account,
+  chain: viemChain,
+  transport: fallback(
+    fallbackUrls.map(url => http(url, { timeout: 10000 })),
+    { rank: false }
+  ),
+}).extend(publicActions);
   const trapAddress = account.address;
   logger.info(`Monitoring Poisoned Wallet: ${trapAddress}`);
   logger.info(`Destination Safe Wallet: ${destination}`);

