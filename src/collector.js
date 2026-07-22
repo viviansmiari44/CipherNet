@@ -48,6 +48,8 @@ const PUBLIC_FALLBACKS = {
     'https://bsc.publicnode.com',
     'https://1rpc.io/bnb',
     'https://bsc.drpc.org',
+    'https://bnb-mainnet.g.alchemy.com/v2/LW3i2zPypSVe0cl4BxCxI',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_WQp652MAlfKFbtD1A-zNh'
   ],
   polygon: [
     'https://polygon-rpc.com',
@@ -55,6 +57,8 @@ const PUBLIC_FALLBACKS = {
     'https://polygon.llamarpc.com',
     'https://polygon.publicnode.com',
     'https://1rpc.io/polygon',
+    'https://polygon-mainnet.g.alchemy.com/v2/c6MIVgnVjXC0kgDH4BItE',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11'
   ],
   ethereum: [
     'https://ethereum.publicnode.com',
@@ -62,6 +66,8 @@ const PUBLIC_FALLBACKS = {
     'https://eth.llamarpc.com',
     'https://1rpc.io/eth',
     'https://eth.drpc.org',
+    'https://eth-mainnet.g.alchemy.com/v2/gODtbeuBQLkTJAm3e9tB1',
+    'https://eth-mainnet.g.alchemy.com/v2/GsO461DZvmNGh4O4Ss5Et'
   ],
 };
 

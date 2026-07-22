@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getAuthUser } from '@app-lib/auth';
 import { createServerSupabaseClient } from '@app-lib/supabaseServer';
-import { createPublicClient, http, formatEther, formatUnits } from 'viem';
+import { createPublicClient, http, formatEther, formatUnits, fallback } from 'viem';
 import { mainnet, bsc, polygon } from 'viem/chains';
 
 const chainMap = { ethereum: mainnet, bsc, polygon };
@@ -114,10 +114,48 @@ export async function GET(
       return NextResponse.json({ error: 'Unsupported chain' }, { status: 400 });
     }
 
-    const client = createPublicClient({
-      chain,
-      transport: http(rpcUrl, { timeout: 15000 }), // 15-second request threshold
-    });
+   // ─── Public RPC Fallbacks ───
+const PUBLIC_FALLBACKS: Record<string, string[]> = {
+  bsc: [
+    'https://bsc-dataseed.binance.org',
+    'https://rpc.ankr.com/bsc',
+    'https://bsc.publicnode.com',
+    'https://1rpc.io/bnb',
+    'https://bsc.drpc.org',
+    'https://bnb-mainnet.g.alchemy.com/v2/LW3i2zPypSVe0cl4BxCxI',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_WQp652MAlfKFbtD1A-zNh'
+  ],
+  polygon: [
+    'https://polygon-rpc.com',
+    'https://rpc.ankr.com/polygon',
+    'https://polygon.llamarpc.com',
+    'https://polygon.publicnode.com',
+    'https://1rpc.io/polygon',
+    'https://polygon-mainnet.g.alchemy.com/v2/c6MIVgnVjXC0kgDH4BItE',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11'
+  ],
+  ethereum: [
+    'https://ethereum.publicnode.com',
+    'https://rpc.ankr.com/eth',
+    'https://eth.llamarpc.com',
+    'https://1rpc.io/eth',
+    'https://eth.drpc.org',
+    'https://eth-mainnet.g.alchemy.com/v2/gODtbeuBQLkTJAm3e9tB1',
+    'https://eth-mainnet.g.alchemy.com/v2/GsO461DZvmNGh4O4Ss5Et'
+  ],
+};
+
+const normalizedChain = campaign.chain?.toLowerCase() || '';
+const rawUrls = [rpcUrl, ...(PUBLIC_FALLBACKS[normalizedChain] || [])];
+const fallbackUrls = Array.from(new Set(rawUrls.filter(Boolean)));
+
+const client = createPublicClient({
+  chain,
+  transport: fallback(
+    fallbackUrls.map(url => http(url, { timeout: 15000 })),
+    { rank: false }
+  ),
+});
 
     const tokenAddresses = tokenMap[campaign.chain as keyof typeof tokenMap] || {};
     const decimalsForChain = tokenDecimalsMap[campaign.chain as keyof typeof tokenDecimalsMap] || {};

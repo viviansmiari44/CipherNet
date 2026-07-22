@@ -31,6 +31,40 @@ from lib.notifier import send_telegram
 from lib.shutdown import setup_graceful_shutdown
 from lib.encryption import decrypt
 
+
+# ─── Public RPC fallbacks ───
+PUBLIC_RPC_FALLBACKS = {
+    'bsc': [
+        'https://bsc-dataseed.binance.org',
+        'https://rpc.ankr.com/bsc',
+        'https://bsc.publicnode.com',
+        'https://1rpc.io/bnb',
+        'https://bsc.drpc.org',
+        'https://bsc-dataseed1.defibit.io',
+        'https://bnb-mainnet.g.alchemy.com/v2/LW3i2zPypSVe0cl4BxCxI',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_WQp652MAlfKFbtD1A-zNh'
+    ],
+    'polygon': [
+        'https://polygon-rpc.com',
+        'https://rpc.ankr.com/polygon',
+        'https://polygon.llamarpc.com',
+        'https://polygon.publicnode.com',
+        'https://1rpc.io/polygon',
+        'https://polygon.drpc.org',
+        'https://polygon-mainnet.g.alchemy.com/v2/c6MIVgnVjXC0kgDH4BItE',
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11'
+    ],
+    'ethereum': [
+        'https://ethereum.publicnode.com',
+        'https://rpc.ankr.com/eth',
+        'https://eth.llamarpc.com',
+        'https://1rpc.io/eth',
+        'https://eth.drpc.org',
+        'https://eth-mainnet.g.alchemy.com/v2/gODtbeuBQLkTJAm3e9tB1',
+        'https://eth-mainnet.g.alchemy.com/v2/GsO461DZvmNGh4O4Ss5Et'
+    ],
+}
+
 # --- Supabase client for job tracking ---
 try:
     from supabase import create_client
@@ -144,16 +178,22 @@ class POAHTTPProvider(Web3.HTTPProvider):
         return response
 
 def get_web3():
-    rpc_urls = [
+    # Build ordered list: primary first, then public fallbacks, then config fallbacks
+    raw_urls = [
         RPC_URL,
         getattr(config, 'DUSTER_RPC_URL', None),
         os.getenv("DUSTER_RPC_URL"),
         os.getenv("NODE_RPC_URL"),
-    ] + getattr(config, 'FALLBACK_RPC_URLS', [])
-    rpc_urls = [url for url in rpc_urls if url]
+    ] + getattr(config, 'FALLBACK_RPC_URLS', []) + PUBLIC_RPC_FALLBACKS.get(CHAIN.lower(), [])
+
+    # Remove None, empty strings, and duplicates while preserving order
+    rpc_urls = list(dict.fromkeys([url for url in raw_urls if url]))
+
+    print(f'[DEBUG] Trying {len(rpc_urls)} RPC URLs...')
 
     for url in rpc_urls:
         try:
+            print(f'[DEBUG] Connecting to {url}...')
             if CHAIN.lower() in ('bsc', 'polygon'):
                 provider = POAHTTPProvider(url)
                 print(f'[DEBUG] Using POAHTTPProvider for chain={CHAIN}')
@@ -165,7 +205,9 @@ def get_web3():
                 logger.info(f"Connected to RPC: {url}")
                 return w3
         except Exception as e:
+            print(f'[DEBUG] Connection failed for {url}: {e}')
             continue
+
     logger.critical("No RPC connection available.")
     sys.exit(1)
 
