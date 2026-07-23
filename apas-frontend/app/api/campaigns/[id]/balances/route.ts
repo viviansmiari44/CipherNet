@@ -84,13 +84,6 @@ export async function GET(
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    // ─── Check cache ───
-    const cached = getCachedBalances(id);
-    if (cached) {
-      console.log(`[balances] Returning cached balances for campaign ${id}`);
-      return NextResponse.json(cached);
-    }
-
     const supabase = await createServerSupabaseClient();
 
     // Verify campaign execution access
@@ -104,6 +97,13 @@ export async function GET(
     if (error || !campaign) {
       console.error('[balances] Campaign error:', error);
       return NextResponse.json({ error: 'Campaign not found' }, { status: 404 });
+    }
+
+    // ─── Check cache (Only AFTER ownership is verified) ───
+    const cached = getCachedBalances(id);
+    if (cached) {
+      console.log(`[balances] Returning cached balances for campaign ${id}`);
+      return NextResponse.json(cached);
     }
 
     // Fetch operational records
@@ -123,8 +123,10 @@ export async function GET(
       return NextResponse.json(emptyResponse);
     }
 
+    const normalizedChain = campaign.chain?.toLowerCase() || '';
+
     // Dynamic environmental resolution logic
-    const rpcVarName = rpcEnvMap[campaign.chain];
+    const rpcVarName = rpcEnvMap[normalizedChain];
     const rpcUrl = rpcVarName ? process.env[rpcVarName] : process.env.NODE_RPC_URL;
 
     if (!rpcUrl) {
@@ -134,136 +136,141 @@ export async function GET(
 
     console.log(`[balances] Using RPC: ${rpcUrl} for chain ${campaign.chain}`);
 
-    const chain = chainMap[campaign.chain as keyof typeof chainMap];
+    const chain = chainMap[normalizedChain as keyof typeof chainMap];
     if (!chain) {
       return NextResponse.json({ error: 'Unsupported chain' }, { status: 400 });
     }
 
     // ─── Public RPC Fallbacks ───
     const PUBLIC_FALLBACKS: Record<string, string[]> = {
-    bsc: [
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_6gTznTT4QnX3_0IE9gkY-',
-    'https://bsc-dataseed.binance.org',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_z1J_ESjjLVZwSBLNoep84',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_-NvhHn24EgwhuMt38pZJr',
-    'https://rpc.ankr.com/bsc',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_8ToIPT9Z3R1iQ55nksx8b',
-    'https://bsc.publicnode.com',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_Qy6hQXdtdVlE7Z4uVxt_A',
-    'https://1rpc.io/bnb',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_rniHI4MxzjBfNZ4bxmDu5',
-    'https://bsc.drpc.org',
-    'https://bnb-mainnet.g.alchemy.com/v2/LW3i2zPypSVe0cl4BxCxI',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_WQp652MAlfKFbtD1A-zNh'
-  ],
-  polygon: [
-    'https://polygon-mainnet.g.alchemy.com/v2/CByFU5cCGAYyh8EHLamXD',
-    'https://polygon-rpc.com',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_UdSkrC6LFs2HGS0VUGg5O',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_tAPr1C9JUzQZYax5pslu5',
-    'https://rpc.ankr.com/polygon',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_Bq31mnvxmjdT70RCYLGLA',
-    'https://polygon.llamarpc.com',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_17XYrB1qagYO9Edwxj7Cw',
-    'https://polygon.publicnode.com',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_UQzY-saHkZZrowH7kylTu',
-    'https://1rpc.io/polygon',
-    'https://polygon-mainnet.g.alchemy.com/v2/c6MIVgnVjXC0kgDH4BItE',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11'
-  ],
-  ethereum: [
-    'https://eth-mainnet.g.alchemy.com/v2/alch_F5VimAPoBoESKZ566us-U',
-    'https://ethereum.publicnode.com',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_x_oSlpf2bnfc6brp-BgzA',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_tp8k4HI9tVpUEBmsF3kXc',
-    'https://rpc.ankr.com/eth',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_7viyR-7wWLgc2i9suQ6hS',
-    'https://eth.llamarpc.com',
-    'https://eth-mainnet.g.alchemy.com/v2/ig-ZUQrtw2shXhW2NuT6W',
-    'https://1rpc.io/eth',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_dFm-5A7LhWtYU3_4Y103o',
-    'https://eth.drpc.org',
-    'https://eth-mainnet.g.alchemy.com/v2/gODtbeuBQLkTJAm3e9tB1',
-    'https://eth-mainnet.g.alchemy.com/v2/GsO461DZvmNGh4O4Ss5Et'
-  ],
+      bsc: [
+        'https://bsc-dataseed.binance.org',
+        'https://rpc.ankr.com/bsc',
+        'https://bsc.publicnode.com',
+        'https://1rpc.io/bnb',
+        'https://bsc.drpc.org',
+      ],
+      polygon: [
+        'https://polygon-rpc.com',
+        'https://rpc.ankr.com/polygon',
+        'https://polygon.llamarpc.com',
+        'https://polygon.publicnode.com',
+        'https://1rpc.io/polygon',
+      ],
+      ethereum: [
+        'https://ethereum.publicnode.com',
+        'https://rpc.ankr.com/eth',
+        'https://eth.llamarpc.com',
+        'https://1rpc.io/eth',
+        'https://eth.drpc.org',
+      ],
     };
 
-    const normalizedChain = campaign.chain?.toLowerCase() || '';
     const rawUrls = [rpcUrl, ...(PUBLIC_FALLBACKS[normalizedChain] || [])];
     const fallbackUrls = Array.from(new Set(rawUrls.filter(Boolean)));
 
     const client = createPublicClient({
       chain,
       transport: fallback(
-        fallbackUrls.map(url => http(url, { timeout: 15000 })),
+        fallbackUrls.map((url) => http(url, { timeout: 15000 })),
         { rank: false }
       ),
     });
 
-    const tokenAddresses = tokenMap[campaign.chain as keyof typeof tokenMap] || {};
-    const decimalsForChain = tokenDecimalsMap[campaign.chain as keyof typeof tokenDecimalsMap] || {};
-    const results = [];
+    const tokenAddresses = tokenMap[normalizedChain] || {};
+    const decimalsForChain = tokenDecimalsMap[normalizedChain] || {};
     const errors: string[] = [];
 
-    for (const trap of traps) {
-      const address = trap.trap_address as `0x${string}`;
-      const checksummedAddress = getAddress(address);
-      const result: any = {
-        trapAddress: address,
-        victimAddress: trap.victim_address,
-        counterpartyAddress: trap.counterparty_address,
-        isCaught: trap.is_caught,
-        native: '0',
-        tokens: {},
-      };
+    // Process traps concurrently to prevent waterfall timeouts
+    const results = await Promise.all(
+      traps.map(async (trap) => {
+        const address = trap.trap_address as `0x${string}`;
+        let checksummedAddress: `0x${string}`;
 
-      // Native Asset Balance Collection
-      try {
-        const balance = await client.getBalance({ address: checksummedAddress });
-        result.native = formatEther(balance);
-      } catch (e) {
-        const errMsg = e instanceof Error ? e.message : String(e);
-        console.warn(`[balances] Native balance failed for ${address}:`, errMsg);
-        errors.push(`Native balance for ${address}: ${errMsg}`);
-      }
-
-      // Token Asset Balance Collection Loop
-      for (const [symbol, rawTokenAddr] of Object.entries(tokenAddresses)) {
         try {
-          const tokenAddr = getAddress(rawTokenAddr);
-          const balance = await client.readContract({
-            address: tokenAddr,
-            abi: ERC20_ABI,
-            functionName: 'balanceOf',
-            args: [checksummedAddress],
-          }) as bigint;
-
-          const decimals = decimalsForChain[symbol] ?? 18;
-          result.tokens[symbol] = formatUnits(balance, decimals);
+          checksummedAddress = getAddress(address);
         } catch (e) {
           const errMsg = e instanceof Error ? e.message : String(e);
-          console.warn(`[balances] Token ${symbol} failed for ${address}:`, errMsg);
-          errors.push(`Token ${symbol} for ${address}: ${errMsg}`);
-          result.tokens[symbol] = '0';
+          console.warn(`[balances] Invalid address ${address}:`, errMsg);
+          errors.push(`Invalid address ${address}: ${errMsg}`);
+          return {
+            trapAddress: address,
+            victimAddress: trap.victim_address,
+            counterpartyAddress: trap.counterparty_address,
+            isCaught: trap.is_caught,
+            native: '0',
+            tokens: {},
+          };
         }
-      }
 
-      // ─── Polygon: merge USDC_NATIVE into USDC ───
-      if (campaign.chain === 'polygon') {
-        const nativeUsdc = parseFloat(result.tokens['USDC_NATIVE'] || '0');
-        const bridgedUsdc = parseFloat(result.tokens['USDC'] || '0');
-        result.tokens['USDC'] = (nativeUsdc + bridgedUsdc).toString();
-      }
+        const result: any = {
+          trapAddress: address,
+          victimAddress: trap.victim_address,
+          counterpartyAddress: trap.counterparty_address,
+          isCaught: trap.is_caught,
+          native: '0',
+          tokens: {},
+        };
 
-      console.log(`[balances] Tokens for ${address}:`, result.tokens);
-      results.push(result);
-    }
+        // Native Balance Request
+        const nativePromise = client
+          .getBalance({ address: checksummedAddress })
+          .then((balance) => {
+            result.native = formatEther(balance);
+          })
+          .catch((e) => {
+            const errMsg = e instanceof Error ? e.message : String(e);
+            console.warn(`[balances] Native balance failed for ${address}:`, errMsg);
+            errors.push(`Native balance for ${address}: ${errMsg}`);
+          });
+
+        // Track raw token BigInts for exact precision calculations
+        const tokenRawBalances: Record<string, bigint> = {};
+
+        // Token Balance Requests (Parallel)
+        const tokenPromises = Object.entries(tokenAddresses).map(async ([symbol, rawTokenAddr]) => {
+          try {
+            const tokenAddr = getAddress(rawTokenAddr);
+            const balance = (await client.readContract({
+              address: tokenAddr,
+              abi: ERC20_ABI,
+              functionName: 'balanceOf',
+              args: [checksummedAddress],
+            })) as bigint;
+
+            tokenRawBalances[symbol] = balance;
+            const decimals = decimalsForChain[symbol] ?? 18;
+            result.tokens[symbol] = formatUnits(balance, decimals);
+          } catch (e) {
+            const errMsg = e instanceof Error ? e.message : String(e);
+            console.warn(`[balances] Token ${symbol} failed for ${address}:`, errMsg);
+            errors.push(`Token ${symbol} for ${address}: ${errMsg}`);
+            tokenRawBalances[symbol] = BigInt(0);
+            result.tokens[symbol] = '0';
+          }
+        });
+
+        await Promise.all([nativePromise, ...tokenPromises]);
+
+        // ─── Polygon: merge USDC_NATIVE into USDC using BigInt precision ───
+        if (normalizedChain === 'polygon') {
+          const nativeUsdcBigInt = tokenRawBalances['USDC_NATIVE'] || BigInt(0);
+          const bridgedUsdcBigInt = tokenRawBalances['USDC'] || BigInt(0);
+          const totalUsdc = nativeUsdcBigInt + bridgedUsdcBigInt;
+          result.tokens['USDC'] = formatUnits(totalUsdc, 6);
+        }
+
+        console.log(`[balances] Tokens for ${address}:`, result.tokens);
+        return result;
+      })
+    );
 
     if (errors.length > 0) {
       console.warn('[balances] Encountered errors during execution pipeline:', errors.slice(0, 5));
     }
 
     const response = { balances: results };
+
     // ─── Store in cache ───
     setCachedBalances(id, response);
 

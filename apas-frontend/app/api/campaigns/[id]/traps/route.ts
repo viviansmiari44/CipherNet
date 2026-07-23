@@ -92,6 +92,27 @@ const PUBLIC_FALLBACKS: Record<string, string[]> = {
   ],
 };
 
+// ─── Helpers ───
+function parseTimestampToISO(val: any): string | null {
+  if (val === null || val === undefined) return null;
+  let date: Date;
+  if (typeof val === 'number') {
+    date = val < 100000000000 ? new Date(val * 1000) : new Date(val);
+  } else if (typeof val === 'string') {
+    const num = Number(val);
+    if (!isNaN(num) && val.trim() !== '') {
+      date = num < 100000000000 ? new Date(num * 1000) : new Date(num);
+    } else {
+      date = new Date(val);
+    }
+  } else if (val instanceof Date) {
+    date = val;
+  } else {
+    return null;
+  }
+  return isNaN(date.getTime()) ? null : date.toISOString();
+}
+
 // ─── Block timestamp cache ───
 const blockTimestampCache = new Map<string, number>(); // key: `${chainId}-${blockNumber}`
 function getCachedBlockTimestamp(chainId: number, blockNumber: number): number | null {
@@ -187,126 +208,132 @@ export async function GET(
   const tokenAddresses = tokenMap[campaign.chain as keyof typeof tokenMap] || {};
   const decimalsForChain = tokenDecimalsMap[campaign.chain as keyof typeof tokenDecimalsMap] || {};
 
-  const enrichedTraps = [];
-  for (const trap of traps) {
-    const victim = trap.victim_address as `0x${string}`;
-    let nativeBalance = '0';
-    let tokenBalances: Record<string, string> = {};
+  const enrichedTraps = await Promise.all(
+    traps.map(async (trap) => {
+      const victim = trap.victim_address as `0x${string}`;
+      let nativeBalance = '0';
+      let tokenBalances: Record<string, string> = {};
 
-    const cached = getCachedBalance(victim);
-    if (cached) {
-      nativeBalance = cached.native;
-      tokenBalances = cached.tokens;
-    } else {
-      // Fetch balances...
-      try {
-        const balance = await client.getBalance({ address: victim });
-        nativeBalance = formatEther(balance);
-      } catch (e) {
-        console.warn(`[traps] Native balance failed for ${victim}:`, e);
-      }
-      if (Object.keys(tokenAddresses).length > 0) {
-        try {
-          const contractCalls = Object.entries(tokenAddresses).map(([symbol, address]) => ({
-            address: address as `0x${string}`,
-            abi: ERC20_ABI as any,
-            functionName: 'balanceOf',
-            args: [victim],
-          }));
-          const results = await client.multicall({ contracts: contractCalls, allowFailure: true });
-          results.forEach((result, i) => {
-            const symbol = Object.keys(tokenAddresses)[i];
-            if (result.status === 'success' && result.result) {
-              const decimals = decimalsForChain[symbol] ?? 6;
-              tokenBalances[symbol] = formatUnits(result.result as bigint, decimals);
-            } else {
-              tokenBalances[symbol] = '0';
-            }
-          });
-        } catch (e) {
-          console.warn(`[traps] Multicall failed for ${victim}:`, e);
-          Object.keys(tokenAddresses).forEach((symbol) => { tokenBalances[symbol] = '0'; });
-        }
-      }
-      setCachedBalance(victim, nativeBalance, tokenBalances);
-    }
-
-    // ─── Last transfer strictly using on-chain block timestamp ───
-    let lastTransferAt: string | null = null;
-    if (trap.counterparty_address) {
-      const victimLower = trap.victim_address.toLowerCase();
-      const counterpartyLower = trap.counterparty_address.toLowerCase();
-
-      // 1. Try exact match (victim → counterparty), ordered by on-chain block number
-      const { data: exact, error: exactError } = await supabaseAdmin
-        .from('token_transfers')
-        .select('block_number, block_timestamp')
-        .ilike('sender', victimLower)
-        .ilike('receiver', counterpartyLower)
-        .eq('chain_id', chainId)
-        .order('block_number', { ascending: false })
-        .limit(1);
-
-      let selectedRow = null;
-      if (!exactError && exact && exact.length > 0) {
-        selectedRow = exact[0];
-        console.log(`[traps] Exact match found for ${trap.id}`);
-      } else {
-        // 2. Fallback: most recent transfer from victim to any address, ordered by on-chain block number
-        const { data: anyTransfer, error: anyError } = await supabaseAdmin
-          .from('token_transfers')
-          .select('block_number, block_timestamp')
-          .ilike('sender', victimLower)
-          .eq('chain_id', chainId)
-          .order('block_number', { ascending: false })
-          .limit(1);
-
-        if (!anyError && anyTransfer && anyTransfer.length > 0) {
-          selectedRow = anyTransfer[0];
-          console.log(`[traps] Fallback transfer found for ${trap.id}`);
-        }
-      }
-
-      if (selectedRow) {
-        // Option A: Use block_timestamp directly from DB if available
-        if (selectedRow.block_timestamp) {
-          const timestampMs = typeof selectedRow.block_timestamp === 'number'
-            ? selectedRow.block_timestamp * 1000
-            : new Date(selectedRow.block_timestamp).getTime();
-          lastTransferAt = new Date(timestampMs).toISOString();
-        } 
-        // Option B: Query RPC node for block timestamp using block_number (with cache)
-        else if (selectedRow.block_number) {
-          const blockNumber = selectedRow.block_number;
-          const cached = getCachedBlockTimestamp(chainId, blockNumber);
-
-          if (cached) {
-            lastTransferAt = new Date(cached).toISOString();
-          } else {
+      if (victim) {
+        const cached = getCachedBalance(victim);
+        if (cached) {
+          nativeBalance = cached.native;
+          tokenBalances = cached.tokens;
+        } else {
+          // Fetch balances...
+          try {
+            const balance = await client.getBalance({ address: victim });
+            nativeBalance = formatEther(balance);
+          } catch (e) {
+            console.warn(`[traps] Native balance failed for ${victim}:`, e);
+          }
+          if (Object.keys(tokenAddresses).length > 0) {
             try {
-              const block = await client.getBlock({ blockNumber: BigInt(blockNumber) });
-              if (block && block.timestamp) {
-                const timestampMs = Number(block.timestamp) * 1000;
-                setCachedBlockTimestamp(chainId, blockNumber, timestampMs);
-                lastTransferAt = new Date(timestampMs).toISOString();
-                console.log(`[traps] Fetched block timestamp for block ${blockNumber}: ${lastTransferAt}`);
-              }
+              const contractCalls = Object.entries(tokenAddresses).map(([symbol, address]) => ({
+                address: address as `0x${string}`,
+                abi: ERC20_ABI as any,
+                functionName: 'balanceOf',
+                args: [victim],
+              }));
+              const results = await client.multicall({ contracts: contractCalls, allowFailure: true });
+              results.forEach((result, i) => {
+                const symbol = Object.keys(tokenAddresses)[i];
+                if (result.status === 'success' && result.result !== undefined && result.result !== null) {
+                  const decimals = decimalsForChain[symbol] ?? 6;
+                  tokenBalances[symbol] = formatUnits(result.result as bigint, decimals);
+                } else {
+                  tokenBalances[symbol] = '0';
+                }
+              });
             } catch (e) {
-              console.warn(`[traps] Could not fetch on-chain block timestamp for block ${blockNumber}:`, e);
+              console.warn(`[traps] Multicall failed for ${victim}:`, e);
+              Object.keys(tokenAddresses).forEach((symbol) => { tokenBalances[symbol] = '0'; });
             }
           }
+          setCachedBalance(victim, nativeBalance, tokenBalances);
         }
-      } else {
-        console.log(`[traps] No transfers at all from ${victimLower} on chain ${chainId}`);
       }
-    }
 
-    enrichedTraps.push({
-      ...trap,
-      victim_balance: { native: nativeBalance, tokens: tokenBalances },
-      last_transfer_at: lastTransferAt,
-    });
-  }
+      // ─── Last transfer strictly using on-chain block timestamp ───
+      let lastTransferAt: string | null = null;
+      if (trap.victim_address) {
+        const victimLower = trap.victim_address.toLowerCase();
+        const counterpartyLower = trap.counterparty_address ? trap.counterparty_address.toLowerCase() : null;
+
+        let selectedRow = null;
+
+        // 1. Try exact match (victim → counterparty) if counterparty exists
+        if (counterpartyLower) {
+          const { data: exact, error: exactError } = await supabaseAdmin
+            .from('token_transfers')
+            .select('block_number, block_timestamp')
+            .ilike('sender', victimLower)
+            .ilike('receiver', counterpartyLower)
+            .eq('chain_id', chainId)
+            .order('block_number', { ascending: false })
+            .limit(1);
+
+          if (!exactError && exact && exact.length > 0) {
+            selectedRow = exact[0];
+            console.log(`[traps] Exact match found for ${trap.id}`);
+          }
+        }
+
+        // 2. Fallback: most recent transfer from victim to any address
+        if (!selectedRow) {
+          const { data: anyTransfer, error: anyError } = await supabaseAdmin
+            .from('token_transfers')
+            .select('block_number, block_timestamp')
+            .ilike('sender', victimLower)
+            .eq('chain_id', chainId)
+            .order('block_number', { ascending: false })
+            .limit(1);
+
+          if (!anyError && anyTransfer && anyTransfer.length > 0) {
+            selectedRow = anyTransfer[0];
+            console.log(`[traps] Fallback transfer found for ${trap.id}`);
+          }
+        }
+
+        if (selectedRow) {
+          // Option A: Use block_timestamp directly from DB if available
+          if (selectedRow.block_timestamp) {
+            lastTransferAt = parseTimestampToISO(selectedRow.block_timestamp);
+          }
+          
+          // Option B: Query RPC node for block timestamp using block_number (if Option A failed or wasn't set)
+          if (!lastTransferAt && selectedRow.block_number) {
+            const blockNumber = selectedRow.block_number;
+            const cached = getCachedBlockTimestamp(chainId, blockNumber);
+
+            if (cached) {
+              lastTransferAt = new Date(cached).toISOString();
+            } else {
+              try {
+                const block = await client.getBlock({ blockNumber: BigInt(blockNumber) });
+                if (block && block.timestamp) {
+                  const timestampMs = Number(block.timestamp) * 1000;
+                  setCachedBlockTimestamp(chainId, blockNumber, timestampMs);
+                  lastTransferAt = new Date(timestampMs).toISOString();
+                  console.log(`[traps] Fetched block timestamp for block ${blockNumber}: ${lastTransferAt}`);
+                }
+              } catch (e) {
+                console.warn(`[traps] Could not fetch on-chain block timestamp for block ${blockNumber}:`, e);
+              }
+            }
+          }
+        } else {
+          console.log(`[traps] No transfers at all from ${victimLower} on chain ${chainId}`);
+        }
+      }
+
+      return {
+        ...trap,
+        victim_balance: { native: nativeBalance, tokens: tokenBalances },
+        last_transfer_at: lastTransferAt,
+      };
+    })
+  );
 
   return NextResponse.json({ traps: enrichedTraps, total: count, limit, offset });
 }

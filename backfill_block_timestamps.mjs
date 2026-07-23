@@ -1,19 +1,16 @@
 // backfill_block_timestamps.mjs
 // Usage: node backfill_block_timestamps.mjs
-// Backfills block_timestamp for all existing token_transfers rows (all chains)
 
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
 import { createPublicClient, http, fallback } from 'viem';
 import { mainnet, bsc, polygon } from 'viem/chains';
 
-// ─── Supabase admin client ───
 const supabaseAdmin = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// ─── Chain definitions (same as collector) ───
 const CHAIN_CONFIGS = {
   1: {
     name: 'ethereum',
@@ -56,10 +53,23 @@ const CHAIN_CONFIGS = {
   }
 };
 
-// ─── Block timestamp cache ───
-const blockTimestampCache = new Map();
+// ─── Performance Settings ───
+const PAGE_SIZE = 1500;           // Records fetched per page
+const RPC_CONCURRENCY = 20;       // Parallel RPC block fetches
+const DB_UPDATE_CONCURRENCY = 8;  // Lowered to prevent Supabase connection exhaustion
 
-async function fetchBlockWithTimeout(client, blockNum, timeoutMs = 5000) {
+const blockTimestampCache = new Map();
+const failedBlocks = new Set();
+
+function chunkArray(array, size) {
+  const chunks = [];
+  for (let i = 0; i < array.length; i += size) {
+    chunks.push(array.slice(i, i + size));
+  }
+  return chunks;
+}
+
+async function fetchBlockWithTimeout(client, blockNum, timeoutMs = 6000) {
   const timeoutPromise = new Promise((_, reject) =>
     setTimeout(() => reject(new Error('Timeout')), timeoutMs)
   );
@@ -67,24 +77,56 @@ async function fetchBlockWithTimeout(client, blockNum, timeoutMs = 5000) {
   return Promise.race([blockPromise, timeoutPromise]);
 }
 
+// Resilient DB update with retries
+// Resilient DB update with exact row count tracking
+async function updateBlockTimestampWithRetry(chainId, blockNum, timestampISO, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const { error, count } = await supabaseAdmin
+        .from('token_transfers')
+        .update(
+          { block_timestamp: timestampISO },
+          { count: 'exact' } // 👈 Tells Supabase to return the actual count of updated rows
+        )
+        .eq('chain_id', chainId)
+        .eq('block_number', blockNum)
+        .is('block_timestamp', null);
+
+      if (!error) return count || 0;
+      
+      console.warn(`[DB Retry ${attempt}/${retries}] Block ${blockNum}: ${error.message}`);
+    } catch (e) {
+      console.warn(`[DB Fetch Error ${attempt}/${retries}] Block ${blockNum}: ${e.message}`);
+    }
+    
+    if (attempt < retries) {
+      await new Promise(res => setTimeout(res, 500 * attempt));
+    }
+  }
+  return 0;
+}
+
 async function main() {
-  console.log('[Backfill] Starting...');
+  console.log('[Backfill] Starting resilient backfill process...');
 
   for (const [chainIdStr, config] of Object.entries(CHAIN_CONFIGS)) {
     const chainId = parseInt(chainIdStr);
-    console.log(`\n[Backfill] Processing chain ${config.name} (ID ${chainId})`);
+    console.log(`\n==========================================`);
+    console.log(`[Backfill] Processing chain ${config.name.toUpperCase()} (ID ${chainId})`);
+    console.log(`==========================================`);
 
     const urls = Array.from(new Set(config.fallbacks));
     const client = createPublicClient({
       chain: config.chain,
       transport: fallback(
-        urls.map(url => http(url, { timeout: 10000 })),
+        urls.map(url => http(url, {
+          timeout: 10000,
+          batch: { batchSize: 30, wait: 20 }
+        })),
         { rank: false }
       ),
     });
 
-    let offset = 0;
-    const PAGE_SIZE = 1000;
     let totalUpdated = 0;
 
     while (true) {
@@ -94,7 +136,7 @@ async function main() {
         .is('block_timestamp', null)
         .eq('chain_id', chainId)
         .order('block_number')
-        .range(offset, offset + PAGE_SIZE - 1);
+        .range(0, PAGE_SIZE - 1);
 
       if (error) {
         console.error(`[Backfill] Error fetching blocks for ${config.name}:`, error.message);
@@ -102,75 +144,79 @@ async function main() {
       }
       if (!blocks || blocks.length === 0) break;
 
-      const blockNumbers = [...new Set(blocks.map(b => b.block_number))];
-      console.log(`[Backfill] Found ${blockNumbers.length} distinct blocks (rows ${offset + 1} - ${offset + blocks.length})`);
+      const blockNumbers = [...new Set(blocks.map(b => b.block_number))]
+        .filter(b => !failedBlocks.has(`${chainId}-${b}`));
 
-      // Fetch block timestamps
-      for (let idx = 0; idx < blockNumbers.length; idx++) {
-        const blockNum = blockNumbers[idx];
-        const key = `${chainId}-${blockNum}`;
-
-        if (blockTimestampCache.has(key)) {
-          console.log(`  [${idx + 1}/${blockNumbers.length}] Block ${blockNum} (cached)`);
-          continue;
-        }
-
-        let fetched = false;
-        for (let attempt = 1; attempt <= 2; attempt++) {
-          try {
-            console.log(`  [${idx + 1}/${blockNumbers.length}] Fetching block ${blockNum} (attempt ${attempt})`);
-            const block = await fetchBlockWithTimeout(client, blockNum, 5000);
-            if (block && block.timestamp) {
-              blockTimestampCache.set(key, Number(block.timestamp));
-              console.log(`    → timestamp ${new Date(Number(block.timestamp) * 1000).toISOString()}`);
-              fetched = true;
-              break;
-            }
-          } catch (e) {
-            console.warn(`    → attempt ${attempt} failed: ${e.message}`);
-            if (attempt < 2) {
-              // wait a bit before retry
-              await new Promise(resolve => setTimeout(resolve, 2000));
-            }
-          }
-        }
-
-        if (!fetched) {
-          console.warn(`  [${idx + 1}/${blockNumbers.length}] Block ${blockNum} could not be fetched – skipping`);
-        }
-
-        // Small delay to avoid rate limiting
-        await new Promise(resolve => setTimeout(resolve, 100));
+      if (blockNumbers.length === 0) {
+        console.log(`[Backfill] No remaining processable blocks in this page for ${config.name}.`);
+        break;
       }
 
-      // Update all rows for these blocks
-      for (const blockNum of blockNumbers) {
-        const key = `${chainId}-${blockNum}`;
-        const timestamp = blockTimestampCache.get(key);
-        if (timestamp === undefined) continue;
+      console.log(`\n[Page] Processing ${blockNumbers.length} distinct blocks (${blocks.length} DB rows total)...`);
 
-        const timestampISO = new Date(timestamp * 1000).toISOString();
-        const { error: updateError, count } = await supabaseAdmin
-          .from('token_transfers')
-          .update({ block_timestamp: timestampISO })
-          .eq('chain_id', chainId)
-          .eq('block_number', blockNum)
-          .is('block_timestamp', null);
+      // ─── Step 1: Fetch block timestamps from RPC ───
+      const rpcChunks = chunkArray(blockNumbers, RPC_CONCURRENCY);
+      let fetchedInPage = 0;
 
-        if (updateError) {
-          console.error(`[Backfill] Update error block ${blockNum}:`, updateError.message);
-        } else {
-          totalUpdated += count || 0;
-        }
+      for (let i = 0; i < rpcChunks.length; i++) {
+        const chunk = rpcChunks[i];
+        
+        await Promise.all(
+          chunk.map(async (blockNum) => {
+            const key = `${chainId}-${blockNum}`;
+            if (blockTimestampCache.has(key)) return;
+
+            try {
+              const block = await fetchBlockWithTimeout(client, blockNum, 6000);
+              if (block && block.timestamp) {
+                blockTimestampCache.set(key, Number(block.timestamp));
+                fetchedInPage++;
+              }
+            } catch (e) {
+              failedBlocks.add(key);
+            }
+          })
+        );
+
+        process.stdout.write(`  RPC progress: ${Math.min((i + 1) * RPC_CONCURRENCY, blockNumbers.length)}/${blockNumbers.length} blocks...\r`);
+      }
+      console.log(`\n  ✅ Fetched timestamps for ${fetchedInPage} blocks.`);
+
+      // ─── Step 2: Update Supabase DB in smaller, controlled waves ───
+      const validBlockNumbers = blockNumbers.filter(b => blockTimestampCache.has(`${chainId}-${b}`));
+      const updateChunks = chunkArray(validBlockNumbers, DB_UPDATE_CONCURRENCY);
+      let pageUpdatedRows = 0;
+
+      for (let i = 0; i < updateChunks.length; i++) {
+        const chunk = updateChunks[i];
+        const results = await Promise.all(
+          chunk.map(async (blockNum) => {
+            const key = `${chainId}-${blockNum}`;
+            const timestamp = blockTimestampCache.get(key);
+            if (timestamp === undefined) return 0;
+
+            const timestampISO = new Date(timestamp * 1000).toISOString();
+            return await updateBlockTimestampWithRetry(chainId, blockNum, timestampISO, 3);
+          })
+        );
+
+        const chunkCount = results.reduce((acc, curr) => acc + curr, 0);
+        pageUpdatedRows += chunkCount;
+        totalUpdated += chunkCount;
+
+        process.stdout.write(`  DB progress: ${Math.min((i + 1) * DB_UPDATE_CONCURRENCY, validBlockNumbers.length)}/${validBlockNumbers.length} blocks updated...\r`);
+        
+        // Pacing pause between update waves
+        await new Promise(res => setTimeout(res, 50));
       }
 
-      offset += PAGE_SIZE;
+      console.log(`\n  ✅ DB updated ${pageUpdatedRows} rows in this batch (Total: ${totalUpdated}).`);
     }
 
-    console.log(`[Backfill] Chain ${config.name}: total rows updated = ${totalUpdated}`);
+    console.log(`\n[Finished] Chain ${config.name}: Total rows updated = ${totalUpdated}`);
   }
 
-  console.log('\n[Backfill] Completed.');
+  console.log('\n[Backfill] Complete!');
 }
 
 main().catch(console.error);

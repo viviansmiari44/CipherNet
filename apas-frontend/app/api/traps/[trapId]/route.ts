@@ -2,6 +2,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getAuthUser } from '@app-lib/auth';
 import { createServerSupabaseClient } from '@app-lib/supabaseServer';
+import { createClient } from '@supabase/supabase-js';
 
 export async function DELETE(
   req: NextRequest,
@@ -15,9 +16,13 @@ export async function DELETE(
   }
 
   const supabase = await createServerSupabaseClient();
+  const supabaseAdmin = createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!
+  );
 
   // Fetch trap to verify ownership via campaign
-  const { data: trap, error: trapError } = await supabase
+  const { data: trap, error: trapError } = await supabaseAdmin
     .from('traps')
     .select('campaign_id')
     .eq('id', trapId)
@@ -34,12 +39,12 @@ export async function DELETE(
     .eq('id', trap.campaign_id)
     .single();
 
-  if (campaignError || campaign.user_id !== user.id) {
+  if (campaignError || !campaign || campaign.user_id !== user.id) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
   }
 
-  // Delete the trap
-  const { error: deleteError } = await supabase
+  // Delete the trap using service role to bypass RLS policies
+  const { error: deleteError } = await supabaseAdmin
     .from('traps')
     .delete()
     .eq('id', trapId);

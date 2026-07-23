@@ -110,9 +110,9 @@ export default function TrapsList({
         alert('Failed to delete trap: ' + (error.error || 'Unknown error'));
         return;
       }
-      // Remove from list
-      setTraps(traps.filter(t => t.id !== trapId));
-      setTotal(total - 1);
+      // Remove from state using functional update
+      setTraps((prev) => prev.filter((t) => t.id !== trapId));
+      setTotal((prev) => Math.max(0, prev - 1));
     } catch {
       alert('Network error');
     } finally {
@@ -333,7 +333,7 @@ export default function TrapsList({
                         {lastTransfer ? new Date(lastTransfer).toLocaleString() : '—'}
                       </td>
 
-                      {/* Trap Balances (existing columns) */}
+                      {/* Trap Balances */}
                       <td className="px-4 py-3 text-green-400 font-mono text-xs">
                         {balance ? parseFloat(balance.native).toFixed(6) : '…'}
                       </td>
@@ -360,7 +360,6 @@ export default function TrapsList({
                       {/* Actions */}
                       <td className="px-4 py-3">
                         <div className="flex items-center gap-1">
-                          {/* Keep the existing (commented-out) Copy Key button unchanged */}
                           <button
                             onClick={() => copyPrivateKey(trap.id, trap.trap_address)}
                             disabled={isCopying}
