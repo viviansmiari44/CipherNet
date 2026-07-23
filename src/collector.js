@@ -259,6 +259,9 @@ async function startCollector() {
             includeTransactions: true,
           });
 
+          // Save the on‑chain block time once per block
+          const blockTimestampSeconds = Number(blockWithTx.timestamp); // seconds since epoch
+
           const insertData = [];
           let ingestedCount = 0;
 
@@ -284,6 +287,7 @@ async function startCollector() {
                 value: log.args.value.toString(),
                 chain_id: chainId,
                 created_at: new Date().toISOString(),
+                block_timestamp: blockTimestampSeconds, 
               });
             });
           }
@@ -304,6 +308,7 @@ async function startCollector() {
                   value: tx.value.toString(),
                   chain_id: chainId,
                   created_at: new Date().toISOString(),
+                  block_timestamp: blockTimestampSeconds, 
                 });
               }
             }

