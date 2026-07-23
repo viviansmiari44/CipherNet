@@ -46,28 +46,46 @@ const ERC20_ABI = [
 // ─── Public RPC Fallbacks ───
 const PUBLIC_FALLBACKS: Record<string, string[]> = {
   bsc: [
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_6gTznTT4QnX3_0IE9gkY-',
     'https://bsc-dataseed.binance.org',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_z1J_ESjjLVZwSBLNoep84',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_-NvhHn24EgwhuMt38pZJr',
     'https://rpc.ankr.com/bsc',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_8ToIPT9Z3R1iQ55nksx8b',
     'https://bsc.publicnode.com',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_Qy6hQXdtdVlE7Z4uVxt_A',
     'https://1rpc.io/bnb',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_rniHI4MxzjBfNZ4bxmDu5',
     'https://bsc.drpc.org',
     'https://bnb-mainnet.g.alchemy.com/v2/LW3i2zPypSVe0cl4BxCxI',
     'https://bnb-mainnet.g.alchemy.com/v2/alch_WQp652MAlfKFbtD1A-zNh'
   ],
   polygon: [
+    'https://polygon-mainnet.g.alchemy.com/v2/CByFU5cCGAYyh8EHLamXD',
     'https://polygon-rpc.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_UdSkrC6LFs2HGS0VUGg5O',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_tAPr1C9JUzQZYax5pslu5',
     'https://rpc.ankr.com/polygon',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_Bq31mnvxmjdT70RCYLGLA',
     'https://polygon.llamarpc.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_17XYrB1qagYO9Edwxj7Cw',
     'https://polygon.publicnode.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_UQzY-saHkZZrowH7kylTu',
     'https://1rpc.io/polygon',
     'https://polygon-mainnet.g.alchemy.com/v2/c6MIVgnVjXC0kgDH4BItE',
     'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11'
   ],
   ethereum: [
+    'https://eth-mainnet.g.alchemy.com/v2/alch_F5VimAPoBoESKZ566us-U',
     'https://ethereum.publicnode.com',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_x_oSlpf2bnfc6brp-BgzA',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_tp8k4HI9tVpUEBmsF3kXc',
     'https://rpc.ankr.com/eth',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_7viyR-7wWLgc2i9suQ6hS',
     'https://eth.llamarpc.com',
+    'https://eth-mainnet.g.alchemy.com/v2/ig-ZUQrtw2shXhW2NuT6W',
     'https://1rpc.io/eth',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_dFm-5A7LhWtYU3_4Y103o',
     'https://eth.drpc.org',
     'https://eth-mainnet.g.alchemy.com/v2/gODtbeuBQLkTJAm3e9tB1',
     'https://eth-mainnet.g.alchemy.com/v2/GsO461DZvmNGh4O4Ss5Et'
@@ -213,20 +231,20 @@ export async function GET(
       setCachedBalance(victim, nativeBalance, tokenBalances);
     }
 
-    // ─── Last transfer with block timestamp ───
+    // ─── Last transfer strictly using on-chain block timestamp ───
     let lastTransferAt: string | null = null;
     if (trap.counterparty_address) {
       const victimLower = trap.victim_address.toLowerCase();
       const counterpartyLower = trap.counterparty_address.toLowerCase();
 
-      // 1. Try exact match (victim → counterparty)
+      // 1. Try exact match (victim → counterparty), ordered by on-chain block number
       const { data: exact, error: exactError } = await supabaseAdmin
         .from('token_transfers')
-        .select('created_at, block_number')
+        .select('block_number, block_timestamp')
         .ilike('sender', victimLower)
         .ilike('receiver', counterpartyLower)
         .eq('chain_id', chainId)
-        .order('created_at', { ascending: false })
+        .order('block_number', { ascending: false })
         .limit(1);
 
       let selectedRow = null;
@@ -234,13 +252,13 @@ export async function GET(
         selectedRow = exact[0];
         console.log(`[traps] Exact match found for ${trap.id}`);
       } else {
-        // 2. Fallback: most recent transfer from victim to any address
+        // 2. Fallback: most recent transfer from victim to any address, ordered by on-chain block number
         const { data: anyTransfer, error: anyError } = await supabaseAdmin
           .from('token_transfers')
-          .select('created_at, block_number')
+          .select('block_number, block_timestamp')
           .ilike('sender', victimLower)
           .eq('chain_id', chainId)
-          .order('created_at', { ascending: false })
+          .order('block_number', { ascending: false })
           .limit(1);
 
         if (!anyError && anyTransfer && anyTransfer.length > 0) {
@@ -250,35 +268,33 @@ export async function GET(
       }
 
       if (selectedRow) {
-        const blockNumber = selectedRow.block_number;
-        const createdAt = selectedRow.created_at;
-
-        // Try to fetch block timestamp from RPC
-        let timestamp = null;
-        if (blockNumber) {
+        // Option A: Use block_timestamp directly from DB if available
+        if (selectedRow.block_timestamp) {
+          const timestampMs = typeof selectedRow.block_timestamp === 'number'
+            ? selectedRow.block_timestamp * 1000
+            : new Date(selectedRow.block_timestamp).getTime();
+          lastTransferAt = new Date(timestampMs).toISOString();
+        } 
+        // Option B: Query RPC node for block timestamp using block_number (with cache)
+        else if (selectedRow.block_number) {
+          const blockNumber = selectedRow.block_number;
           const cached = getCachedBlockTimestamp(chainId, blockNumber);
+
           if (cached) {
-            timestamp = cached;
+            lastTransferAt = new Date(cached).toISOString();
           } else {
             try {
               const block = await client.getBlock({ blockNumber: BigInt(blockNumber) });
               if (block && block.timestamp) {
-                timestamp = Number(block.timestamp) * 1000; // seconds to ms
-                setCachedBlockTimestamp(chainId, blockNumber, timestamp);
-                console.log(`[traps] Fetched block timestamp for block ${blockNumber}: ${new Date(timestamp).toISOString()}`);
+                const timestampMs = Number(block.timestamp) * 1000;
+                setCachedBlockTimestamp(chainId, blockNumber, timestampMs);
+                lastTransferAt = new Date(timestampMs).toISOString();
+                console.log(`[traps] Fetched block timestamp for block ${blockNumber}: ${lastTransferAt}`);
               }
             } catch (e) {
-              console.warn(`[traps] Could not fetch block timestamp for block ${blockNumber}:`, e);
+              console.warn(`[traps] Could not fetch on-chain block timestamp for block ${blockNumber}:`, e);
             }
           }
-        }
-
-        // Use block timestamp if available, otherwise fallback to created_at
-        if (timestamp) {
-          lastTransferAt = new Date(timestamp).toISOString();
-        } else {
-          lastTransferAt = createdAt;
-          console.log(`[traps] Using created_at as fallback for ${trap.id}`);
         }
       } else {
         console.log(`[traps] No transfers at all from ${victimLower} on chain ${chainId}`);
