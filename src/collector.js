@@ -89,22 +89,49 @@ const transferEvent = parseAbiItem(
 );
 
 // --- Build MONITORED_TOKENS from chain config (with fallback) ---
+const TOKEN_DECIMALS_MAP = {
+  // Chain 56 (BSC)
+  56: {
+    '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d': 18, // BSC USDC
+    '0x55d398326f99059ff775485246999027b3197955': 18, // BSC USDT
+    '0xe9e7cea3dedca5984780bafc599bd69add087d56': 18, // BSC BUSD
+  },
+  // Chain 1 (Ethereum)
+  1: {
+    '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48': 6,  // ETH USDC
+    '0xdac17f958d2ee523a2206206994597c13d831ec7': 6,  // ETH USDT
+    '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599': 8,  // ETH WBTC
+  },
+  // Chain 137 (Polygon)
+  137: {
+    '0x2791bca1f2de4661ed88a30c99a7a9449aa84174': 6,  // Polygon USDC.e
+    '0xc2132d05d31c914a87c6611c10748aeb04b58e8f': 6,  // Polygon USDT
+    '0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6': 8,  // Polygon WBTC
+  }
+};
+
+function getTokenDecimals(address, symbol, currentChainId) {
+  const addrLower = address.toLowerCase();
+  if (TOKEN_DECIMALS_MAP[currentChainId] && TOKEN_DECIMALS_MAP[currentChainId][addrLower] !== undefined) {
+    return TOKEN_DECIMALS_MAP[currentChainId][addrLower];
+  }
+  if (symbol === 'USDC' || symbol === 'USDT') return currentChainId === 56 ? 18 : 6;
+  if (symbol === 'BUSD') return 18;
+  if (symbol === 'WBTC') return 8;
+  return 18;
+}
+
 let MONITORED_TOKENS = {};
 
 if (chainCfg && chainCfg.tokens) {
   for (const [symbol, address] of Object.entries(chainCfg.tokens)) {
-    let decimals = 18;
-    if (symbol === 'USDC' || symbol === 'USDT' || symbol === 'BUSD') {
-      decimals = 6;
-    } else if (symbol === 'WBTC') {
-      decimals = 8;
-    }
+    const decimals = getTokenDecimals(address, symbol, chainId);
     MONITORED_TOKENS[address.toLowerCase()] = { symbol, decimals };
   }
 } else {
   MONITORED_TOKENS = {
-    '0xdac17f958d2ee523a2206206994597c13d831ec7': { symbol: 'USDT', decimals: 6 },
-    '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48': { symbol: 'USDC', decimals: 6 },
+    '0xdac17f958d2ee523a2206206994597c13d831ec7': { symbol: 'USDT', decimals: getTokenDecimals('0xdac17f958d2ee523a2206206994597c13d831ec7', 'USDT', chainId) },
+    '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48': { symbol: 'USDC', decimals: getTokenDecimals('0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48', 'USDC', chainId) },
     '0x6b175474e89094c44da98b954eedeac495271d0f': { symbol: 'DAI', decimals: 18 },
     '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2': { symbol: 'WETH', decimals: 18 },
   };
@@ -123,6 +150,14 @@ const PRICES = {
   POL: 0.08,
   WBTC: 64000.0,
 };
+
+function getPrice(symbol) {
+  const sym = symbol.toUpperCase();
+  if (sym === 'WMATIC' || sym === 'POL') return PRICES['MATIC'] || PRICES['POL'] || 0.08;
+  if (sym === 'WETH') return PRICES['ETH'] || 1880.0;
+  if (sym === 'WBNB') return PRICES['BNB'] || 578.0;
+  return PRICES[sym] || 1.0;
+}
 
 // Simple, production-ready price updater (Will not block execution if API fails)
 async function updatePrices() {
@@ -157,7 +192,7 @@ async function updatePrices() {
 
 // Calculates exact minimum BigInt value for $3,000 securely
 function getMinTransferValue(decimals, symbol, targetUsd = 3000) {
-  const price = PRICES[symbol.toUpperCase()] || 1.0;
+  const price = getPrice(symbol);
   const targetUsdBig = BigInt(Math.round(targetUsd));
   const priceScaled = BigInt(Math.round(price * 1000000));
   return (targetUsdBig * (10n ** BigInt(decimals)) * 1000000n) / priceScaled;
