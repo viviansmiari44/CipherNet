@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { createPublicClient, http, parseAbiItem, fallback } from 'viem'; 
+import { createPublicClient, http, parseAbiItem, fallback, getAddress } from 'viem'; 
 import { mainnet, bsc, polygon } from 'viem/chains';
 import { createClient } from '@supabase/supabase-js';
 
@@ -20,6 +20,9 @@ const chainName = config.chain || 'ethereum';
 const chainCfg = config.getChainConfig ? config.getChainConfig() : null;
 const nativeSymbol = chainCfg?.nativeSymbol || 'ETH';
 const chainId = chainCfg?.chainId || 1;
+
+// When building MONITORED_TOKENS
+MONITORED_TOKENS[getAddress(address)] = { symbol, decimals };
 
 // Viem chain object for the current chain
 let viemChain;
@@ -280,6 +283,7 @@ async function startCollector() {
                 receiver: log.args.to.toLowerCase(),
                 value: log.args.value.toString(),
                 chain_id: chainId,
+                created_at: new Date().toISOString(),
               });
             });
           }
@@ -299,6 +303,7 @@ async function startCollector() {
                   receiver: tx.to.toLowerCase(),
                   value: tx.value.toString(),
                   chain_id: chainId,
+                  created_at: new Date().toISOString(),
                 });
               }
             }
