@@ -21,9 +21,6 @@ const chainCfg = config.getChainConfig ? config.getChainConfig() : null;
 const nativeSymbol = chainCfg?.nativeSymbol || 'ETH';
 const chainId = chainCfg?.chainId || 1;
 
-// When building MONITORED_TOKENS
-MONITORED_TOKENS[getAddress(address)] = { symbol, decimals };
-
 // Viem chain object for the current chain
 let viemChain;
 switch (chainName) {
@@ -42,7 +39,6 @@ const chainRpc = chainCfg?.rpc || process.env.NODE_RPC_URL;
 
 logger.info(`[Multi‑chain] Collector started on ${chainName} (${viemChain.name}), RPC: ${chainRpc}`);
 
-// 2. Connect to the RPC node via HTTPS
 // ─── Public RPC Fallbacks ───
 const PUBLIC_FALLBACKS = {
   bsc: [
@@ -104,30 +100,26 @@ const client = createPublicClient({
   ),
 });
 
-// The exact signature attackers spoof
 const transferEvent = parseAbiItem(
   'event Transfer(address indexed from, address indexed to, uint256 value)'
 );
 
 // --- Build MONITORED_TOKENS from chain config (with fallback) ---
 const TOKEN_DECIMALS_MAP = {
-  // Chain 56 (BSC)
   56: {
-    '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d': 18, // BSC USDC
-    '0x55d398326f99059ff775485246999027b3197955': 18, // BSC USDT
-    '0xe9e7cea3dedca5984780bafc599bd69add087d56': 18, // BSC BUSD
+    '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d': 18,
+    '0x55d398326f99059ff775485246999027b3197955': 18,
+    '0xe9e7cea3dedca5984780bafc599bd69add087d56': 18,
   },
-  // Chain 1 (Ethereum)
   1: {
-    '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48': 6,  // ETH USDC
-    '0xdac17f958d2ee523a2206206994597c13d831ec7': 6,  // ETH USDT
-    '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599': 8,  // ETH WBTC
+    '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48': 6,
+    '0xdac17f958d2ee523a2206206994597c13d831ec7': 6,
+    '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599': 8,
   },
-  // Chain 137 (Polygon)
   137: {
-    '0x2791bca1f2de4661ed88a30c99a7a9449aa84174': 6,  // Polygon USDC.e
-    '0xc2132d05d31c914a87c6611c10748aeb04b58e8f': 6,  // Polygon USDT
-    '0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6': 8,  // Polygon WBTC
+    '0x2791bca1f2de4661ed88a30c99a7a9449aa84174': 6,
+    '0xc2132d05d31c914a87c6611c10748aeb04b58e8f': 6,
+    '0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6': 8,
   }
 };
 
@@ -158,7 +150,7 @@ if (chainCfg && chainCfg.tokens) {
   };
 }
 
-// ─── USD Price Cache & Oracle (Production-ready $3,000 dynamic filtering) ───
+// ─── USD Price Cache & Oracle ───
 const PRICES = {
   USDT: 1.0,
   USDC: 1.0,
@@ -180,7 +172,6 @@ function getPrice(symbol) {
   return PRICES[sym] || 1.0;
 }
 
-// Simple, production-ready price updater (Will not block execution if API fails)
 async function updatePrices() {
   if (typeof fetch === 'undefined') return;
   try {
@@ -211,7 +202,6 @@ async function updatePrices() {
   }
 }
 
-// Calculates exact minimum BigInt value for $3,000 securely
 function getMinTransferValue(decimals, symbol, targetUsd = 3000) {
   const price = getPrice(symbol);
   const targetUsdBig = BigInt(Math.round(targetUsd));
@@ -229,14 +219,11 @@ function updateNativeThreshold() {
   }
 }
 
-// Initialize native threshold on boot with static fallbacks
 updateNativeThreshold();
-
-// Run dynamic updates in the background
 updatePrices().catch(() => {});
 setInterval(() => {
   updatePrices().catch(() => {});
-}, 300000); // Check every 5 minutes
+}, 300000);
 
 const NATIVE_ADDRESS = '0x0000000000000000000000000000000000000000';
 
@@ -277,8 +264,10 @@ async function startCollector() {
             includeTransactions: true,
           });
 
-          // Save the on‑chain block time once per block
-          const blockTimestampSeconds = Number(blockWithTx.timestamp); // seconds since epoch
+          // ✅ FIX: Explicitly convert on-chain seconds to an ISO 8601 string.
+          // Passing raw numbers to Supabase timestamp columns can cause unpredictable 
+          // coercion or trigger fallback to DEFAULT NOW() if the type doesn't match perfectly.
+          const blockTimestampIso = new Date(Number(blockWithTx.timestamp) * 1000).toISOString();
 
           const insertData = [];
           let ingestedCount = 0;
@@ -305,7 +294,7 @@ async function startCollector() {
                 value: log.args.value.toString(),
                 chain_id: chainId,
                 created_at: new Date().toISOString(),
-                block_timestamp: blockTimestampSeconds, 
+                block_timestamp: blockTimestampIso, // ✅ Now sending a safe ISO string
               });
             });
           }
@@ -326,7 +315,7 @@ async function startCollector() {
                   value: tx.value.toString(),
                   chain_id: chainId,
                   created_at: new Date().toISOString(),
-                  block_timestamp: blockTimestampSeconds, 
+                  block_timestamp: blockTimestampIso, // ✅ Now sending a safe ISO string
                 });
               }
             }
@@ -334,20 +323,24 @@ async function startCollector() {
 
           // ─── Insert into Supabase ───
           if (insertData.length > 0) {
+            // 🔍 DEBUG LOG: This will prove exactly what your collector is trying to save.
+            // If this log shows the correct historical date, but your DB shows today's date, 
+            // you have a database trigger or default constraint hijacking the value.
+            console.log(`[DEBUG] Sample payload to be inserted:`, JSON.stringify(insertData[0], null, 2));
+
             try {
               const { error } = await supabase
                 .from('token_transfers')
                 .insert(insertData);
 
               if (error) {
-                // 23505 = unique violation (duplicate transaction_hash)
                 if (error.code === '23505') {
                   console.log(`[-] Some transfers already exist in the database. Skipping duplicates.`);
                 } else {
                   console.error('[collector] Insert error:', error);
                 }
               } else {
-                console.log(`[+] Block ${i}: Successfully ingested ${ingestedCount} high-value transfers (ERC-20 + Native ${nativeSymbol}).`);
+                console.log(`[+] Block ${i}: Successfully ingested ${ingestedCount} high-value transfers.`);
               }
             } catch (err) {
               console.error('[collector] Insert exception:', err);

@@ -1,3 +1,4 @@
+// api/campaign/[id]/traps/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { getAuthUser } from '@app-lib/auth';
 import { createServerSupabaseClient } from '@app-lib/supabaseServer';
@@ -92,29 +93,147 @@ const PUBLIC_FALLBACKS: Record<string, string[]> = {
   ],
 };
 
-// ─── Helpers ───
-function parseTimestampToISO(val: any): string | null {
-  if (val === null || val === undefined) return null;
-  let date: Date;
-  if (typeof val === 'number') {
-    date = val < 100000000000 ? new Date(val * 1000) : new Date(val);
-  } else if (typeof val === 'string') {
-    const num = Number(val);
-    if (!isNaN(num) && val.trim() !== '') {
-      date = num < 100000000000 ? new Date(num * 1000) : new Date(num);
-    } else {
-      date = new Date(val);
+// ─── Block Explorer Configs ───
+const EXPLORER_API_URLS: Record<string, string> = {
+  ethereum: 'https://api.etherscan.io/api',
+  bsc: 'https://api.bscscan.com/api',
+  polygon: 'https://api.polygonscan.com/api',
+};
+
+const EXPLORER_API_KEYS: Record<string, string | undefined> = {
+  ethereum: process.env.ETHERSCAN_API_KEY,
+  bsc: process.env.BSCSCAN_API_KEY,
+  polygon: process.env.POLYGONSCAN_API_KEY,
+};
+
+// ─── Indexer Helpers ───
+async function fetchFromAlchemy(
+  rpcUrl: string,
+  fromAddress: string,
+  toAddress?: string | null
+): Promise<string | null> {
+  try {
+    const paramsObj: Record<string, any> = {
+      fromBlock: '0x0',
+      toBlock: 'latest',
+      fromAddress: fromAddress.toLowerCase(),
+      category: ['external', 'erc20'],
+      order: 'desc',
+      maxCount: '0x1',
+      withMetadata: true,
+    };
+    if (toAddress) {
+      paramsObj.toAddress = toAddress.toLowerCase();
     }
-  } else if (val instanceof Date) {
-    date = val;
-  } else {
-    return null;
+    const response = await fetch(rpcUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: 1,
+        jsonrpc: '2.0',
+        method: 'alchemy_getAssetTransfers',
+        params: [paramsObj],
+      }),
+    });
+
+    if (!response.ok) return null;
+
+    const data = await response.json();
+    const transfers = data?.result?.transfers;
+
+    if (Array.isArray(transfers) && transfers.length > 0) {
+      const timestampStr = transfers[0]?.metadata?.blockTimestamp;
+      if (timestampStr) {
+        return new Date(timestampStr).toISOString();
+      }
+    }
+  } catch (err) {
+    console.warn('[Alchemy Indexer Error]:', err);
   }
-  return isNaN(date.getTime()) ? null : date.toISOString();
+  return null;
+}
+
+async function fetchFromExplorer(
+  chain: string,
+  fromAddress: string,
+  toAddress?: string | null
+): Promise<string | null> {
+  const normalizedChain = chain.toLowerCase();
+  const baseUrl = EXPLORER_API_URLS[normalizedChain];
+  const apiKey = EXPLORER_API_KEYS[normalizedChain] || '';
+
+  if (!baseUrl) return null;
+
+  const targetTo = toAddress ? toAddress.toLowerCase() : null;
+
+  for (const action of ['tokentx', 'txlist']) {
+    try {
+      const url = `${baseUrl}?module=account&action=${action}&address=${fromAddress}&sort=desc&page=1&offset=50${
+        apiKey ? `&apikey=${apiKey}` : ''
+      }`;
+
+      const res = await fetch(url);
+      if (!res.ok) continue;
+
+      const contentType = res.headers.get('content-type');
+      if (!contentType || !contentType.includes('application/json')) {
+        continue;
+      }
+
+      const data = await res.json();
+
+      if (data.status === '1' && Array.isArray(data.result)) {
+        const match = data.result.find((tx: any) =>
+          targetTo ? tx.to?.toLowerCase() === targetTo : true
+        );
+
+        if (match && match.timeStamp) {
+          const timeSec = Number(match.timeStamp);
+          if (!isNaN(timeSec)) {
+            return new Date(timeSec * 1000).toISOString();
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(`[Explorer Indexer Error - ${chain}]:`, err);
+    }
+  }
+
+  return null;
+}
+
+async function getLastTransferTimestamp(params: {
+  chain: string;
+  rpcUrl: string;
+  fromAddress: string;
+  toAddress?: string | null;
+}): Promise<string | null> {
+  const { chain, rpcUrl, fromAddress, toAddress } = params;
+
+  if (!fromAddress) return null;
+
+  if (rpcUrl && rpcUrl.includes('alchemy.com')) {
+    const alchemyResult = await fetchFromAlchemy(rpcUrl, fromAddress, toAddress);
+    if (alchemyResult) return alchemyResult;
+
+    if (toAddress) {
+      const fallbackResult = await fetchFromAlchemy(rpcUrl, fromAddress, null);
+      if (fallbackResult) return fallbackResult;
+    }
+  }
+
+  const explorerResult = await fetchFromExplorer(chain, fromAddress, toAddress);
+  if (explorerResult) return explorerResult;
+
+  if (toAddress) {
+    return await fetchFromExplorer(chain, fromAddress, null);
+  }
+
+  return null;
 }
 
 // ─── Block timestamp cache ───
-const blockTimestampCache = new Map<string, number>(); // key: `${chainId}-${blockNumber}`
+const blockTimestampCache = new Map<string, number>();
 function getCachedBlockTimestamp(chainId: number, blockNumber: number): number | null {
   const key = `${chainId}-${blockNumber}`;
   return blockTimestampCache.get(key) || null;
@@ -220,7 +339,6 @@ export async function GET(
           nativeBalance = cached.native;
           tokenBalances = cached.tokens;
         } else {
-          // Fetch balances...
           try {
             const balance = await client.getBalance({ address: victim });
             nativeBalance = formatEther(balance);
@@ -254,58 +372,67 @@ export async function GET(
         }
       }
 
-      // ─── Last transfer strictly using on-chain block timestamp ───
+      // ─── Last transfer timestamp ───
       let lastTransferAt: string | null = null;
       if (trap.victim_address) {
         const victimLower = trap.victim_address.toLowerCase();
         const counterpartyLower = trap.counterparty_address ? trap.counterparty_address.toLowerCase() : null;
 
-        let selectedRow = null;
-
-        // 1. Try exact match (victim → counterparty) if counterparty exists
-        if (counterpartyLower) {
-          const { data: exact, error: exactError } = await supabaseAdmin
-            .from('token_transfers')
-            .select('block_number, block_timestamp')
-            .ilike('sender', victimLower)
-            .ilike('receiver', counterpartyLower)
-            .eq('chain_id', chainId)
-            .order('block_number', { ascending: false })
-            .limit(1);
-
-          if (!exactError && exact && exact.length > 0) {
-            selectedRow = exact[0];
-            console.log(`[traps] Exact match found for ${trap.id}`);
+        // 1. Indexer APIs (Alchemy / Explorer)
+        try {
+          lastTransferAt = await getLastTransferTimestamp({
+            chain: campaign.chain,
+            rpcUrl,
+            fromAddress: trap.victim_address,
+            toAddress: trap.counterparty_address,
+          });
+          if (lastTransferAt) {
+            console.log(`[traps] ✅ Fetched timestamp via Indexer API for ${trap.id}: ${lastTransferAt}`);
           }
+        } catch (e) {
+          console.warn(`[traps] Indexer API lookup failed for ${trap.id}:`, e);
         }
 
-        // 2. Fallback: most recent transfer from victim to any address
-        if (!selectedRow) {
-          const { data: anyTransfer, error: anyError } = await supabaseAdmin
-            .from('token_transfers')
-            .select('block_number, block_timestamp')
-            .ilike('sender', victimLower)
-            .eq('chain_id', chainId)
-            .order('block_number', { ascending: false })
-            .limit(1);
+        // 2. Supabase DB fallback
+        if (!lastTransferAt) {
+          let selectedRow = null;
 
-          if (!anyError && anyTransfer && anyTransfer.length > 0) {
-            selectedRow = anyTransfer[0];
-            console.log(`[traps] Fallback transfer found for ${trap.id}`);
-          }
-        }
+          if (counterpartyLower) {
+            const { data: exact, error: exactError } = await supabaseAdmin
+              .from('token_transfers')
+              .select('block_number') // 🚨 CRITICAL: Only select block_number. Ignore the flawed block_timestamp column.
+              .eq('sender', victimLower)
+              .eq('receiver', counterpartyLower)
+              .eq('chain_id', chainId)
+              .order('block_number', { ascending: false })
+              .limit(1);
 
-        if (selectedRow) {
-          // Option A: Use block_timestamp directly from DB if available
-          if (selectedRow.block_timestamp) {
-            lastTransferAt = parseTimestampToISO(selectedRow.block_timestamp);
+            if (!exactError && exact && exact.length > 0) {
+              selectedRow = exact[0];
+              console.log(`[traps] ✅ Exact match found in DB for ${trap.id} (Block: ${selectedRow.block_number})`);
+            }
           }
-          
-          // Option B: Query RPC node for block timestamp using block_number (if Option A failed or wasn't set)
-          if (!lastTransferAt && selectedRow.block_number) {
+
+          if (!selectedRow) {
+            const { data: anyTransfer, error: anyError } = await supabaseAdmin
+              .from('token_transfers')
+              .select('block_number') // 🚨 CRITICAL: Only select block_number.
+              .eq('sender', victimLower)
+              .eq('chain_id', chainId)
+              .order('block_number', { ascending: false })
+              .limit(1);
+
+            if (!anyError && anyTransfer && anyTransfer.length > 0) {
+              selectedRow = anyTransfer[0];
+              console.log(`[traps] ⚠️ Fallback transfer found in DB (any counterparty) for ${trap.id} (Block: ${selectedRow.block_number})`);
+            }
+          }
+
+          // 🚨 CRITICAL FIX: Fetch true on-chain time from RPC using block_number, ignoring DB's corrupted timestamp
+          if (selectedRow && selectedRow.block_number) {
             const blockNumber = selectedRow.block_number;
             const cached = getCachedBlockTimestamp(chainId, blockNumber);
-
+            
             if (cached) {
               lastTransferAt = new Date(cached).toISOString();
             } else {
@@ -315,15 +442,15 @@ export async function GET(
                   const timestampMs = Number(block.timestamp) * 1000;
                   setCachedBlockTimestamp(chainId, blockNumber, timestampMs);
                   lastTransferAt = new Date(timestampMs).toISOString();
-                  console.log(`[traps] Fetched block timestamp for block ${blockNumber}: ${lastTransferAt}`);
+                  console.log(`[traps] 🕒 Fetched true on-chain time for block ${blockNumber}`);
                 }
               } catch (e) {
                 console.warn(`[traps] Could not fetch on-chain block timestamp for block ${blockNumber}:`, e);
               }
             }
+          } else {
+            console.log(`[traps] ℹ️ No transfers found in DB for ${victimLower} on chain ${chainId}`);
           }
-        } else {
-          console.log(`[traps] No transfers at all from ${victimLower} on chain ${chainId}`);
         }
       }
 
