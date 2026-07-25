@@ -244,7 +244,7 @@ def generate_key_for_counterparty(counterparty_address):
     match_pattern = f"{prefix}{wildcard}{suffix}"
     logger.info(f"Processing counterparty {counterparty_address} with pattern {match_pattern}")
 
-    remote_cmd = f"cd {REMOTE_PATH} && ./profanity --matching '{match_pattern}' -I 16"
+    remote_cmd = f"cd {REMOTE_PATH} && ./profanity --matching '{match_pattern}'"
     ssh_cmd = (
         f'sshpass -p "{REMOTE_PASSWORD}" ssh '
         f'-o ConnectTimeout=15 '
