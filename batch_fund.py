@@ -2,8 +2,8 @@
 """
 Batch funding script.
 Reads vault.txt (local fallback) or fetches from Supabase DB, extracts trap addresses, 
-and sends ALL available balances (native + ERC‑20 tokens) equally distributed among
-all unique trap addresses.
+and sends ALL available balances (native + ERC‑20 tokens) dynamically equalized among
+all unique trap addresses taking into account existing trap balances.
 
 Supports multi‑chain: Ethereum, BSC, Polygon (via CHAIN env var).
 
@@ -324,10 +324,84 @@ def extract_addresses_from_file(filepath="vault.txt"):
         logger.error(f"Error reading/parsing local {filepath}: {e}")
     return addresses
 
-def compute_funding_plan(num_addresses, native_bal, usdc_bal, native_usdc_bal, usdt_bal, total_txs):
-    """Build asset list, dynamically calculating gas requirements first."""
-    plan = []
+def get_trap_balances(unique_addresses):
+    """Fetch current native and ERC-20 token balances across all trap addresses."""
+    balances = {
+        "native": {},
+        "USDC": {},
+        "USDC_NATIVE": {},
+        "USDT": {}
+    }
+    for addr in unique_addresses:
+        chk_addr = w3.to_checksum_address(addr)
+        try:
+            balances["native"][addr] = call_with_retry(w3.eth.get_balance, chk_addr)
+        except Exception as e:
+            logger.warning(f"Failed to fetch native balance for trap {addr}: {e}")
+            balances["native"][addr] = 0
+
+        balances["USDC"][addr] = get_token_balance(chk_addr, "USDC")
+        if "USDC_NATIVE" in TOKEN_CONFIG:
+            balances["USDC_NATIVE"][addr] = get_token_balance(chk_addr, "USDC_NATIVE")
+        balances["USDT"][addr] = get_token_balance(chk_addr, "USDT")
+
+    return balances
+
+def calculate_equalized_distribution(funder_available, trap_balances):
+    """
+    Calculates exact payout per trap to achieve equalized target balance across all traps.
+    Handles 'rich traps' (traps already holding >= target balance) by excluding them
+    and re-equalizing remaining funder funds among active traps.
+    """
+    if not trap_balances or funder_available <= 0:
+        return {addr: 0 for addr in trap_balances}
+
+    active_addrs = list(trap_balances.keys())
+    allocatable_funder = funder_available
+
+    target_balance = 0
+    while active_addrs:
+        current_pool = sum(trap_balances[a] for a in active_addrs) + allocatable_funder
+        target_balance = current_pool // len(active_addrs)
+        
+        rich_traps = [a for a in active_addrs if trap_balances[a] >= target_balance]
+        if not rich_traps:
+            break
+        for a in rich_traps:
+            active_addrs.remove(a)
+
+    payouts = {}
+    for addr, current_bal in trap_balances.items():
+        if addr in active_addrs:
+            needed = target_balance - current_bal
+            payouts[addr] = max(0, needed)
+        else:
+            payouts[addr] = 0
+
+    return payouts
+
+def compute_funding_plan(unique_addresses, native_bal, usdc_bal, native_usdc_bal, usdt_bal, total_txs, trap_balances=None):
+    """Build asset distribution plan per target address using dynamic balance equalization."""
+    plan = {}
     
+    if isinstance(unique_addresses, int):
+        num_addresses = unique_addresses
+        addrs = [f"addr_{i}" for i in range(num_addresses)]
+    else:
+        addrs = unique_addresses
+        num_addresses = len(addrs)
+
+    if num_addresses == 0:
+        return plan
+
+    if trap_balances is None:
+        trap_balances = {
+            "native": {a: 0 for a in addrs},
+            "USDC": {a: 0 for a in addrs},
+            "USDC_NATIVE": {a: 0 for a in addrs},
+            "USDT": {a: 0 for a in addrs}
+        }
+
     # Decimals dynamic fetch
     token_decimals = getattr(config, 'get_token_decimals', lambda: {"USDC": 6, "USDT": 6, "USDC_NATIVE": 6})()
 
@@ -348,11 +422,15 @@ def compute_funding_plan(num_addresses, native_bal, usdc_bal, native_usdc_bal, u
     gas_units_per_tx = 68000
     total_gas_reserve = total_txs * gas_units_per_tx * safe_reserve_gas_price
 
+    # 1. Equalize Native Asset
     if native_bal > total_gas_reserve:
         distributable_native = native_bal - total_gas_reserve
-        per_addr = distributable_native // num_addresses
-        if per_addr > 0:
-            plan.append((NATIVE_SYMBOL, per_addr, 18))
+        native_payouts = calculate_equalized_distribution(distributable_native, trap_balances.get("native", {}))
+        for addr in addrs:
+            p_amount = native_payouts.get(addr, 0)
+            if p_amount > 0:
+                if addr not in plan: plan[addr] = []
+                plan[addr].append((NATIVE_SYMBOL, p_amount, 18))
     else:
         logger.warning(
             f"Native balance too low to distribute native asset. "
@@ -360,20 +438,35 @@ def compute_funding_plan(num_addresses, native_bal, usdc_bal, native_usdc_bal, u
             f"Required safe Gas Reserve: {w3.from_wei(total_gas_reserve, 'ether')} {NATIVE_SYMBOL}."
         )
 
+    # 2. Equalize USDC
     if usdc_bal > 0:
-        per_addr = usdc_bal // num_addresses
-        if per_addr > 0:
-            plan.append(("USDC", per_addr, token_decimals.get("USDC", 6)))
+        usdc_payouts = calculate_equalized_distribution(usdc_bal, trap_balances.get("USDC", {}))
+        dec = token_decimals.get("USDC", 6)
+        for addr in addrs:
+            p_amount = usdc_payouts.get(addr, 0)
+            if p_amount > 0:
+                if addr not in plan: plan[addr] = []
+                plan[addr].append(("USDC", p_amount, dec))
 
+    # 3. Equalize USDC_NATIVE
     if "USDC_NATIVE" in TOKEN_CONFIG and native_usdc_bal > 0:
-        per_addr = native_usdc_bal // num_addresses
-        if per_addr > 0:
-            plan.append(("USDC_NATIVE", per_addr, token_decimals.get("USDC_NATIVE", 6)))
+        native_usdc_payouts = calculate_equalized_distribution(native_usdc_bal, trap_balances.get("USDC_NATIVE", {}))
+        dec = token_decimals.get("USDC_NATIVE", 6)
+        for addr in addrs:
+            p_amount = native_usdc_payouts.get(addr, 0)
+            if p_amount > 0:
+                if addr not in plan: plan[addr] = []
+                plan[addr].append(("USDC_NATIVE", p_amount, dec))
 
+    # 4. Equalize USDT
     if usdt_bal > 0:
-        per_addr = usdt_bal // num_addresses
-        if per_addr > 0:
-            plan.append(("USDT", per_addr, token_decimals.get("USDT", 6)))
+        usdt_payouts = calculate_equalized_distribution(usdt_bal, trap_balances.get("USDT", {}))
+        dec = token_decimals.get("USDT", 6)
+        for addr in addrs:
+            p_amount = usdt_payouts.get(addr, 0)
+            if p_amount > 0:
+                if addr not in plan: plan[addr] = []
+                plan[addr].append(("USDT", p_amount, dec))
 
     return plan
 
@@ -547,7 +640,7 @@ def main():
         num_targets = len(unique_addresses)
         logger.info(f"Targeting {num_targets} unique trap addresses")
 
-        # 3. Pull balances
+        # 3. Pull source and trap balances
         native_bal = w3.eth.get_balance(source_address)
         usdc_bal = get_token_balance(source_address, "USDC")
         native_usdc_bal = get_token_balance(source_address, "USDC_NATIVE")
@@ -559,7 +652,10 @@ def main():
             logger.info(f"Source USDC_NATIVE Balance: {native_usdc_bal / 1e6} USDC_NATIVE")
         logger.info(f"Source USDT Balance: {usdt_bal / 1e6} USDT")
 
-        # 4. Generate plan
+        logger.info("Fetching existing trap balances for dynamic balance equalization...")
+        trap_balances = get_trap_balances(unique_addresses)
+
+        # 4. Generate equalized plan
         assets_to_send = 0
         if usdc_bal > 0: assets_to_send += 1
         if "USDC_NATIVE" in TOKEN_CONFIG and native_usdc_bal > 0: assets_to_send += 1
@@ -568,18 +664,19 @@ def main():
         txs_per_address = (1 if native_bal > 0 else 0) + assets_to_send
         total_txs = txs_per_address * num_targets
 
-        plan = compute_funding_plan(num_targets, native_bal, usdc_bal, native_usdc_bal, usdt_bal, total_txs)
-        if not plan:
+        plan = compute_funding_plan(unique_addresses, native_bal, usdc_bal, native_usdc_bal, usdt_bal, total_txs, trap_balances)
+        
+        total_expected = sum(len(txs) for txs in plan.values())
+
+        if not plan or total_expected == 0:
             logger.critical("No assets to distribute or gas balance too low.")
             if job_id:
                 update_job(job_id, status="failed", message="No assets to distribute or native balance is too low for gas.")
             send_telegram("❌ Funding failed: No assets to distribute or native balance is too low for gas.", campaign_id)
             sys.exit(1)
 
-        logger.info(f"Funding Plan computed: {plan}")
+        logger.info(f"Funding Plan computed (dynamic equalization): {plan}")
 
-        # Correct tracking count representation after test-mode slicing
-        total_expected = len(plan) * num_targets
         if job_id:
             update_job(job_id, total=total_expected, progress=0)
 
@@ -604,7 +701,8 @@ def main():
         tx_count = 0
 
         for addr in unique_addresses:
-            for asset, amount, decimals in plan:
+            addr_plan = plan.get(addr, [])
+            for asset, amount, decimals in addr_plan:
                 logger.info(f"Sending {amount / (10**decimals)} {asset} to {addr} (Nonce: {current_nonce})")
                 
                 tx_hash, nonce_consumed = send_funding(
