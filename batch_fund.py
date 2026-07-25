@@ -96,7 +96,7 @@ if SUPABASE_URL and SUPABASE_KEY and create_client:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def update_job(job_id, status=None, progress=None, total=None, message=None):
-    """Update job status in Supabase."""
+    """Update job status in Supabase with retry logic for connection stability."""
     if not supabase:
         return
     data = {}
@@ -112,10 +112,16 @@ def update_job(job_id, status=None, progress=None, total=None, message=None):
         data["started_at"] = "now()"
     if status in ("completed", "failed"):
         data["completed_at"] = "now()"
-    try:
-        supabase.table("jobs").update(data).eq("id", job_id).execute()
-    except Exception as e:
-        logger.error(f"Failed to update job {job_id}: {e}")
+    
+    for attempt in range(3):
+        try:
+            supabase.table("jobs").update(data).eq("id", job_id).execute()
+            break
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(1)
+            else:
+                logger.error(f"Failed to update job {job_id}: {e}")
 
 def get_campaign_id_from_job(job_id):
     """Retrieve campaign_id from job record."""
@@ -472,9 +478,10 @@ def compute_funding_plan(unique_addresses, native_bal, usdc_bal, native_usdc_bal
 
 def send_funding(source_address, private_key, to_address, asset, amount_units, nonce):
     """
-    Send a funding transaction with isolated broadcast/wait logic 
-    and dynamic EIP-1559/Legacy gas fallbacks.
+    Send a funding transaction with isolated broadcast/wait logic, 
+    dynamic EIP-1559/Legacy gas fallbacks, and dynamic nonce recovery.
     """
+    used_nonce = nonce
     try:
         to_checksum = w3.to_checksum_address(to_address)
         latest_block = call_with_retry(w3.eth.get_block, "latest")
@@ -526,7 +533,7 @@ def send_funding(source_address, private_key, to_address, asset, amount_units, n
             token_addr = TOKEN_CONFIG.get(asset)
             if not token_addr:
                 logger.error(f"Unknown token {asset}")
-                return None, False
+                return None, False, used_nonce
 
             token = w3.eth.contract(address=w3.to_checksum_address(token_addr), abi=ERC20_ABI)
             try:
@@ -554,31 +561,55 @@ def send_funding(source_address, private_key, to_address, asset, amount_units, n
 
         if current_native_balance < total_required:
             logger.error(f"Insufficient gas balance to cover transaction. Needed: {total_required}, Have: {current_native_balance}")
-            return None, False
+            return None, False, used_nonce
 
         # Sign & Broadcast (The absolute point of no return for nonce consumption!)
         signed = w3.eth.account.sign_transaction(tx, private_key)
         raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
-        tx_hash = w3.eth.send_raw_transaction(raw_tx)
-        logger.info(f"Broadcasted TX: {tx_hash.hex()} (Nonce: {nonce})")
+        
+        try:
+            tx_hash = w3.eth.send_raw_transaction(raw_tx)
+            logger.info(f"Broadcasted TX: {tx_hash.hex()} (Nonce: {used_nonce})")
+        except Exception as broadcast_err:
+            err_msg = str(broadcast_err).lower()
+            if "nonce too low" in err_msg:
+                logger.warning(f"Nonce {nonce} too low for {to_address}. Fetching updated pending nonce from node...")
+                try:
+                    fresh_nonce = call_with_retry(w3.eth.get_transaction_count, source_address, "pending")
+                    if fresh_nonce <= nonce:
+                        fresh_nonce = call_with_retry(w3.eth.get_transaction_count, source_address, "latest")
+                    tx['nonce'] = fresh_nonce
+                    used_nonce = fresh_nonce
+                    signed = w3.eth.account.sign_transaction(tx, private_key)
+                    raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
+                    tx_hash = w3.eth.send_raw_transaction(raw_tx)
+                    logger.info(f"Broadcasted TX on retry: {tx_hash.hex()} (Nonce: {used_nonce})")
+                except Exception as retry_err:
+                    logger.error(f"Retry broadcast with updated nonce failed: {retry_err}")
+                    return None, True, used_nonce
+            elif "already known" in err_msg or "replacement transaction underpriced" in err_msg:
+                logger.warning(f"Transaction with nonce {nonce} already in pool: {broadcast_err}")
+                return None, True, used_nonce
+            else:
+                raise broadcast_err
 
     except Exception as e:
         logger.error(f"Failed to prepare or broadcast transaction for {to_address}: {e}")
         # Transaction NEVER hit the network, so nonce remains unconsumed.
-        return None, False
+        return None, False, used_nonce
 
     # Confirmation Phase (Timeout or errors here do NOT free the nonce, it is in the mempool!)
     try:
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
         if receipt.status == 1:
             logger.info(f"✅ TX confirmed: {tx_hash.hex()}")
-            return tx_hash.hex(), True
+            return tx_hash.hex(), True, used_nonce
         else:
             logger.error(f"❌ TX reverted in block: {tx_hash.hex()}")
-            return None, True
+            return None, True, used_nonce
     except Exception as e:
         logger.warning(f"⚠️ Receipt check timed out/failed for {tx_hash.hex()}. Nonce marked as spent: {e}")
-        return tx_hash.hex(), True
+        return tx_hash.hex(), True, used_nonce
 
 
 def main():
@@ -703,9 +734,18 @@ def main():
         for addr in unique_addresses:
             addr_plan = plan.get(addr, [])
             for asset, amount, decimals in addr_plan:
+                # Sync nonce with on-chain pending state to prevent stale/desynced nonce
+                try:
+                    pending_nonce = call_with_retry(w3.eth.get_transaction_count, source_address, "pending")
+                    if pending_nonce > current_nonce:
+                        logger.info(f"Syncing local nonce ({current_nonce}) to node pending nonce ({pending_nonce})")
+                        current_nonce = pending_nonce
+                except Exception as e:
+                    logger.warning(f"Could not sync pending nonce: {e}")
+
                 logger.info(f"Sending {amount / (10**decimals)} {asset} to {addr} (Nonce: {current_nonce})")
                 
-                tx_hash, nonce_consumed = send_funding(
+                tx_hash, nonce_consumed, used_nonce = send_funding(
                     source_address=source_address,
                     private_key=funding_key,
                     to_address=addr,
@@ -715,7 +755,7 @@ def main():
                 )
 
                 if nonce_consumed:
-                    current_nonce += 1
+                    current_nonce = max(current_nonce + 1, used_nonce + 1)
 
                 if tx_hash:
                     total_ok += 1
