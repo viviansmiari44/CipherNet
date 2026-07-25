@@ -263,7 +263,6 @@ def generate_key_for_counterparty(counterparty_address):
             text=True,
             shell=True,
             bufsize=1,
-            timeout=60 
         )
 
         private_key = None
