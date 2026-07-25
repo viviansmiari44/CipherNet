@@ -60321,3 +60321,50 @@ Connection reset by 45.12.114.97 port 1318
 2026-07-13 17:27:46,167 - duster - INFO - Generated 67 keys out of 4422.
 2026-07-13 17:27:46,167 - duster - INFO - Cancelling Clore.ai instance...
 2026-07-13 17:28:09,723 - duster - ERROR - Failed to cancel instance: 401 - {"code":3}
+2026-07-25 21:11:20,154 - duster - INFO - Connected to RPC: https://bsc-dataseed.binance.org
+2026-07-25 21:11:20,180 - duster - INFO - Funding source address: 0x09c3228439d8461908Cad6abF3e5300f2648D818
+2026-07-25 21:11:20,180 - duster - WARNING - Local file vault.txt not found.
+2026-07-25 21:11:20,180 - duster - CRITICAL - No trap addresses loaded. Exiting.
+2026-07-25 21:14:14,037 - duster - INFO - Connected to RPC: https://ethereum.publicnode.com
+2026-07-25 21:14:14,052 - duster - INFO - Funding source address: 0x09c3228439d8461908Cad6abF3e5300f2648D818
+2026-07-25 21:14:14,057 - duster - INFO - Loaded 1 unique trap addresses from local file 'vault.txt'
+2026-07-25 21:14:14,057 - duster - INFO - [TEST MODE] Slicing execution down to first trap address only.
+2026-07-25 21:14:14,057 - duster - INFO - Targeting 1 unique trap addresses
+2026-07-25 21:14:16,266 - duster - INFO - Source Native Balance: 0.000077683632919021 ETH
+2026-07-25 21:14:16,266 - duster - INFO - Source USDC Balance: 10.756508 USDC
+2026-07-25 21:14:16,266 - duster - INFO - Source USDT Balance: 5.004399 USDT
+2026-07-25 21:14:16,767 - duster - INFO - Funding Plan computed: [('ETH', 51332260951021, 18), ('USDC', 10756508, 6), ('USDT', 5004399, 6)]
+2026-07-25 21:16:09,355 - duster - INFO - Operation cancelled by user.
+2026-07-25 21:22:20,263 - duster - INFO - Connected to RPC: https://ethereum.publicnode.com
+2026-07-25 21:22:20,289 - duster - INFO - Funding source address: 0x09c3228439d8461908Cad6abF3e5300f2648D818
+2026-07-25 21:22:20,294 - duster - INFO - Loaded 1 unique trap addresses from local file 'vault.txt'
+2026-07-25 21:22:20,296 - duster - INFO - [TEST MODE] Slicing execution down to first trap address only.
+2026-07-25 21:22:20,297 - duster - INFO - Targeting 1 unique trap addresses
+2026-07-25 21:22:23,618 - duster - INFO - Source Native Balance: 0.000077683632919021 ETH
+2026-07-25 21:22:23,618 - duster - INFO - Source USDC Balance: 10.756508 USDC
+2026-07-25 21:22:23,618 - duster - INFO - Source USDT Balance: 5.004399 USDT
+2026-07-25 21:22:24,414 - duster - INFO - Funding Plan computed: [('ETH', 46374689467021, 18), ('USDC', 10756508, 6), ('USDT', 5004399, 6)]
+2026-07-25 21:22:29,228 - duster - INFO - Sending 4.6374689467021e-05 ETH to 0x51c7bc746828c245158ecae094566c1a71c12a7f (Nonce: 24)
+2026-07-25 21:22:31,281 - duster - ERROR - Failed to prepare or broadcast transaction for 0x51c7bc746828c245158ecae094566c1a71c12a7f: 'SignedTransaction' object has no attribute 'rawTransaction'
+2026-07-25 21:22:31,784 - duster - INFO - Sending 10.756508 USDC to 0x51c7bc746828c245158ecae094566c1a71c12a7f (Nonce: 24)
+2026-07-25 21:22:34,114 - duster - ERROR - Failed to prepare or broadcast transaction for 0x51c7bc746828c245158ecae094566c1a71c12a7f: 'SignedTransaction' object has no attribute 'rawTransaction'
+2026-07-25 21:22:34,618 - duster - INFO - Sending 5.004399 USDT to 0x51c7bc746828c245158ecae094566c1a71c12a7f (Nonce: 24)
+2026-07-25 21:22:37,668 - duster - ERROR - Failed to prepare or broadcast transaction for 0x51c7bc746828c245158ecae094566c1a71c12a7f: 'SignedTransaction' object has no attribute 'rawTransaction'
+2026-07-25 21:30:18,660 - duster - INFO - Connected to RPC: https://ethereum.publicnode.com
+2026-07-25 21:30:18,686 - duster - INFO - Funding source address: 0x09c3228439d8461908Cad6abF3e5300f2648D818
+2026-07-25 21:30:18,690 - duster - INFO - Loaded 1 unique trap addresses from local file 'vault.txt'
+2026-07-25 21:30:18,690 - duster - INFO - [TEST MODE] Slicing execution down to first trap address only.
+2026-07-25 21:30:18,691 - duster - INFO - Targeting 1 unique trap addresses
+2026-07-25 21:30:21,465 - duster - INFO - Source Native Balance: 0.000077683632919021 ETH
+2026-07-25 21:30:21,465 - duster - INFO - Source USDC Balance: 10.756508 USDC
+2026-07-25 21:30:21,466 - duster - INFO - Source USDT Balance: 5.004399 USDT
+2026-07-25 21:30:22,536 - duster - INFO - Funding Plan computed: [('ETH', 52671571339021, 18), ('USDC', 10756508, 6), ('USDT', 5004399, 6)]
+2026-07-25 21:30:24,510 - duster - INFO - Sending 5.2671571339021e-05 ETH to 0x51c7bc746828c245158ecae094566c1a71c12a7f (Nonce: 24)
+2026-07-25 21:30:26,983 - duster - INFO - Broadcasted TX: f9fd275b5f2ab5b7dd9bb4dfabdef6f8f3d3a36144e60800f9ac56e1653ce351 (Nonce: 24)
+2026-07-25 21:30:36,952 - duster - INFO - ✅ TX confirmed: f9fd275b5f2ab5b7dd9bb4dfabdef6f8f3d3a36144e60800f9ac56e1653ce351
+2026-07-25 21:30:37,457 - duster - INFO - Sending 10.756508 USDC to 0x51c7bc746828c245158ecae094566c1a71c12a7f (Nonce: 25)
+2026-07-25 21:30:40,433 - duster - INFO - Broadcasted TX: f7e45b9942db2843dd20964120e6c7329457e67b38fac1e0178b632b51cea1e7 (Nonce: 25)
+2026-07-25 21:30:49,199 - duster - INFO - ✅ TX confirmed: f7e45b9942db2843dd20964120e6c7329457e67b38fac1e0178b632b51cea1e7
+2026-07-25 21:30:49,700 - duster - INFO - Sending 5.004399 USDT to 0x51c7bc746828c245158ecae094566c1a71c12a7f (Nonce: 26)
+2026-07-25 21:30:55,382 - duster - INFO - Broadcasted TX: 3190c2c9e8be6480369830727b8f8322cc4909e9d0350cc9b81dc07e3e0e348b (Nonce: 26)
+2026-07-25 21:31:01,311 - duster - INFO - ✅ TX confirmed: 3190c2c9e8be6480369830727b8f8322cc4909e9d0350cc9b81dc07e3e0e348b

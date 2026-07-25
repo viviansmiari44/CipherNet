@@ -333,15 +333,20 @@ def compute_funding_plan(num_addresses, native_bal, usdc_bal, native_usdc_bal, u
 
     # Dynamic gas price estimator logic
     try:
-        current_gas_price = w3.eth.gas_price
+        latest_block = w3.eth.get_block("latest")
+        base_fee = latest_block.get("baseFeePerGas", w3.eth.gas_price)
+        # Standard dynamic priority tip (0.05 Gwei on quiet mainnet/L2)
+        priority_fee = w3.to_wei(0.05, "gwei")
+        effective_gas_price = base_fee + priority_fee
     except Exception:
-        current_gas_price = w3.to_wei(30, "gwei")  # Safe fallback default
+        effective_gas_price = w3.to_wei(2, "gwei")  # Safe, low fallback default
 
     max_fee_cap = w3.to_wei(getattr(config, 'GAS_MAX_FEE_CAP_GWEI', 100), "gwei")
-    safe_reserve_gas_price = min(int(current_gas_price * 1.5), max_fee_cap)
+    safe_reserve_gas_price = min(int(effective_gas_price * 1.1), max_fee_cap)
     
-    # 80k is standard high-buffer gas limit for ERC20/Base interactions
-    total_gas_reserve = total_txs * 80000 * safe_reserve_gas_price
+    # ERC-20 transfers consume ~65k gas units. 68k gives a tight 5% buffer.
+    gas_units_per_tx = 68000
+    total_gas_reserve = total_txs * gas_units_per_tx * safe_reserve_gas_price
 
     if native_bal > total_gas_reserve:
         distributable_native = native_bal - total_gas_reserve
@@ -393,18 +398,23 @@ def send_funding(source_address, private_key, to_address, asset, amount_units, n
 
         if use_eip1559:
             base_fee = latest_block["baseFeePerGas"]
-            max_priority = w3.to_wei(getattr(config, 'GAS_PRIORITY_FEE_GWEI', 1), "gwei")
-            buffer = getattr(config, 'GAS_FEE_BUFFER', 1.2)
-            max_fee = int((base_fee + max_priority) * buffer)
+            
+            # Fetch dynamic priority fee from node or use lean 0.05 Gwei fallback
+            try:
+                max_priority = w3.eth.max_priority_fee
+            except Exception:
+                max_priority = w3.to_wei(0.05, "gwei")
+
+            # Apply a tight 10% buffer to baseFee instead of 20%+
+            buffer = 1.1
+            max_fee = int((base_fee * buffer) + max_priority)
             max_fee = min(max_fee, max_fee_cap)
-            if max_priority > max_fee:
-                max_priority = int(max_fee * 0.1)
 
             gas_params['maxFeePerGas'] = max_fee
             gas_params['maxPriorityFeePerGas'] = max_priority
         else:
             gas_price = w3.eth.gas_price
-            legacy_buffer = getattr(config, 'GAS_FEE_BUFFER', 1.15)
+            legacy_buffer = 1.05  # Tighten legacy buffer to 5%
             capped_gas_price = min(int(gas_price * legacy_buffer), max_fee_cap)
             gas_params['gasPrice'] = capped_gas_price
 
@@ -428,10 +438,11 @@ def send_funding(source_address, private_key, to_address, asset, amount_units, n
             token = w3.eth.contract(address=w3.to_checksum_address(token_addr), abi=ERC20_ABI)
             try:
                 est_gas = token.functions.transfer(to_checksum, amount_units).estimate_gas({'from': source_address})
-                gas_limit = int(est_gas * 1.2)
+                # Tighten gas limit buffer from 20% (1.2x) to 5% (1.05x)
+                gas_limit = int(est_gas * 1.05)
             except Exception as e:
-                logger.warning(f"Gas estimation failed for {asset}, falling back to 100000 limit: {e}")
-                gas_limit = 100000
+                logger.warning(f"Gas estimation failed for {asset}, falling back to 68000 limit: {e}")
+                gas_limit = 68000
 
             tx = token.functions.transfer(to_checksum, amount_units).build_transaction({
                 'from': source_address,
@@ -454,7 +465,8 @@ def send_funding(source_address, private_key, to_address, asset, amount_units, n
 
         # Sign & Broadcast (The absolute point of no return for nonce consumption!)
         signed = w3.eth.account.sign_transaction(tx, private_key)
-        tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+        raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
+        tx_hash = w3.eth.send_raw_transaction(raw_tx)
         logger.info(f"Broadcasted TX: {tx_hash.hex()} (Nonce: {nonce})")
 
     except Exception as e:

