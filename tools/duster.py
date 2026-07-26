@@ -455,7 +455,7 @@ def send_dust(private_key, victim_address, campaign_id=None):
         
         logger.info(f"TX hash: {tx_hash.hex()}")
 
-        receipt = call_with_retry(w3.eth.wait_for_transaction_receipt, tx_hash, timeout=120)
+        receipt = call_with_retry(w3.eth.wait_for_transaction_receipt, tx_hash, timeout=600)
         
         if receipt.status == 1:
             try:
