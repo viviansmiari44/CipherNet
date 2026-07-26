@@ -493,137 +493,155 @@ def compute_funding_plan(unique_addresses, native_bal, usdc_bal, native_usdc_bal
 def send_funding(source_address, private_key, to_address, asset, amount_units, nonce):
     """
     Send a funding transaction with isolated broadcast/wait logic, 
-    dynamic EIP-1559/Legacy gas fallbacks, and dynamic nonce recovery.
+    dynamic EIP-1559/Legacy gas fallbacks, dynamic gas replacement for stuck nonces,
+    and dynamic nonce recovery.
     """
     used_nonce = nonce
-    try:
-        to_checksum = w3.to_checksum_address(to_address)
-        latest_block = call_with_retry(w3.eth.get_block, "latest")
-        
-        # Check if chain supports EIP-1559, and enforce legacy transactions on BSC
-        use_eip1559 = (
-            "baseFeePerGas" in latest_block 
-            and latest_block["baseFeePerGas"] is not None 
-            and CHAIN.lower() != "bsc"
-        )
+    max_retries = 3
 
-        gas_params = {}
-        max_fee_cap = w3.to_wei(getattr(config, 'GAS_MAX_FEE_CAP_GWEI', 100), "gwei")
-
-        if use_eip1559:
-            base_fee = latest_block["baseFeePerGas"]
+    for attempt in range(max_retries):
+        try:
+            to_checksum = w3.to_checksum_address(to_address)
+            latest_block = call_with_retry(w3.eth.get_block, "latest")
             
-            # Fetch dynamic priority fee from node or use lean 0.05 Gwei fallback
-            try:
-                max_priority = w3.eth.max_priority_fee
-            except Exception:
-                max_priority = w3.to_wei(0.05, "gwei")
+            # Check if chain supports EIP-1559, and enforce legacy transactions on BSC
+            use_eip1559 = (
+                "baseFeePerGas" in latest_block 
+                and latest_block["baseFeePerGas"] is not None 
+                and CHAIN.lower() != "bsc"
+            )
 
-            # Apply a tight 10% buffer to baseFee instead of 20%+
-            buffer = 1.1
-            max_fee = int((base_fee * buffer) + max_priority)
-            max_fee = min(max_fee, max_fee_cap)
+            gas_params = {}
+            max_fee_cap = w3.to_wei(getattr(config, 'GAS_MAX_FEE_CAP_GWEI', 100), "gwei")
 
-            gas_params['maxFeePerGas'] = max_fee
-            gas_params['maxPriorityFeePerGas'] = max_priority
-        else:
-            gas_price = w3.eth.gas_price
-            legacy_buffer = 1.05  # Tighten legacy buffer to 5%
-            capped_gas_price = min(int(gas_price * legacy_buffer), max_fee_cap)
-            gas_params['gasPrice'] = capped_gas_price
+            # Apply gas multiplier on retry attempts (at least 15% bump required by EVM nodes for replacement)
+            gas_bump = 1.15 ** attempt
 
-        # Build payloads
-        if asset == NATIVE_SYMBOL:
-            tx = {
-                'from': source_address,
-                'to': to_checksum,
-                'value': amount_units,
-                'gas': 21000,
-                'nonce': nonce,
-                'chainId': CHAIN_ID,
-                **gas_params
-            }
-        else:
-            token_addr = TOKEN_CONFIG.get(asset)
-            if not token_addr:
-                logger.error(f"Unknown token {asset}")
+            if use_eip1559:
+                base_fee = latest_block["baseFeePerGas"]
+                
+                # Fetch dynamic priority fee from node or use lean 0.05 Gwei fallback
+                try:
+                    max_priority = w3.eth.max_priority_fee
+                except Exception:
+                    max_priority = w3.to_wei(0.05, "gwei")
+
+                max_priority = int(max_priority * gas_bump)
+                buffer = 1.1 * gas_bump
+                max_fee = int((base_fee * buffer) + max_priority)
+                max_fee = min(max_fee, max_fee_cap)
+
+                # Invariant: maxFeePerGas >= maxPriorityFeePerGas
+                if max_fee < max_priority:
+                    max_fee = max_priority
+
+                gas_params['maxFeePerGas'] = max_fee
+                gas_params['maxPriorityFeePerGas'] = max_priority
+            else:
+                gas_price = w3.eth.gas_price
+                legacy_buffer = 1.05 * gas_bump
+                capped_gas_price = min(int(gas_price * legacy_buffer), max_fee_cap)
+                gas_params['gasPrice'] = capped_gas_price
+
+            # Build payloads
+            if asset == NATIVE_SYMBOL:
+                tx = {
+                    'from': source_address,
+                    'to': to_checksum,
+                    'value': amount_units,
+                    'gas': 21000,
+                    'nonce': used_nonce,
+                    'chainId': CHAIN_ID,
+                    **gas_params
+                }
+            else:
+                token_addr = TOKEN_CONFIG.get(asset)
+                if not token_addr:
+                    logger.error(f"Unknown token {asset}")
+                    return None, False, used_nonce
+
+                token = w3.eth.contract(address=w3.to_checksum_address(token_addr), abi=ERC20_ABI)
+                try:
+                    est_gas = token.functions.transfer(to_checksum, amount_units).estimate_gas({'from': source_address})
+                    gas_limit = int(est_gas * 1.05)
+                except Exception as e:
+                    logger.warning(f"Gas estimation failed for {asset}, falling back to 68000 limit: {e}")
+                    gas_limit = 68000
+
+                tx = token.functions.transfer(to_checksum, amount_units).build_transaction({
+                    'from': source_address,
+                    'nonce': used_nonce,
+                    'chainId': CHAIN_ID,
+                    'gas': gas_limit,
+                    **gas_params
+                })
+
+            # Final wallet check before broadcast
+            current_native_balance = w3.eth.get_balance(source_address)
+            active_gas_price = gas_params.get('gasPrice', gas_params.get('maxFeePerGas', 0))
+            gas_cost = tx.get('gas', 21000) * active_gas_price
+            transfer_value = tx.get('value', 0)
+            total_required = gas_cost + transfer_value
+
+            if current_native_balance < total_required:
+                logger.error(f"Insufficient gas balance to cover transaction. Needed: {total_required}, Have: {current_native_balance}")
                 return None, False, used_nonce
 
-            token = w3.eth.contract(address=w3.to_checksum_address(token_addr), abi=ERC20_ABI)
+            # Sign & Broadcast
+            signed = w3.eth.account.sign_transaction(tx, private_key)
+            raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
+            
             try:
-                est_gas = token.functions.transfer(to_checksum, amount_units).estimate_gas({'from': source_address})
-                # Tighten gas limit buffer from 20% (1.2x) to 5% (1.05x)
-                gas_limit = int(est_gas * 1.05)
-            except Exception as e:
-                logger.warning(f"Gas estimation failed for {asset}, falling back to 68000 limit: {e}")
-                gas_limit = 68000
+                tx_hash = w3.eth.send_raw_transaction(raw_tx)
+                logger.info(f"Broadcasted TX: {tx_hash.hex()} (Nonce: {used_nonce}, Attempt: {attempt + 1})")
+            except Exception as broadcast_err:
+                err_msg = str(broadcast_err).lower()
+                if "nonce too low" in err_msg:
+                    logger.warning(f"Nonce {used_nonce} too low for {to_address}. Fetching updated pending nonce from node...")
+                    try:
+                        fresh_nonce = call_with_retry(w3.eth.get_transaction_count, source_address, "pending")
+                        if fresh_nonce <= used_nonce:
+                            fresh_nonce = call_with_retry(w3.eth.get_transaction_count, source_address, "latest")
+                        tx['nonce'] = fresh_nonce
+                        used_nonce = fresh_nonce
+                        signed = w3.eth.account.sign_transaction(tx, private_key)
+                        raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
+                        tx_hash = w3.eth.send_raw_transaction(raw_tx)
+                        logger.info(f"Broadcasted TX on retry: {tx_hash.hex()} (Nonce: {used_nonce})")
+                    except Exception as retry_err:
+                        logger.error(f"Retry broadcast with updated nonce failed: {retry_err}")
+                        return None, True, used_nonce
+                elif "already known" in err_msg or "replacement transaction underpriced" in err_msg:
+                    logger.warning(f"Transaction with nonce {used_nonce} already in pool: {broadcast_err}")
+                    if attempt == max_retries - 1:
+                        return None, True, used_nonce
+                else:
+                    raise broadcast_err
 
-            tx = token.functions.transfer(to_checksum, amount_units).build_transaction({
-                'from': source_address,
-                'nonce': nonce,
-                'chainId': CHAIN_ID,
-                'gas': gas_limit,
-                **gas_params
-            })
+        except Exception as e:
+            logger.error(f"Failed to prepare or broadcast transaction for {to_address}: {e}")
+            if attempt == max_retries - 1:
+                return None, False, used_nonce
+            time.sleep(2)
+            continue
 
-        # Final wallet check before broadcast
-        current_native_balance = w3.eth.get_balance(source_address)
-        active_gas_price = gas_params.get('gasPrice', gas_params.get('maxFeePerGas', 0))
-        gas_cost = tx.get('gas', 21000) * active_gas_price
-        transfer_value = tx.get('value', 0)
-        total_required = gas_cost + transfer_value
-
-        if current_native_balance < total_required:
-            logger.error(f"Insufficient gas balance to cover transaction. Needed: {total_required}, Have: {current_native_balance}")
-            return None, False, used_nonce
-
-        # Sign & Broadcast (The absolute point of no return for nonce consumption!)
-        signed = w3.eth.account.sign_transaction(tx, private_key)
-        raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
-        
+        # Confirmation Phase (45s timeout per attempt before performing a higher-gas replacement)
         try:
-            tx_hash = w3.eth.send_raw_transaction(raw_tx)
-            logger.info(f"Broadcasted TX: {tx_hash.hex()} (Nonce: {used_nonce})")
-        except Exception as broadcast_err:
-            err_msg = str(broadcast_err).lower()
-            if "nonce too low" in err_msg:
-                logger.warning(f"Nonce {nonce} too low for {to_address}. Fetching updated pending nonce from node...")
-                try:
-                    fresh_nonce = call_with_retry(w3.eth.get_transaction_count, source_address, "pending")
-                    if fresh_nonce <= nonce:
-                        fresh_nonce = call_with_retry(w3.eth.get_transaction_count, source_address, "latest")
-                    tx['nonce'] = fresh_nonce
-                    used_nonce = fresh_nonce
-                    signed = w3.eth.account.sign_transaction(tx, private_key)
-                    raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
-                    tx_hash = w3.eth.send_raw_transaction(raw_tx)
-                    logger.info(f"Broadcasted TX on retry: {tx_hash.hex()} (Nonce: {used_nonce})")
-                except Exception as retry_err:
-                    logger.error(f"Retry broadcast with updated nonce failed: {retry_err}")
-                    return None, True, used_nonce
-            elif "already known" in err_msg or "replacement transaction underpriced" in err_msg:
-                logger.warning(f"Transaction with nonce {nonce} already in pool: {broadcast_err}")
-                return None, True, used_nonce
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=45)
+            if receipt.status == 1:
+                logger.info(f"✅ TX confirmed: {tx_hash.hex()}")
+                return tx_hash.hex(), True, used_nonce
             else:
-                raise broadcast_err
+                logger.error(f"❌ TX reverted in block: {tx_hash.hex()}")
+                return None, True, used_nonce
+        except Exception as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"⚠️ TX {tx_hash.hex()} timed out on Nonce {used_nonce}. Bumping gas for replacement TX (Attempt {attempt + 2}/{max_retries})...")
+            else:
+                logger.warning(f"⚠️ Receipt check timed out/failed for {tx_hash.hex()}. Nonce marked as spent: {e}")
+                return tx_hash.hex(), True, used_nonce
 
-    except Exception as e:
-        logger.error(f"Failed to prepare or broadcast transaction for {to_address}: {e}")
-        # Transaction NEVER hit the network, so nonce remains unconsumed.
-        return None, False, used_nonce
-
-    # Confirmation Phase (Timeout or errors here do NOT free the nonce, it is in the mempool!)
-    try:
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-        if receipt.status == 1:
-            logger.info(f"✅ TX confirmed: {tx_hash.hex()}")
-            return tx_hash.hex(), True, used_nonce
-        else:
-            logger.error(f"❌ TX reverted in block: {tx_hash.hex()}")
-            return None, True, used_nonce
-    except Exception as e:
-        logger.warning(f"⚠️ Receipt check timed out/failed for {tx_hash.hex()}. Nonce marked as spent: {e}")
-        return tx_hash.hex(), True, used_nonce
+    return None, False, used_nonce
 
 
 def main():
