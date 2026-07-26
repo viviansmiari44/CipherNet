@@ -19,10 +19,16 @@ const {
   files,
 } = config;
 
-// --- MULTI‑CHAIN: get chain‑specific configs ---
+// --- MULTI‑CHAIN: get chain‑specific configs with robust ID mapping ---
 const chainName = config.chain || 'ethereum';
 const chainCfg = config.getChainConfig ? config.getChainConfig() : null;
-const chainId = chainCfg?.chainId || 1;
+
+const CHAIN_IDS = {
+  ethereum: 1,
+  bsc:      56,
+  polygon:  137,
+};
+const chainId = chainCfg?.chainId || CHAIN_IDS[chainName] || 1;
 
 logger.info(`[Multi‑chain] Observer running for chain: ${chainName} (ID: ${chainId})`);
 
@@ -172,7 +178,7 @@ async function fetchPendingTargets() {
     logger.info(`Total new qualified pairs added this run: ${totalInserted} | Total pending targets in database: ${totalCount}`);
 
     if (totalInserted > 0) {
-      await sendAlert(`📊 Added ${totalInserted} new qualified pairs. Total pending targets: ${totalCount}`);
+      await sendAlert(`📊 [${chainName.toUpperCase()}] Added ${totalInserted} new qualified pairs. Total pending targets: ${totalCount}`);
     }
 
   } catch (error) {
