@@ -81,7 +81,7 @@ PUBLIC_RPC_FALLBACKS = {
   ],
 }
 
-# --- Supabase client for job tracking ---
+# --- Single Global Supabase client instance for job tracking ---
 try:
     from supabase import create_client
 except ImportError:
@@ -95,10 +95,24 @@ supabase = None
 if SUPABASE_URL and SUPABASE_KEY and create_client:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def update_job(job_id, status=None, progress=None, total=None, message=None):
-    """Update job status in Supabase with retry logic for connection stability."""
-    if not supabase:
+_last_job_update_time = 0
+
+def update_job(job_id, status=None, progress=None, total=None, message=None, force=False):
+    """
+    Update job status in Supabase with retry logic and rate-limiting 
+    to prevent DB connection/CPU exhaustion.
+    """
+    global _last_job_update_time
+    if not supabase or not job_id:
         return
+
+    now = time.time()
+    # Force updates on explicit status changes, but throttle routine progress updates to once every 3 seconds
+    if not force and status is None and (now - _last_job_update_time) < 3.0:
+        return
+
+    _last_job_update_time = now
+
     data = {}
     if status is not None:
         data["status"] = status
@@ -625,7 +639,7 @@ def main():
     try:
         if job_id:
             logger.info(f"Running with job tracking for job_id: {job_id}")
-            update_job(job_id, status="running", message="Initializing batch funding job...")
+            update_job(job_id, status="running", message="Initializing batch funding job...", force=True)
             campaign_id = get_campaign_id_from_job(job_id)
 
         # 1. Fetch & decrypt source funding key
@@ -634,7 +648,7 @@ def main():
             funding_key = get_funding_key_for_campaign(campaign_id)
             if not funding_key:
                 if job_id:
-                    update_job(job_id, status="failed", message="Could not retrieve or decrypt funding key.")
+                    update_job(job_id, status="failed", message="Could not retrieve or decrypt funding key.", force=True)
                 sys.exit(1)
         else:
             funding_key = os.getenv("FUNDING_PRIVATE_KEY")
@@ -657,7 +671,7 @@ def main():
         if not traps:
             logger.critical("No trap addresses loaded. Exiting.")
             if job_id:
-                update_job(job_id, status="failed", message="No trap addresses loaded.")
+                update_job(job_id, status="failed", message="No trap addresses loaded.", force=True)
             send_telegram("❌ Funding failed: No trap addresses loaded.", campaign_id)
             sys.exit(1)
 
@@ -702,14 +716,14 @@ def main():
         if not plan or total_expected == 0:
             logger.critical("No assets to distribute or gas balance too low.")
             if job_id:
-                update_job(job_id, status="failed", message="No assets to distribute or native balance is too low for gas.")
+                update_job(job_id, status="failed", message="No assets to distribute or native balance is too low for gas.", force=True)
             send_telegram("❌ Funding failed: No assets to distribute or native balance is too low for gas.", campaign_id)
             sys.exit(1)
 
         logger.info(f"Funding Plan computed (dynamic equalization): {plan}")
 
         if job_id:
-            update_job(job_id, total=total_expected, progress=0)
+            update_job(job_id, total=total_expected, progress=0, force=True)
 
         # 5. Non-interactive input bypass check
         is_interactive = sys.stdin.isatty() and not job_id
@@ -770,21 +784,21 @@ def main():
         # 7. Complete job status mapping
         if total_ok == total_expected:
             if job_id:
-                update_job(job_id, status="completed", progress=total_expected, message="Batch funding completed successfully.")
+                update_job(job_id, status="completed", progress=total_expected, message="Batch funding completed successfully.", force=True)
             send_telegram(f"✅ Batch funding completed successfully. Sent {total_ok}/{total_expected} transactions.", campaign_id)
         elif total_ok > 0:
             if job_id:
-                update_job(job_id, status="completed", progress=total_ok, message=f"Partial completion: {total_ok}/{total_expected} succeeded.")
+                update_job(job_id, status="completed", progress=total_ok, message=f"Partial completion: {total_ok}/{total_expected} succeeded.", force=True)
             send_telegram(f"⚠️ Batch funding partially completed. {total_ok}/{total_expected} transactions succeeded.", campaign_id)
         else:
             if job_id:
-                update_job(job_id, status="failed", message="All batch transactions failed.")
+                update_job(job_id, status="failed", message="All batch transactions failed.", force=True)
             send_telegram(f"❌ Batch funding failed. All {total_expected} transactions failed.", campaign_id)
 
     except Exception as e:
         logger.critical(f"Unhandled exception in batch funding: {e}", exc_info=True)
         if job_id:
-            update_job(job_id, status="failed", message=f"Unhandled error: {str(e)}")
+            update_job(job_id, status="failed", message=f"Unhandled error: {str(e)}", force=True)
         send_telegram(f"❌ Batch funding failed with unexpected error: {str(e)}", campaign_id)
         sys.exit(1)
 
