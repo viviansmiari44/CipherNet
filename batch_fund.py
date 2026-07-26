@@ -370,8 +370,8 @@ def get_trap_balances(unique_addresses):
 def calculate_equalized_distribution(funder_available, trap_balances):
     """
     Calculates exact payout per trap to achieve equalized target balance across all traps.
-    Handles 'rich traps' (traps already holding >= target balance) by excluding them
-    and re-equalizing remaining funder funds among active traps.
+    Uses a water-filling algorithm: funds lowest-balance traps first until active traps
+    reach the same target balance. Traps already holding >= target balance are skipped.
     """
     if not trap_balances or funder_available <= 0:
         return {addr: 0 for addr in trap_balances}
@@ -379,10 +379,10 @@ def calculate_equalized_distribution(funder_available, trap_balances):
     active_addrs = list(trap_balances.keys())
     allocatable_funder = funder_available
 
-    target_balance = 0
+    # Iteratively remove traps that already meet or exceed the dynamic target
     while active_addrs:
-        current_pool = sum(trap_balances[a] for a in active_addrs) + allocatable_funder
-        target_balance = current_pool // len(active_addrs)
+        current_sum = sum(trap_balances[a] for a in active_addrs)
+        target_balance = (current_sum + allocatable_funder) // len(active_addrs)
         
         rich_traps = [a for a in active_addrs if trap_balances[a] >= target_balance]
         if not rich_traps:
@@ -390,17 +390,30 @@ def calculate_equalized_distribution(funder_available, trap_balances):
         for a in rich_traps:
             active_addrs.remove(a)
 
-    payouts = {}
-    for addr, current_bal in trap_balances.items():
-        if addr in active_addrs:
-            needed = target_balance - current_bal
-            payouts[addr] = max(0, needed)
-        else:
-            payouts[addr] = 0
+    payouts = {addr: 0 for addr in trap_balances}
+    if not active_addrs:
+        return payouts
+
+    # Calculate final target balance for active traps
+    current_sum = sum(trap_balances[a] for a in active_addrs)
+    target_balance = (current_sum + allocatable_funder) // len(active_addrs)
+    
+    remaining_funder = allocatable_funder
+    for addr in active_addrs:
+        needed = target_balance - trap_balances[addr]
+        if needed > 0:
+            payouts[addr] = needed
+            remaining_funder -= needed
+
+    # Distribute leftover wei/units from integer division rounding to lowest-balance traps
+    if remaining_funder > 0:
+        active_sorted = sorted(active_addrs, key=lambda a: trap_balances[a] + payouts[a])
+        for i in range(min(remaining_funder, len(active_sorted))):
+            payouts[active_sorted[i]] += 1
 
     return payouts
 
-def compute_funding_plan(unique_addresses, native_bal, usdc_bal, native_usdc_bal, usdt_bal, total_txs, trap_balances=None):
+def compute_funding_plan(unique_addresses, native_bal, usdc_bal, native_usdc_bal, usdt_bal, total_txs=0, trap_balances=None):
     """Build asset distribution plan per target address using dynamic balance equalization."""
     plan = {}
     
@@ -422,71 +435,71 @@ def compute_funding_plan(unique_addresses, native_bal, usdc_bal, native_usdc_bal
             "USDT": {a: 0 for a in addrs}
         }
 
-    # Decimals dynamic fetch
     token_decimals = getattr(config, 'get_token_decimals', lambda: {"USDC": 6, "USDT": 6, "USDC_NATIVE": 6})()
 
-    # Dynamic gas price estimator logic
+    # Dynamic gas price estimation
     try:
         latest_block = w3.eth.get_block("latest")
         base_fee = latest_block.get("baseFeePerGas", w3.eth.gas_price)
-        # Standard dynamic priority tip (0.05 Gwei on quiet mainnet/L2)
         priority_fee = w3.to_wei(0.05, "gwei")
         effective_gas_price = base_fee + priority_fee
     except Exception:
-        effective_gas_price = w3.to_wei(2, "gwei")  # Safe, low fallback default
+        effective_gas_price = w3.to_wei(2, "gwei")
 
     max_fee_cap = w3.to_wei(getattr(config, 'GAS_MAX_FEE_CAP_GWEI', 100), "gwei")
     safe_reserve_gas_price = min(int(effective_gas_price * 1.1), max_fee_cap)
-    
-    # ERC-20 transfers consume ~65k gas units. 68k gives a tight 5% buffer.
-    gas_units_per_tx = 68000
-    total_gas_reserve = total_txs * gas_units_per_tx * safe_reserve_gas_price
 
-    # 1. Equalize Native Asset
+    # 1. Calculate ERC-20 Token Payouts First
+    usdc_payouts = calculate_equalized_distribution(usdc_bal, trap_balances.get("USDC", {})) if usdc_bal > 0 else {}
+    native_usdc_payouts = calculate_equalized_distribution(native_usdc_bal, trap_balances.get("USDC_NATIVE", {})) if ("USDC_NATIVE" in TOKEN_CONFIG and native_usdc_bal > 0) else {}
+    usdt_payouts = calculate_equalized_distribution(usdt_bal, trap_balances.get("USDT", {})) if usdt_bal > 0 else {}
+
+    # Count actual active ERC-20 transfers
+    token_tx_count = (
+        sum(1 for amt in usdc_payouts.values() if amt > 0) +
+        sum(1 for amt in native_usdc_payouts.values() if amt > 0) +
+        sum(1 for amt in usdt_payouts.values() if amt > 0)
+    )
+
+    # Estimate native transfers count
+    native_tx_count_est = num_addresses
+
+    # Reserve gas based on actual needed transfers (68k gas for ERC-20, 21k for Native)
+    total_gas_reserve = (token_tx_count * 68000 + native_tx_count_est * 21000) * safe_reserve_gas_price
+
+    # 2. Calculate Native Payouts using remaining distributable native balance
     if native_bal > total_gas_reserve:
         distributable_native = native_bal - total_gas_reserve
         native_payouts = calculate_equalized_distribution(distributable_native, trap_balances.get("native", {}))
-        for addr in addrs:
-            p_amount = native_payouts.get(addr, 0)
-            if p_amount > 0:
-                if addr not in plan: plan[addr] = []
-                plan[addr].append((NATIVE_SYMBOL, p_amount, 18))
     else:
         logger.warning(
             f"Native balance too low to distribute native asset. "
             f"Available: {w3.from_wei(native_bal, 'ether')} {NATIVE_SYMBOL}. "
-            f"Required safe Gas Reserve: {w3.from_wei(total_gas_reserve, 'ether')} {NATIVE_SYMBOL}."
+            f"Required Gas Reserve: {w3.from_wei(total_gas_reserve, 'ether')} {NATIVE_SYMBOL}."
         )
+        native_payouts = {}
 
-    # 2. Equalize USDC
-    if usdc_bal > 0:
-        usdc_payouts = calculate_equalized_distribution(usdc_bal, trap_balances.get("USDC", {}))
-        dec = token_decimals.get("USDC", 6)
-        for addr in addrs:
-            p_amount = usdc_payouts.get(addr, 0)
-            if p_amount > 0:
-                if addr not in plan: plan[addr] = []
-                plan[addr].append(("USDC", p_amount, dec))
+    # 3. Assemble Plan per address
+    for addr in addrs:
+        addr_plan = []
+        p_native = native_payouts.get(addr, 0)
+        if p_native > 0:
+            addr_plan.append((NATIVE_SYMBOL, p_native, 18))
 
-    # 3. Equalize USDC_NATIVE
-    if "USDC_NATIVE" in TOKEN_CONFIG and native_usdc_bal > 0:
-        native_usdc_payouts = calculate_equalized_distribution(native_usdc_bal, trap_balances.get("USDC_NATIVE", {}))
-        dec = token_decimals.get("USDC_NATIVE", 6)
-        for addr in addrs:
-            p_amount = native_usdc_payouts.get(addr, 0)
-            if p_amount > 0:
-                if addr not in plan: plan[addr] = []
-                plan[addr].append(("USDC_NATIVE", p_amount, dec))
+        p_usdc = usdc_payouts.get(addr, 0)
+        if p_usdc > 0:
+            addr_plan.append(("USDC", p_usdc, token_decimals.get("USDC", 6)))
 
-    # 4. Equalize USDT
-    if usdt_bal > 0:
-        usdt_payouts = calculate_equalized_distribution(usdt_bal, trap_balances.get("USDT", {}))
-        dec = token_decimals.get("USDT", 6)
-        for addr in addrs:
-            p_amount = usdt_payouts.get(addr, 0)
-            if p_amount > 0:
-                if addr not in plan: plan[addr] = []
-                plan[addr].append(("USDT", p_amount, dec))
+        p_nusdc = native_usdc_payouts.get(addr, 0)
+        if p_nusdc > 0:
+            addr_plan.append(("USDC_NATIVE", p_nusdc, token_decimals.get("USDC_NATIVE", 6)))
+
+        p_usdt = usdt_payouts.get(addr, 0)
+        if p_usdt > 0:
+            addr_plan.append(("USDT", p_usdt, token_decimals.get("USDT", 6)))
+
+        if addr_plan:
+            plan[addr] = addr_plan
 
     return plan
 
@@ -717,6 +730,12 @@ def main():
 
         logger.info("Fetching existing trap balances for dynamic balance equalization...")
         trap_balances = get_trap_balances(unique_addresses)
+
+        # Prioritize 0-balance / lowest-balance traps first during execution
+        unique_addresses = sorted(
+            unique_addresses, 
+            key=lambda a: trap_balances.get("native", {}).get(a, 0)
+        )
 
         # 4. Generate equalized plan
         assets_to_send = 0
