@@ -161,10 +161,18 @@ async function fetchPendingTargets() {
       }
     }
 
-    logger.info(`Total new qualified pairs added this run: ${totalInserted}`);
+    // ─── Fetch total pending targets count for this chain ───
+    const { count: totalPendingCount, error: countError } = await supabase
+      .from('pending_targets')
+      .select('*', { count: 'exact', head: true })
+      .eq('chain', chainName);
 
-    if (totalInserted > 50) {
-      await sendAlert(`📊 Found ${totalInserted} new qualified pairs.`);
+    const totalCount = countError ? 'Unknown' : totalPendingCount;
+
+    logger.info(`Total new qualified pairs added this run: ${totalInserted} | Total pending targets in database: ${totalCount}`);
+
+    if (totalInserted > 0) {
+      await sendAlert(`📊 Added ${totalInserted} new qualified pairs. Total pending targets: ${totalCount}`);
     }
 
   } catch (error) {
