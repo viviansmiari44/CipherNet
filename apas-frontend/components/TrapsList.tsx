@@ -58,7 +58,12 @@ export default function TrapsList({
       if (res.ok) {
         const data = await res.json();
         setTraps(data.traps || []);
-        setTotal(data.total || 0);
+        // ✅ Only update total if the API returns a valid positive number.
+        // This prevents resetting total to 0 on subsequent paginated requests.
+        if (data.total !== undefined && data.total > 0) {
+          setTotal(data.total);
+        }
+        // If total is not provided, we keep the existing total.
       } else {
         console.warn('[TrapsList] Failed to fetch traps, status:', res.status);
       }
@@ -135,7 +140,7 @@ export default function TrapsList({
     return balances[trapAddress.toLowerCase()] || null;
   };
 
-  // ─── Copy private key (existing) ───
+  // ─── Copy private key ───
   const copyPrivateKey = async (trapId: string, trapAddress: string) => {
     setCopying((prev) => ({ ...prev, [trapId]: true }));
     try {
