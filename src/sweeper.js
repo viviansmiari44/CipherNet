@@ -59,7 +59,7 @@ const lastBalanceAlertTimes = new Map();
 
 let cycleMetadataCache = null;
 
-// 🚀 FIX: Bulletproof 429 prevention
+// 🚀 BULLETPROOF MULTI-SOURCE PRICE FETCHER
 let priceCache = {};
 let lastPriceFetch = 0;
 let priceFetchPromise = null;
@@ -67,10 +67,7 @@ const PRICE_CACHE_MS = 15 * 60 * 1000; // 15 minutes
 
 async function fetchTokenPrices() {
   const now = Date.now();
-  
-  // If we attempted a fetch recently (even if it failed with 429), DO NOT try again.
-  // This completely stops the 429 spam loop.
-  if (now - lastPriceFetch < PRICE_CACHE_MS) {
+  if (now - lastPriceFetch < PRICE_CACHE_MS && Object.keys(priceCache).length > 0) {
     return priceCache;
   }
 
@@ -83,36 +80,82 @@ async function fetchTokenPrices() {
       const nativeSymbol = globalConfig.getChainConfig()?.nativeSymbol || 'ETH';
       const ids = [nativeSymbol.toLowerCase()];
       const TOKEN_LIST = globalConfig.getChainConfig()?.tokens ? 
-        Object.entries(globalConfig.getChainConfig().tokens).map(([s]) => s.toLowerCase()) : 
+        Object.keys(globalConfig.getChainConfig().tokens).map(s => s.toLowerCase()) : 
         ['usdc', 'usdt', 'wbtc', 'weth', 'dai'];
       
       const allSymbols = [...new Set([...ids, ...TOKEN_LIST])];
-      const symbolToId = { eth: 'ethereum', bnb: 'binancecoin', matic: 'matic-network', pol: 'matic-network', usdc: 'usd-coin', usdt: 'tether', dai: 'dai', wbtc: 'bitcoin', weth: 'weth' };
+      let newCache = {};
 
-      const coinIds = allSymbols.map(s => symbolToId[s]).filter(Boolean);
-      if (coinIds.length > 0) {
-        const url = `https://api.coingecko.com/api/v3/simple/price?ids=${coinIds.join(',')}&vs_currencies=usd`;
-        const resp = await axios.get(url, { timeout: 10000 });
-        
-        if (resp.status === 200) {
-          const data = resp.data;
-          const newCache = {};
-          for (const sym of allSymbols) {
-            const id = symbolToId[sym];
-            if (id && data[id] && data[id].usd) {
-              newCache[sym] = data[id].usd;
+      // ─── TIER 1: CoinGecko ───
+      try {
+        const symbolToId = { eth: 'ethereum', bnb: 'binancecoin', matic: 'matic-network', pol: 'matic-network', usdc: 'usd-coin', usdt: 'tether', dai: 'dai', wbtc: 'bitcoin', weth: 'weth' };
+        const coinIds = allSymbols.map(s => symbolToId[s]).filter(Boolean);
+        if (coinIds.length > 0) {
+          const url = `https://api.coingecko.com/api/v3/simple/price?ids=${coinIds.join(',')}&vs_currencies=usd`;
+          const resp = await axios.get(url, { timeout: 8000 });
+          if (resp.status === 200) {
+            const data = resp.data;
+            for (const sym of allSymbols) {
+              const id = symbolToId[sym];
+              if (id && data[id] && data[id].usd) {
+                newCache[sym] = data[id].usd;
+              }
             }
           }
-          if (Object.keys(newCache).length > 0) {
-            priceCache = newCache;
+        }
+      } catch (e) {
+        logger.warn(`CoinGecko price fetch failed (${e.message}). Trying fallback...`);
+      }
+
+      // ─── TIER 2: Binance API (Highly reliable for major pairs) ───
+      if (Object.keys(newCache).length < allSymbols.length) {
+        try {
+          const binancePairs = {
+            eth: 'ETHUSDT', bnb: 'BNBUSDT', matic: 'MATICUSDT', pol: 'POLUSDT',
+            wbtc: 'BTCUSDT', weth: 'ETHUSDT' // WETH tracks ETH price
+          };
+          
+          for (const sym of allSymbols) {
+            if (newCache[sym]) continue; // Already fetched successfully
+            
+            const pair = binancePairs[sym];
+            if (pair) {
+              const url = `https://api.binance.com/api/v3/ticker/price?symbol=${pair}`;
+              const resp = await axios.get(url, { timeout: 5000 });
+              if (resp.status === 200 && resp.data.price) {
+                newCache[sym] = parseFloat(resp.data.price);
+              }
+            } else if (sym === 'usdc' || sym === 'usdt' || sym === 'dai') {
+              newCache[sym] = 1.0; // Stablecoins are always ~$1
+            }
           }
+        } catch (e) {
+          logger.warn(`Binance price fetch failed (${e.message}).`);
         }
       }
+
+      // ─── TIER 3: Hardcoded Conservative Fallback (Prevents $0 value disasters) ───
+      const fallbackPrices = {
+        eth: 3000, bnb: 600, matic: 0.5, pol: 0.5,
+        usdc: 1, usdt: 1, dai: 1, wbtc: 65000, weth: 3000
+      };
+
+      for (const sym of allSymbols) {
+        if (!newCache[sym] && fallbackPrices[sym]) {
+          logger.warn(`⚠️ All APIs failed. Using conservative hardcoded fallback price for ${sym}: $${fallbackPrices[sym]}`);
+          newCache[sym] = fallbackPrices[sym];
+        }
+      }
+
+      if (Object.keys(newCache).length > 0) {
+        priceCache = newCache;
+        logger.debug(`Final price cache established: ${JSON.stringify(priceCache)}`);
+      }
     } catch (e) {
-      logger.warn(`Price fetch failed: ${e.message}. Using existing cache or 0 USD value.`);
+      logger.error(`Critical: All price fetch sources failed: ${e.message}`);
     } finally {
       // 🚀 CRITICAL: Update lastPriceFetch EVEN ON FAILURE to enforce the 15-minute cooldown
-      lastPriceFetch = now;
+      lastPriceFetch = Date.now();
       priceFetchPromise = null;
     }
     return priceCache;
