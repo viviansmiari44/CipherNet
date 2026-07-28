@@ -176,7 +176,7 @@ console.log('[DEBUG] delayBetweenMs:', delayBetweenMs);
 const COOLDOWN_MS = cooldownMs || 60 * 60 * 1000;
 const DUST_RETRIES = dustRetries || 2;
 const DELAY_BETWEEN_DUST_MS = delayBetweenMs || 2000;
-const EXEC_TIMEOUT_MS = 60000;
+const EXEC_TIMEOUT_MS = 180000; 
 
 // --- Dynamic cooldown limits ---
 const MIN_COOLDOWN_MS = parseInt(process.env.MIN_COOLDOWN_MS || '600000', 10);

