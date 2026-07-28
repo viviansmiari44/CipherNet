@@ -44,47 +44,24 @@ const PUBLIC_FALLBACKS = {
   bsc: [
     'https://bnb-mainnet.g.alchemy.com/v2/alch_6gTznTT4QnX3_0IE9gkY-',
     'https://bsc-dataseed.binance.org',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_z1J_ESjjLVZwSBLNoep84',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_-NvhHn24EgwhuMt38pZJr',
     'https://rpc.ankr.com/bsc',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_8ToIPT9Z3R1iQ55nksx8b',
     'https://bsc.publicnode.com',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_Qy6hQXdtdVlE7Z4uVxt_A',
     'https://1rpc.io/bnb',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_rniHI4MxzjBfNZ4bxmDu5',
-    'https://bsc.drpc.org',
-    'https://bnb-mainnet.g.alchemy.com/v2/LW3i2zPypSVe0cl4BxCxI',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_WQp652MAlfKFbtD1A-zNh'
+    'https://bsc.drpc.org'
   ],
   polygon: [
-    'https://polygon-mainnet.g.alchemy.com/v2/CByFU5cCGAYyh8EHLamXD',
     'https://polygon-rpc.com',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_UdSkrC6LFs2HGS0VUGg5O',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_tAPr1C9JUzQZYax5pslu5',
     'https://rpc.ankr.com/polygon',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_Bq31mnvxmjdT70RCYLGLA',
     'https://polygon.llamarpc.com',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_17XYrB1qagYO9Edwxj7Cw',
     'https://polygon.publicnode.com',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_UQzY-saHkZZrowH7kylTu',
-    'https://1rpc.io/polygon',
-    'https://polygon-mainnet.g.alchemy.com/v2/c6MIVgnVjXC0kgDH4BItE',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11'
+    'https://1rpc.io/polygon'
   ],
   ethereum: [
-    'https://eth-mainnet.g.alchemy.com/v2/alch_F5VimAPoBoESKZ566us-U',
     'https://ethereum.publicnode.com',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_x_oSlpf2bnfc6brp-BgzA',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_tp8k4HI9tVpUEBmsF3kXc',
     'https://rpc.ankr.com/eth',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_7viyR-7wWLgc2i9suQ6hS',
     'https://eth.llamarpc.com',
-    'https://eth-mainnet.g.alchemy.com/v2/ig-ZUQrtw2shXhW2NuT6W',
     'https://1rpc.io/eth',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_dFm-5A7LhWtYU3_4Y103o',
-    'https://eth.drpc.org',
-    'https://eth-mainnet.g.alchemy.com/v2/gODtbeuBQLkTJAm3e9tB1',
-    'https://eth-mainnet.g.alchemy.com/v2/GsO461DZvmNGh4O4Ss5Et'
+    'https://eth.drpc.org'
   ],
 };
 
@@ -104,7 +81,56 @@ const transferEvent = parseAbiItem(
   'event Transfer(address indexed from, address indexed to, uint256 value)'
 );
 
-// --- Build MONITORED_TOKENS from chain config (with fallback) ---
+// ─── BOUNDED LRU CONTRACT CACHE WITH FAIL-SAFE TTL ───
+const MAX_CACHE_SIZE = 20000;
+const addressCodeCache = new Map();
+
+function setCacheEntry(key, value, ttlMs = null) {
+  if (addressCodeCache.has(key)) {
+    addressCodeCache.delete(key);
+  } else if (addressCodeCache.size >= MAX_CACHE_SIZE) {
+    // Evict oldest entry (LRU)
+    const oldestKey = addressCodeCache.keys().next().value;
+    addressCodeCache.delete(oldestKey);
+  }
+  
+  addressCodeCache.set(key, {
+    isContract: value,
+    expiresAt: ttlMs ? Date.now() + ttlMs : null
+  });
+}
+
+/**
+ * Checks if an address is a Smart Contract or EOA (User).
+ * @param {string} address - Checksummed or lowercase Ethereum address
+ * @returns {Promise<boolean>} - Returns true if Smart Contract, false if User (EOA)
+ */
+async function isContractAddress(address) {
+  const lower = address.toLowerCase();
+  const cached = addressCodeCache.get(lower);
+
+  if (cached) {
+    // Check if entry has expired (for temporary RPC failure caches)
+    if (!cached.expiresAt || Date.now() < cached.expiresAt) {
+      return cached.isContract;
+    }
+  }
+
+  try {
+    const code = await client.getBytecode({ address: getAddress(address) });
+    const isContract = Boolean(code && code !== '0x');
+    
+    // Store permanently in LRU cache
+    setCacheEntry(lower, isContract);
+    return isContract;
+  } catch (err) {
+    // Prevent RPC storms by caching false for 5 minutes (TTL) instead of indefinitely
+    setCacheEntry(lower, false, 5 * 60 * 1000);
+    return false;
+  }
+}
+
+// --- Build MONITORED_TOKENS from chain config ---
 const TOKEN_DECIMALS_MAP = {
   56: {
     '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d': 18,
@@ -193,12 +219,12 @@ async function updatePrices() {
           if (price > 0) PRICES[key] = price;
         }
       } catch {
-        // Silent catch for individual network hiccups
+        // Silent catch
       }
     }
     updateNativeThreshold();
   } catch {
-    // Graceful fallback to static defaults
+    // Fallback
   }
 }
 
@@ -233,7 +259,6 @@ let isProcessing = false;
 async function startCollector() {
   console.log(`[+] Starting real-time block ingestion on ${chainName}...`);
   console.log(`[+] Monitoring assets: ${Object.values(MONITORED_TOKENS).map(t => t.symbol).join(', ')} and Native ${nativeSymbol}`);
-  console.log(`[+] Filtering dust: Only saving transfers >= $3,000 equivalent (${NATIVE_THRESHOLD_WEI} wei native)`);
 
   setInterval(async () => {
     if (isProcessing) return;
@@ -251,71 +276,96 @@ async function startCollector() {
       if (currentBlock > lastProcessedBlock) {
         for (let i = lastProcessedBlock + 1n; i <= currentBlock; i++) {
           console.log(`\n[!] Block ${i} mined! Fetching transfer logs and block transactions...`);
-          
-          const logs = await client.getLogs({
-            event: transferEvent,
-            address: Object.keys(MONITORED_TOKENS),
-            fromBlock: i,
-            toBlock: i,
-          });
 
-          const blockWithTx = await client.getBlock({
-            blockNumber: i,
-            includeTransactions: true,
-          });
+          // Execute both RPC calls simultaneously
+          const [logs, blockWithTx] = await Promise.all([
+            client.getLogs({
+              event: transferEvent,
+              address: Object.keys(MONITORED_TOKENS),
+              fromBlock: i,
+              toBlock: i,
+            }),
+            client.getBlock({
+              blockNumber: i,
+              includeTransactions: true,
+            }),
+          ]);
 
-          // ✅ FIX: Explicitly convert on-chain seconds to an ISO 8601 string.
-          // Passing raw numbers to Supabase timestamp columns can cause unpredictable 
-          // coercion or trigger fallback to DEFAULT NOW() if the type doesn't match perfectly.
           const blockTimestampIso = new Date(Number(blockWithTx.timestamp) * 1000).toISOString();
-
           const insertData = [];
           let ingestedCount = 0;
 
           // ─── Process ERC-20 Logs ───
           if (logs.length > 0) {
-            logs.forEach((log) => {
-              if (!log.args || !log.args.from || !log.args.to || !log.args.value) return; 
+            for (const log of logs) {
+              if (!log.args || !log.args.from || !log.args.to || !log.args.value) continue; 
 
               const tokenAddress = log.address.toLowerCase();
               const tokenMeta = MONITORED_TOKENS[tokenAddress];
-              if (!tokenMeta) return;
+              if (!tokenMeta) continue;
 
               const minTransferValue = getMinTransferValue(tokenMeta.decimals, tokenMeta.symbol, 3000);
-              if (log.args.value < minTransferValue) return;
+              if (log.args.value < minTransferValue) continue;
+
+              const sender = log.args.from.toLowerCase();
+              const receiver = log.args.to.toLowerCase();
+
+              // 🔍 OPTIMIZED POISONING FILTER:
+              const senderIsContract = await isContractAddress(sender);
+              const receiverIsContract = await isContractAddress(receiver);
+
+              // If BOTH are contracts, skip.
+              if (senderIsContract && receiverIsContract) {
+                continue;
+              }
 
               ingestedCount++;
               insertData.push({
                 transaction_hash: log.transactionHash,
                 block_number: Number(i),
                 token_address: tokenAddress,
-                sender: log.args.from.toLowerCase(),
-                receiver: log.args.to.toLowerCase(),
+                sender,
+                receiver,
                 value: log.args.value.toString(),
                 chain_id: chainId,
                 created_at: new Date().toISOString(),
-                block_timestamp: blockTimestampIso, // ✅ Now sending a safe ISO string
+                block_timestamp: blockTimestampIso,
+                likely_victim: receiverIsContract ? sender : receiver,
               });
-            });
+            }
           }
 
           // ─── Process Native transfers ───
           if (blockWithTx && blockWithTx.transactions) {
             for (const tx of blockWithTx.transactions) {
-              if (tx.value && tx.value >= NATIVE_THRESHOLD_WEI && tx.to) {
+              // Explicit BigInt check for safety
+              if (tx.value > 0n && tx.value >= NATIVE_THRESHOLD_WEI && tx.to) {
                 if (!tx.from || !tx.to) continue;
+
+                const sender = tx.from.toLowerCase();
+                const receiver = tx.to.toLowerCase();
+
+                // 🔍 OPTIMIZED POISONING FILTER:
+                const senderIsContract = await isContractAddress(sender);
+                const receiverIsContract = await isContractAddress(receiver);
+
+                // If BOTH are contracts, skip.
+                if (senderIsContract && receiverIsContract) {
+                  continue;
+                }
 
                 ingestedCount++;
                 insertData.push({
                   transaction_hash: tx.hash,
                   block_number: Number(i),
                   token_address: NATIVE_ADDRESS,
-                  sender: tx.from.toLowerCase(),
-                  receiver: tx.to.toLowerCase(),
+                  sender,
+                  receiver,
                   value: tx.value.toString(),
                   chain_id: chainId,
                   created_at: new Date().toISOString(),
-                  block_timestamp: blockTimestampIso, // ✅ Now sending a safe ISO string
+                  block_timestamp: blockTimestampIso,
+                  likely_victim: receiverIsContract ? sender : receiver,
                 });
               }
             }
@@ -323,11 +373,6 @@ async function startCollector() {
 
           // ─── Insert into Supabase ───
           if (insertData.length > 0) {
-            // 🔍 DEBUG LOG: This will prove exactly what your collector is trying to save.
-            // If this log shows the correct historical date, but your DB shows today's date, 
-            // you have a database trigger or default constraint hijacking the value.
-            console.log(`[DEBUG] Sample payload to be inserted:`, JSON.stringify(insertData[0], null, 2));
-
             try {
               const { error } = await supabase
                 .from('token_transfers')
@@ -340,13 +385,13 @@ async function startCollector() {
                   console.error('[collector] Insert error:', error);
                 }
               } else {
-                console.log(`[+] Block ${i}: Successfully ingested ${ingestedCount} high-value transfers.`);
+                console.log(`[+] Block ${i}: Successfully ingested ${ingestedCount} high-value user transfers.`);
               }
             } catch (err) {
               console.error('[collector] Insert exception:', err);
             }
           } else {
-            console.log(`[-] Block ${i}: No transfers met the $3,000 threshold criteria.`);
+            console.log(`[-] Block ${i}: No user transfers met criteria.`);
           }
         }
         
