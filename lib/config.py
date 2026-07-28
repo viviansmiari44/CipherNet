@@ -200,7 +200,7 @@ class Config:
         # --- Gas ---
         # 🚀 UPDATED: Matched to batch_fund.py low-fee defaults (100 Gwei cap, 1.1x buffer)
         self.GAS_MAX_FEE_CAP_GWEI = int(os.getenv("GAS_MAX_FEE_CAP_GWEI", "25"))
-        self.GAS_PRIORITY_FEE_GWEI = int(os.getenv("GAS_PRIORITY_FEE_GWEI", "0.05"))
+        self.GAS_PRIORITY_FEE_GWEI = float(os.getenv("GAS_PRIORITY_FEE_GWEI", "0.05"))
         self.GAS_FEE_BUFFER = float(os.getenv("GAS_FEE_BUFFER", "1.02"))
 
         # --- Logging ---
