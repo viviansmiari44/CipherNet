@@ -293,6 +293,7 @@ def extract_addresses_from_db(campaign_id):
         result = supabase.table("traps")\
             .select("trap_address, trap_private_key_enc")\
             .eq("campaign_id", campaign_id)\
+            .eq("funding_enabled", True)\
             .limit(2000)\
             .execute()
             

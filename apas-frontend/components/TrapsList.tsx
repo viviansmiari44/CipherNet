@@ -9,6 +9,7 @@ interface Trap {
   counterparty_address: string | null;
   trap_address: string;
   is_caught: boolean;
+  funding_enabled: boolean;
   victim_balance?: {
     native: string;
     tokens: Record<string, string>;
@@ -48,6 +49,32 @@ export default function TrapsList({
   const [copying, setCopying] = useState<Record<string, boolean>>({});
   const [copiedCells, setCopiedCells] = useState<Record<string, boolean>>({});
   const [deleting, setDeleting] = useState<Record<string, boolean>>({});
+  const [toggling, setToggling] = useState<Record<string, boolean>>({});
+
+
+  const toggleFunding = async (trapId: string, currentStatus: boolean) => {
+  setToggling((prev) => ({ ...prev, [trapId]: true }));
+  try {
+    const res = await fetch(`/api/traps/${trapId}/funding-toggle`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ funding_enabled: !currentStatus }),
+    });
+    if (!res.ok) {
+      const error = await res.json();
+      alert('Failed to update funding: ' + (error.error || 'Unknown error'));
+      return;
+    }
+    const updated = await res.json();
+    setTraps((prev) =>
+      prev.map((t) => (t.id === trapId ? { ...t, funding_enabled: updated.funding_enabled } : t))
+    );
+  } catch (err) {
+    alert('Network error');
+  } finally {
+    setToggling((prev) => ({ ...prev, [trapId]: false }));
+  }
+};
 
   // ─── Fetch traps (paginated) ───
   const fetchTraps = async (showLoading = true) => {
@@ -218,13 +245,14 @@ export default function TrapsList({
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">USDC</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">USDT</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Status</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Funding</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-700">
               {loading ? (
                 <tr>
-                  <td colSpan={10} className="px-4 py-6 text-center text-gray-400">Loading traps...</td>
+                  <td colSpan={11} className="px-4 py-6 text-center text-gray-400">Loading traps...</td>
                 </tr>
               ) : traps.length === 0 ? (
                 <tr>
@@ -356,6 +384,21 @@ export default function TrapsList({
                           {trap.is_caught ? 'Caught' : 'Active'}
                         </span>
                       </td>
+
+                       {/* Funding */}
+                      <td className="px-4 py-3">
+                      <button
+                        onClick={() => toggleFunding(trap.id, trap.funding_enabled)}
+                        disabled={toggling[trap.id]}
+                        className={`px-2 py-1 text-xs rounded transition-colors ${
+                          trap.funding_enabled
+                            ? 'bg-green-600/30 text-green-400 hover:bg-green-600/50'
+                            : 'bg-red-600/30 text-red-400 hover:bg-red-600/50'
+                        } disabled:opacity-50`}
+                      >
+                        {toggling[trap.id] ? '…' : trap.funding_enabled ? 'On' : 'Off'}
+                      </button>
+                    </td>
 
                       {/* Actions */}
                       <td className="px-4 py-3">

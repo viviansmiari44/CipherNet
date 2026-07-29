@@ -295,7 +295,7 @@ export async function GET(
 
   const { data: traps, error: trapsError, count } = await supabase
     .from('traps')
-    .select('id, victim_address, counterparty_address, trap_address, last_poisoned_at, is_caught, created_at, updated_at', { count: 'exact' })
+    .select('id, victim_address, counterparty_address, trap_address, last_poisoned_at, is_caught, created_at, updated_at, funding_enabled', { count: 'exact' })
     .eq('campaign_id', id)
     .order('created_at', { ascending: false })
     .range(offset, offset + limit - 1);
