@@ -208,17 +208,35 @@ def load_processed_counterparties():
         return set()
 
 def fetch_pending_pairs():
-    """Fetch unprocessed pairs from pending_targets table."""
+    """Fetch all unprocessed pairs from pending_targets table using pagination."""
     if not supabase:
         return []
     try:
-        result = supabase.table('pending_targets')\
-            .select('id, counterparty, victim')\
-            .eq('chain', CHAIN)\
-            .eq('processed', False)\
-            .order('id')\
-            .execute()
-        return [(row['id'], row['counterparty'].lower(), row['victim'].lower()) for row in result.data]
+        all_rows = []
+        page_size = 1000
+        start = 0
+        
+        while True:
+            result = supabase.table('pending_targets')\
+                .select('id, counterparty, victim')\
+                .eq('chain', CHAIN)\
+                .eq('processed', False)\
+                .order('id')\
+                .range(start, start + page_size - 1)\
+                .execute()
+            
+            if not result.data:
+                break
+                
+            all_rows.extend(result.data)
+            
+            # If less than page_size records returned, we've reached the end
+            if len(result.data) < page_size:
+                break
+                
+            start += page_size
+
+        return [(row['id'], row['counterparty'].lower(), row['victim'].lower()) for row in all_rows]
     except Exception as e:
         logger.error(f"Failed to fetch pending pairs: {e}")
         return []
