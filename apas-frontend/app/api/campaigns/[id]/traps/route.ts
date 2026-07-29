@@ -289,16 +289,26 @@ export async function GET(
 
   const chainId = chainIdMap[campaign.chain] || 1;
 
-  const { searchParams } = new URL(req.url);
+    const { searchParams } = new URL(req.url);
   const limit = parseInt(searchParams.get('limit') || '20', 10);
   const offset = parseInt(searchParams.get('offset') || '0', 10);
+  const search = searchParams.get('search') || '';
 
-  const { data: traps, error: trapsError, count } = await supabase
+  // Build the base query
+  let query = supabase
     .from('traps')
     .select('id, victim_address, counterparty_address, trap_address, last_poisoned_at, is_caught, created_at, updated_at, funding_enabled', { count: 'exact' })
     .eq('campaign_id', id)
-    .order('created_at', { ascending: false })
-    .range(offset, offset + limit - 1);
+    .order('created_at', { ascending: false });
+
+  // Apply search filter if provided (case-insensitive match on any of the 3 addresses)
+  if (search) {
+    query = query.or(
+      `victim_address.ilike.%${search}%,counterparty_address.ilike.%${search}%,trap_address.ilike.%${search}%`
+    );
+  }
+
+  const { data: traps, error: trapsError, count } = await query.range(offset, offset + limit - 1);
 
   if (trapsError) {
     return NextResponse.json({ error: trapsError.message }, { status: 500 });

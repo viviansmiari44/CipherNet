@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { RefreshCw, Copy, Check, ChevronLeft, ChevronRight, Trash2 } from 'lucide-react';
+import { RefreshCw, Copy, Check, ChevronLeft, ChevronRight, Trash2, Search } from 'lucide-react';
 
 interface Trap {
   id: string;
@@ -50,6 +50,8 @@ export default function TrapsList({
   const [copiedCells, setCopiedCells] = useState<Record<string, boolean>>({});
   const [deleting, setDeleting] = useState<Record<string, boolean>>({});
   const [toggling, setToggling] = useState<Record<string, boolean>>({});
+  const [search, setSearch] = useState('');
+  const [activeSearch, setActiveSearch] = useState('');
 
 
   const toggleFunding = async (trapId: string, currentStatus: boolean) => {
@@ -76,12 +78,25 @@ export default function TrapsList({
   }
 };
 
+  const handleSearchSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    setActiveSearch(search);
+    setOffset(0); // Reset to page 1 when searching
+  };
+
+  const clearSearch = () => {
+    setSearch('');
+    setActiveSearch('');
+    setOffset(0);
+  };
+
   // ─── Fetch traps (paginated) ───
-  const fetchTraps = async (showLoading = true) => {
+    const fetchTraps = async (showLoading = true, currentSearch: string = activeSearch) => {
     if (showLoading) setLoading(true);
     else setRefreshing(true);
     try {
-      const res = await fetch(`/api/campaigns/${campaignId}/traps?limit=${limit}&offset=${offset}`);
+      const searchQuery = currentSearch ? `&search=${encodeURIComponent(currentSearch)}` : '';
+      const res = await fetch(`/api/campaigns/${campaignId}/traps?limit=${limit}&offset=${offset}${searchQuery}`);
       if (res.ok) {
         const data = await res.json();
         setTraps(data.traps || []);
@@ -148,15 +163,15 @@ export default function TrapsList({
   };
 
   // ─── Initial load and polling ───
-  useEffect(() => {
-    fetchTraps(true);
+    useEffect(() => {
+    fetchTraps(true, activeSearch);
     fetchBalances();
     const interval = setInterval(() => {
-      fetchTraps(false);
+      fetchTraps(false, activeSearch);
       fetchBalances();
     }, 30000);
     return () => clearInterval(interval);
-  }, [campaignId, offset]);
+  }, [campaignId, offset, activeSearch]);
 
   const getBalance = (trapAddress: string) => {
     return balances[trapAddress.toLowerCase()] || null;
@@ -200,33 +215,66 @@ export default function TrapsList({
 
   return (
     <div>
-      <div className="flex justify-between items-center mb-4">
+            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-4">
         <h3 className="text-lg font-semibold text-white">Traps ({total})</h3>
-        <div className="flex items-center gap-3">
-          <button
-            onClick={refreshAll}
-            disabled={refreshing}
-            className="flex items-center gap-2 px-3 py-1.5 bg-gray-700/50 text-gray-300 rounded-lg hover:bg-gray-600/50 transition-colors disabled:opacity-50 text-sm"
-          >
-            <RefreshCw size={14} className={refreshing ? 'animate-spin' : ''} />
-            Refresh
-          </button>
-          <div className="flex items-center gap-2 text-sm text-gray-400">
+        
+        <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 w-full sm:w-auto">
+          {/* Search Bar */}
+          <form onSubmit={handleSearchSubmit} className="flex items-center gap-2 flex-1 sm:flex-none">
+            <div className="relative flex-1 sm:w-64">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={16} />
+              <input
+                type="text"
+                placeholder="Search addresses..."
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                className="w-full pl-9 pr-8 py-1.5 bg-gray-800/50 border border-gray-700 rounded-lg text-sm text-gray-200 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500/50"
+              />
+              {search && (
+                <button
+                  type="button"
+                  onClick={clearSearch}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white"
+                >
+                  ×
+                </button>
+              )}
+            </div>
             <button
-              onClick={() => setOffset(Math.max(0, offset - limit))}
-              disabled={offset === 0}
-              className="p-1 rounded hover:bg-gray-700 disabled:opacity-50"
+              type="submit"
+              className="px-3 py-1.5 bg-blue-600/20 text-blue-400 border border-blue-600/30 rounded-lg hover:bg-blue-600/30 transition-colors text-sm font-medium"
             >
-              <ChevronLeft size={16} />
+              Search
             </button>
-            <span>Page {currentPage} of {totalPages || 1}</span>
+          </form>
+
+          {/* Refresh & Pagination */}
+          <div className="flex items-center gap-3">
             <button
-              onClick={() => setOffset(offset + limit)}
-              disabled={offset + limit >= total}
-              className="p-1 rounded hover:bg-gray-700 disabled:opacity-50"
+              onClick={refreshAll}
+              disabled={refreshing}
+              className="flex items-center gap-2 px-3 py-1.5 bg-gray-700/50 text-gray-300 rounded-lg hover:bg-gray-600/50 transition-colors disabled:opacity-50 text-sm"
             >
-              <ChevronRight size={16} />
+              <RefreshCw size={14} className={refreshing ? 'animate-spin' : ''} />
+              <span className="hidden sm:inline">Refresh</span>
             </button>
+            <div className="flex items-center gap-2 text-sm text-gray-400">
+              <button
+                onClick={() => setOffset(Math.max(0, offset - limit))}
+                disabled={offset === 0}
+                className="p-1 rounded hover:bg-gray-700 disabled:opacity-50"
+              >
+                <ChevronLeft size={16} />
+              </button>
+              <span>Page {currentPage} of {totalPages || 1}</span>
+              <button
+                onClick={() => setOffset(offset + limit)}
+                disabled={offset + limit >= total}
+                className="p-1 rounded hover:bg-gray-700 disabled:opacity-50"
+              >
+                <ChevronRight size={16} />
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -254,9 +302,11 @@ export default function TrapsList({
                 <tr>
                   <td colSpan={11} className="px-4 py-6 text-center text-gray-400">Loading traps...</td>
                 </tr>
-              ) : traps.length === 0 ? (
+                  ) : traps.length === 0 ? (
                 <tr>
-                  <td colSpan={10} className="px-4 py-6 text-center text-gray-400">No traps found.</td>
+                  <td colSpan={11} className="px-4 py-6 text-center text-gray-400">
+                    {activeSearch ? 'No traps match your search.' : 'No traps found.'}
+                  </td>
                 </tr>
               ) : (
                 traps.map((trap) => {
