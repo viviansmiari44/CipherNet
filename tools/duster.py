@@ -466,7 +466,7 @@ def send_dust(private_key, victim_address, campaign_id=None):
             # --- LOW GAS OPTIMIZATION ---
             # 1. Cap priority fee to low fixed value based on chain
             if CHAIN.lower() == "polygon":
-                max_priority = w3.to_wei(0.05, "gwei")  # Polygon network minimum
+                max_priority = w3.to_wei(30, "gwei")  # Polygon network minimum
             elif CHAIN.lower() == "ethereum":
                 max_priority = w3.to_wei(0.05, "gwei") # Low priority tip (0.05 Gwei vs standard 1+ Gwei)
             else:
