@@ -528,8 +528,12 @@ def send_funding(source_address, private_key, to_address, asset, amount_units, n
             gas_params = {}
             max_fee_cap = w3.to_wei(getattr(config, 'GAS_MAX_FEE_CAP_GWEI', 100), "gwei")
 
-            # Apply gas multiplier on retry attempts (at least 15% bump required by EVM nodes for replacement)
+            # Apply gas multiplier on retry attempts
             gas_bump = 1.15 ** attempt
+            
+            # 🚨 POLYGON FIX: Polygon RPCs require a much higher bump to replace stuck TXs
+            if CHAIN.lower() == "polygon":
+                gas_bump = 1.50 ** attempt  # 50% bump to guarantee it satisfies "underpriced" checks
 
             if use_eip1559:
                 base_fee = latest_block["baseFeePerGas"]
@@ -539,9 +543,9 @@ def send_funding(source_address, private_key, to_address, asset, amount_units, n
                 except Exception:
                     max_priority = w3.to_wei(0.05, "gwei")
 
-                # 🚨 FIX FOR POLYGON: Enforce minimum 30 Gwei priority fee to satisfy RPC replacement rules
+                # 🚨 POLYGON FIX: Increase minimum priority to 50 Gwei for instant mining
                 if CHAIN.lower() == "polygon":
-                    min_poly_priority = w3.to_wei(30, "gwei")
+                    min_poly_priority = w3.to_wei(50, "gwei") # Increased from 30 to 50
                     if max_priority < min_poly_priority:
                         max_priority = min_poly_priority
 
