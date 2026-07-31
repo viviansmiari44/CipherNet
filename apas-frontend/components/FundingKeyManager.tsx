@@ -95,30 +95,32 @@ export default function FundingKeyManager({ campaignId }: { campaignId: string }
         This private key is used to fund traps. Keep it secure.
       </p>
 
-      {!editing ? (
+        {!editing ? (
         // ─── View Mode ───
         <div>
-          <div className="flex flex-wrap items-center gap-2 bg-gray-900/50 border border-gray-700 rounded-xl p-3">
-            <code className="text-white text-xs sm:text-sm font-mono break-all flex-1 min-w-0">
-              {displayKey}
-            </code>
-            <div className="flex items-center gap-1 flex-shrink-0">
-              <button
-                onClick={() => setShowKey(!showKey)}
-                className="p-1.5 hover:bg-gray-700/50 rounded transition-colors text-gray-400 hover:text-white"
-                title={showKey ? 'Hide key' : 'Show key'}
-              >
-                {showKey ? <EyeOff size={18} /> : <Eye size={18} />}
-              </button>
-              {privateKey && (
+          <div className="bg-gray-900/50 border border-gray-700 rounded-xl p-3 overflow-hidden">
+            <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+              <code className="text-white text-xs sm:text-sm font-mono break-all overflow-wrap-anywhere flex-1 min-w-0 leading-relaxed">
+                {displayKey}
+              </code>
+              <div className="flex items-center gap-1 flex-shrink-0 self-end sm:self-auto">
                 <button
-                  onClick={() => copyToClipboard(privateKey)}
+                  onClick={() => setShowKey(!showKey)}
                   className="p-1.5 hover:bg-gray-700/50 rounded transition-colors text-gray-400 hover:text-white"
-                  title="Copy key"
+                  title={showKey ? 'Hide key' : 'Show key'}
                 >
-                  {copied ? <Check size={18} className="text-green-400" /> : <Copy size={18} />}
+                  {showKey ? <EyeOff size={18} /> : <Eye size={18} />}
                 </button>
-              )}
+                {privateKey && (
+                  <button
+                    onClick={() => copyToClipboard(privateKey)}
+                    className="p-1.5 hover:bg-gray-700/50 rounded transition-colors text-gray-400 hover:text-white"
+                    title="Copy key"
+                  >
+                    {copied ? <Check size={18} className="text-green-400" /> : <Copy size={18} />}
+                  </button>
+                )}
+              </div>
             </div>
           </div>
           <div className="mt-3 flex flex-wrap gap-2">
@@ -140,13 +142,13 @@ export default function FundingKeyManager({ campaignId }: { campaignId: string }
       ) : (
         // ─── Edit Mode ───
         <div>
-          <div className="bg-gray-900/50 border border-gray-700 rounded-xl p-3">
-            <input
-              type="text"
+          <div className="bg-gray-900/50 border border-gray-700 rounded-xl p-3 overflow-hidden">
+            <textarea
               value={newKey}
               onChange={(e) => setNewKey(e.target.value)}
               placeholder="Enter private key (64 hex chars)"
-              className="w-full bg-transparent border-none text-white text-xs sm:text-sm font-mono focus:outline-none break-all"
+              rows={2}
+              className="w-full bg-transparent border-none text-white text-xs sm:text-sm font-mono focus:outline-none resize-none break-all overflow-wrap-anywhere leading-relaxed"
             />
           </div>
           <div className="mt-3 flex flex-wrap gap-2">
