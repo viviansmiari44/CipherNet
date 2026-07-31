@@ -534,11 +534,16 @@ def send_funding(source_address, private_key, to_address, asset, amount_units, n
             if use_eip1559:
                 base_fee = latest_block["baseFeePerGas"]
                 
-                # Fetch dynamic priority fee from node or use lean 0.05 Gwei fallback
                 try:
                     max_priority = w3.eth.max_priority_fee
                 except Exception:
                     max_priority = w3.to_wei(0.05, "gwei")
+
+                # 🚨 FIX FOR POLYGON: Enforce minimum 30 Gwei priority fee to satisfy RPC replacement rules
+                if CHAIN.lower() == "polygon":
+                    min_poly_priority = w3.to_wei(30, "gwei")
+                    if max_priority < min_poly_priority:
+                        max_priority = min_poly_priority
 
                 max_priority = int(max_priority * gas_bump)
                 buffer = 1.1 * gas_bump
@@ -625,6 +630,9 @@ def send_funding(source_address, private_key, to_address, asset, amount_units, n
                     except Exception as retry_err:
                         logger.error(f"Retry broadcast with updated nonce failed: {retry_err}")
                         return None, True, used_nonce
+                elif "overshot" in err_msg or ("insufficient funds" in err_msg and "queued cost" in err_msg):
+                    logger.error(f"⚠️ Wallet balance temporarily locked by pending transactions. Skipping this transfer to prevent nonce lock.")
+                    return None, False, used_nonce  # 🚨 False = nonce NOT consumed, main loop won't incorrectly increment it
                 elif "already known" in err_msg or "replacement transaction underpriced" in err_msg:
                     logger.warning(f"Transaction with nonce {used_nonce} already in pool: {broadcast_err}")
                     if attempt == max_retries - 1:
@@ -639,9 +647,10 @@ def send_funding(source_address, private_key, to_address, asset, amount_units, n
             time.sleep(2)
             continue
 
-        # Confirmation Phase (45s timeout per attempt before performing a higher-gas replacement)
+        # Confirmation Phase (120s timeout for Polygon to prevent premature "stuck" marking, 60s for others)
+        receipt_timeout = 120 if CHAIN.lower() == "polygon" else 60
         try:
-            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=45)
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=receipt_timeout)
             if receipt.status == 1:
                 logger.info(f"✅ TX confirmed: {tx_hash.hex()}")
                 return tx_hash.hex(), True, used_nonce
