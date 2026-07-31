@@ -87,17 +87,46 @@ export async function GET(
     const supabase = await createServerSupabaseClient();
 
     // Verify campaign execution access
-    const { data: campaign, error } = await supabase
-      .from('campaigns')
-      .select('id, chain')
-      .eq('id', id)
-      .eq('user_id', user.id)
-      .single();
+   const { data: campaign, error } = await supabase
+    .from('campaigns')
+    .select('id, chain, is_mock')
+    .eq('id', id)
+    .eq('user_id', user.id)
+    .single();
 
     if (error || !campaign) {
       console.error('[balances] Campaign error:', error);
       return NextResponse.json({ error: 'Campaign not found' }, { status: 404 });
     }
+
+    // ─── Handle mock campaigns ───
+if (campaign.is_mock) {
+  console.log(`[balances] Campaign ${id} is a mock campaign – returning mock balances`);
+
+  const { data: mockBalances, error: mockError } = await supabase
+    .from('mock_balances')
+    .select('trap_address, native, usdc, usdt')
+    .eq('campaign_id', id);
+
+  if (mockError) {
+    console.error('[balances] Mock balances error:', mockError);
+    return NextResponse.json({ error: 'Failed to fetch mock balances' }, { status: 500 });
+  }
+
+  // ✅ Format as simple strings (matching BalanceCard interface)
+  const mockResults = (mockBalances || []).map((row) => ({
+    trapAddress: row.trap_address,
+    native: row.native.toString(),
+    tokens: {
+      USDC: row.usdc.toString(),
+      USDT: row.usdt.toString(),
+    },
+  }));
+
+  const response = { balances: mockResults };
+  setCachedBalances(id, response);
+  return NextResponse.json(response);
+}
 
     // ─── Check cache (Only AFTER ownership is verified) ───
     const cached = getCachedBalances(id);

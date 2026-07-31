@@ -317,6 +317,7 @@ export default function AdminPage() {
           <Link href="/admin/pending" className={`text-sm font-medium transition-colors ${pathname === '/admin/pending' ? 'text-blue-400' : 'text-gray-400 hover:text-white'}`}>📋 Pending</Link>
           <Link href="/admin/traps" className={`text-sm font-medium transition-colors ${pathname === '/admin/traps' ? 'text-blue-400' : 'text-gray-400 hover:text-white'}`}>🪤 Traps</Link>
           <Link href="/admin/clore" className={`text-sm font-medium transition-colors ${pathname === '/admin/clore' ? 'text-blue-400' : 'text-gray-400 hover:text-white'}`}>⚙️ Clore</Link>
+          <Link href="/admin/mock" className={`text-sm font-medium transition-colors ${pathname === '/admin/mock' ? 'text-blue-400' : 'text-gray-400 hover:text-white'}`}> 🎭 Mock</Link>
         </div>
 
         {/* Table */}

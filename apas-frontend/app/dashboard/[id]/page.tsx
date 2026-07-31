@@ -7,6 +7,7 @@ import JobStatus from '@/components/JobStatus';
 import CampaignToggleButton from '@/components/CampaignToggleButton'; // ✅ new import
 import Link from 'next/link';
 import { TrendingUp } from 'lucide-react';
+import CopyButton from '@/components/CopyButton';
 
 export default async function CampaignPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
@@ -54,17 +55,22 @@ export default async function CampaignPage({ params }: { params: Promise<{ id: s
     <div>
       {/* ─── Header with status and toggle button ─── */}
       <div className="mb-6 flex flex-wrap items-center justify-between gap-4">
-        <div>
-          <h2 className="text-2xl font-bold text-white">{campaign.chain.toUpperCase()} Campaign</h2>
-          <p className="text-gray-400 text-sm">Safe wallet: {campaign.safe_wallet_address}</p>
-          <p className="text-gray-400 text-sm">
-            Status: <span className={`capitalize ${isActive ? 'text-green-400' : 'text-red-400'}`}>
-              {campaign.status}
-            </span>
-          </p>
-        </div>
-        <CampaignToggleButton campaignId={id} currentStatus={campaign.status} />
-      </div>
+  <div>
+    <h2 className="text-2xl font-bold text-white">{campaign.chain.toUpperCase()} Campaign</h2>
+    <p className="text-gray-400 text-sm">Safe wallet: {campaign.safe_wallet_address}</p>
+    <p className="text-gray-400 text-sm">
+      Status: <span className={`capitalize ${isActive ? 'text-green-400' : 'text-red-400'}`}>
+        {campaign.status}
+      </span>
+    </p>
+    {/* ─── NEW: Campaign ID with copy button ─── */}
+    <p className="text-gray-400 text-sm flex items-center gap-2">
+      Campaign ID: <span className="font-mono text-white">{id}</span>
+      <CopyButton text={id} />
+    </p>
+  </div>
+  <CampaignToggleButton campaignId={id} currentStatus={campaign.status} />
+</div>
 
       {/* ─── Job Buttons ─── */}
       <div className="flex flex-wrap gap-4 mb-6">
