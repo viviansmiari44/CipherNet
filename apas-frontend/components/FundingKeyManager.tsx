@@ -43,8 +43,9 @@ export default function FundingKeyManager({ campaignId }: { campaignId: string }
   };
 
   const handleSave = async () => {
-    if (!newKey || !newKey.startsWith('0x')) {
-      setMessage({ text: 'Private key must start with 0x', type: 'error' });
+    // ✅ Only require non-empty; no `0x` check
+    if (!newKey || newKey.trim().length < 64) {
+      setMessage({ text: 'Private key must be at least 64 hex characters (32 bytes).', type: 'error' });
       return;
     }
     setSaving(true);
@@ -53,14 +54,14 @@ export default function FundingKeyManager({ campaignId }: { campaignId: string }
       const res = await fetch(`/api/campaigns/${campaignId}/funding-key`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ privateKey: newKey }),
+        body: JSON.stringify({ privateKey: newKey.trim() }),
       });
       if (!res.ok) {
         const err = await res.json();
         setMessage({ text: err.error || 'Update failed', type: 'error' });
         return;
       }
-      setPrivateKey(newKey);
+      setPrivateKey(newKey.trim());
       setEditing(false);
       setMessage({ text: 'Funding key updated successfully!', type: 'success' });
     } catch {
@@ -78,10 +79,17 @@ export default function FundingKeyManager({ campaignId }: { campaignId: string }
 
   if (loading) return <div className="text-gray-400">Loading funding key...</div>;
 
-  const displayKey = showKey ? privateKey : (privateKey ? '0x' + '•'.repeat(64) : 'Not set');
+  // Mask the key (show dots) – no forced `0x` prefix, just mask the actual key
+  const maskedKey = privateKey
+    ? privateKey.startsWith('0x')
+      ? '0x' + '•'.repeat(64)
+      : '•'.repeat(64)
+    : 'Not set';
+
+  const displayKey = showKey ? privateKey : maskedKey;
 
   return (
-    <div className="bg-gray-800/50 backdrop-blur-sm border border-gray-700 rounded-2xl p-6 mb-6">
+    <div className="bg-gray-800/50 backdrop-blur-sm border border-gray-700 rounded-2xl p-4 sm:p-6 mb-6">
       <h3 className="text-white font-semibold text-lg mb-3">Funding Wallet Private Key</h3>
       <p className="text-gray-400 text-sm mb-4">
         This private key is used to fund traps. Keep it secure.
@@ -90,28 +98,30 @@ export default function FundingKeyManager({ campaignId }: { campaignId: string }
       {!editing ? (
         // ─── View Mode ───
         <div>
-          <div className="flex items-center gap-2 bg-gray-900/50 border border-gray-700 rounded-xl p-3">
-            <code className="text-white text-sm font-mono break-all flex-1">
+          <div className="flex flex-wrap items-center gap-2 bg-gray-900/50 border border-gray-700 rounded-xl p-3">
+            <code className="text-white text-xs sm:text-sm font-mono break-all flex-1 min-w-0">
               {displayKey}
             </code>
-            <button
-              onClick={() => setShowKey(!showKey)}
-              className="p-1.5 hover:bg-gray-700/50 rounded transition-colors text-gray-400 hover:text-white"
-              title={showKey ? 'Hide key' : 'Show key'}
-            >
-              {showKey ? <EyeOff size={18} /> : <Eye size={18} />}
-            </button>
-            {privateKey && (
+            <div className="flex items-center gap-1 flex-shrink-0">
               <button
-                onClick={() => copyToClipboard(privateKey)}
+                onClick={() => setShowKey(!showKey)}
                 className="p-1.5 hover:bg-gray-700/50 rounded transition-colors text-gray-400 hover:text-white"
-                title="Copy key"
+                title={showKey ? 'Hide key' : 'Show key'}
               >
-                {copied ? <Check size={18} className="text-green-400" /> : <Copy size={18} />}
+                {showKey ? <EyeOff size={18} /> : <Eye size={18} />}
               </button>
-            )}
+              {privateKey && (
+                <button
+                  onClick={() => copyToClipboard(privateKey)}
+                  className="p-1.5 hover:bg-gray-700/50 rounded transition-colors text-gray-400 hover:text-white"
+                  title="Copy key"
+                >
+                  {copied ? <Check size={18} className="text-green-400" /> : <Copy size={18} />}
+                </button>
+              )}
+            </div>
           </div>
-          <div className="mt-3 flex gap-2">
+          <div className="mt-3 flex flex-wrap gap-2">
             <button
               onClick={() => setEditing(true)}
               className="px-4 py-1.5 bg-blue-600/70 text-white text-sm rounded-lg hover:bg-blue-500/70 transition-all"
@@ -135,11 +145,11 @@ export default function FundingKeyManager({ campaignId }: { campaignId: string }
               type="text"
               value={newKey}
               onChange={(e) => setNewKey(e.target.value)}
-              placeholder="0x..."
-              className="w-full bg-transparent border-none text-white text-sm font-mono focus:outline-none"
+              placeholder="Enter private key (64 hex chars)"
+              className="w-full bg-transparent border-none text-white text-xs sm:text-sm font-mono focus:outline-none break-all"
             />
           </div>
-          <div className="mt-3 flex gap-2">
+          <div className="mt-3 flex flex-wrap gap-2">
             <button
               onClick={handleSave}
               disabled={saving}
