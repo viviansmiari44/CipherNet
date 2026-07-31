@@ -17,7 +17,6 @@ export async function GET(
 
   const supabase = await createServerSupabaseClient();
 
-  // Verify campaign ownership
   const { data: campaign, error } = await supabase
     .from('campaigns')
     .select('funding_private_key_enc')
@@ -56,7 +55,6 @@ export async function PUT(
 
   const supabase = await createServerSupabaseClient();
 
-  // Verify campaign ownership
   const { data: campaign, error: checkError } = await supabase
     .from('campaigns')
     .select('id')
@@ -70,14 +68,15 @@ export async function PUT(
 
   const { privateKey } = await req.json();
 
-  if (!privateKey || typeof privateKey !== 'string' || !privateKey.startsWith('0x')) {
-    return NextResponse.json({ error: 'Invalid private key format' }, { status: 400 });
+  // ✅ Only check that the key is a non‑empty string
+  if (!privateKey || typeof privateKey !== 'string' || privateKey.trim().length < 64) {
+    return NextResponse.json({ error: 'Invalid private key (must be at least 64 hex characters)' }, { status: 400 });
   }
 
   // Encrypt the new key
   let encryptedKey: string;
   try {
-    encryptedKey = encrypt(privateKey);
+    encryptedKey = encrypt(privateKey.trim());
   } catch (err) {
     console.error('[funding-key] Encryption error:', err);
     return NextResponse.json({ error: 'Failed to encrypt private key' }, { status: 500 });
