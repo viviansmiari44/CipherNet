@@ -8,7 +8,7 @@ import sys
 import time
 
 # 1. 🔴 PASTE YOUR FUNDING PRIVATE KEY HERE 🔴
-PRIVATE_KEY = "acb92216291c7f30f7a1e91a757e5052dcca5a83dc8ff383168ea49a35dc7178"
+PRIVATE_KEY = ""
 
 # 2. The exact RPC rotation list used by your batch_fund.py
 RPC_LIST = [
