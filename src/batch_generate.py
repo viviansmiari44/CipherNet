@@ -162,7 +162,7 @@ REMOTE_PATH = config.BATCH_REMOTE_PATH
 CLORE_API_KEY = config.CLORE_API_KEY
 CLORE_INSTANCE_ID = config.CLORE_INSTANCE_ID
 
-# --- Database-based progress ---
+# --- Database-based progress (no longer used for resume, kept for compatibility) ---
 def read_progress(chain):
     if not supabase:
         return -1
@@ -477,18 +477,10 @@ def main():
     total = len(pending)
     logger.info(f"Will process {total} new counterparties.")
 
-    # 3. Resume from progress
-    last_done = read_progress(CHAIN)
-    start_index = last_done + 1
-    if start_index >= total:
-        logger.info("All victims already completed in a previous run.")
-        if job_id:
-            update_job(job_id, status='completed', progress=total, total=total, message='All done')
-        sys.exit(0)
-
-    if start_index > 0:
-        logger.info(f"Resuming from index {start_index+1} of {total}")
-        pending = pending[start_index:]
+    # FIX: Removed broken resume logic. Deduplication is now handled entirely by:
+    #   - pending_targets.processed flag
+    #   - load_processed_counterparties() checking the traps table
+    # The generation_progress table is no longer used for resume (kept for compatibility).
 
     # FIX: Set status='running' and total AFTER we know the total
     if job_id:
@@ -505,7 +497,8 @@ def main():
     # ─── NEW: Success counter for cleanup ───
     success_counter = 0
 
-    for idx, (pair_id, cp, victim) in enumerate(pending, start=start_index+1):
+    # FIX: Changed enumerate to start from 1 (not start_index+1)
+    for idx, (pair_id, cp, victim) in enumerate(pending, start=1):
         # ─── Check cancellation ───
         if job_id and is_job_cancelled(job_id):
             logger.info("Job cancelled by user. Exiting.")
@@ -534,11 +527,11 @@ def main():
                 save_trap(cp, victim, key, campaign_id)
                 success_count += 1
                 success_counter += 1
-                write_progress(CHAIN, idx)
+                # write_progress no longer used for resume, but kept for compatibility
                 if campaign_id and user_id:
                     deduct_key_fee(user_id, job_id, campaign_id, fee_per_key)
                 if job_id:
-                    update_job(job_id, progress=idx)
+                    update_job(job_id, progress=success_count)  # FIX: use success_count, not idx
                 mark_pair_processed(pair_id)
 
                 # ─── NEW: Cleanup remote profanity after every CLEANUP_INTERVAL successes ───
