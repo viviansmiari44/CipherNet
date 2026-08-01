@@ -41,3 +41,33 @@
 {"level":"info","message":"[Stage 2] Run complete. Added: 11 | Filtered: 1 bots | Total in DB: 194","timestamp":"2026-08-01T04:58:48.239Z"}
 {"level":"info","message":"Page 1: +9 human targets | 0 bots filtered","timestamp":"2026-08-01T04:58:50.539Z"}
 {"level":"info","message":"[Stage 2] Run complete. Added: 9 | Filtered: 0 bots | Total in DB: 1117","timestamp":"2026-08-01T04:58:50.724Z"}
+{"level":"info","message":"Fetching qualified pairs and running Stage 2 behavioral heuristics...","timestamp":"2026-08-01T09:57:26.848Z"}
+{"level":"info","message":"Fetching qualified pairs and running Stage 2 behavioral heuristics...","timestamp":"2026-08-01T09:57:26.848Z"}
+{"level":"info","message":"Fetching qualified pairs and running Stage 2 behavioral heuristics...","timestamp":"2026-08-01T09:57:27.477Z"}
+{"level":"info","message":"Threshold block for 40-day window: 25371269 (max block: 25659269)","timestamp":"2026-08-01T09:57:29.801Z"}
+{"level":"info","message":"Threshold block for 40-day window: 112221626 (max block: 113373626)","timestamp":"2026-08-01T09:57:29.801Z"}
+{"level":"info","message":"Threshold block for 40-day window: 89520818 (max block: 91248818)","timestamp":"2026-08-01T09:57:29.935Z"}
+{"level":"info","message":"Fetched 21 raw pairs (page 1). Running behavioral checks...","timestamp":"2026-08-01T09:57:31.214Z"}
+{"level":"info","message":"Fetched 1 raw pairs (page 1). Running behavioral checks...","timestamp":"2026-08-01T09:57:31.353Z"}
+{"level":"info","message":"Fetched 29 raw pairs (page 1). Running behavioral checks...","timestamp":"2026-08-01T09:57:32.159Z"}
+{"level":"info","message":"Page 1: +1 human targets | 0 bots filtered","timestamp":"2026-08-01T09:57:47.382Z"}
+{"level":"info","message":"[Stage 2] Run complete. Added: 1 | Filtered: 0 bots | Total in DB: 442","timestamp":"2026-08-01T09:57:47.579Z"}
+{"level":"info","message":"Page 1: +28 human targets | 1 bots filtered","timestamp":"2026-08-01T09:57:48.327Z"}
+{"level":"info","message":"[Stage 2] Run complete. Added: 28 | Filtered: 1 bots | Total in DB: 217","timestamp":"2026-08-01T09:57:48.519Z"}
+{"level":"info","message":"Page 1: +21 human targets | 0 bots filtered","timestamp":"2026-08-01T09:57:48.627Z"}
+{"level":"info","message":"[Stage 2] Run complete. Added: 21 | Filtered: 0 bots | Total in DB: 1119","timestamp":"2026-08-01T09:57:48.823Z"}
+{"level":"info","message":"Fetching qualified pairs and running Stage 2 behavioral heuristics...","timestamp":"2026-08-01T14:57:27.112Z"}
+{"level":"info","message":"Fetching qualified pairs and running Stage 2 behavioral heuristics...","timestamp":"2026-08-01T14:57:27.111Z"}
+{"level":"info","message":"Fetching qualified pairs and running Stage 2 behavioral heuristics...","timestamp":"2026-08-01T14:57:27.762Z"}
+{"level":"info","message":"Threshold block for 40-day window: 112242430 (max block: 113394430)","timestamp":"2026-08-01T14:57:31.381Z"}
+{"level":"info","message":"Threshold block for 40-day window: 25372662 (max block: 25660662)","timestamp":"2026-08-01T14:57:31.507Z"}
+{"level":"info","message":"Threshold block for 40-day window: 89527051 (max block: 91255051)","timestamp":"2026-08-01T14:57:32.613Z"}
+{"level":"info","message":"Fetched 44 raw pairs (page 1). Running behavioral checks...","timestamp":"2026-08-01T14:57:33.894Z"}
+{"level":"info","message":"Fetched 27 raw pairs (page 1). Running behavioral checks...","timestamp":"2026-08-01T14:57:33.903Z"}
+{"level":"info","message":"Fetched 2 raw pairs (page 1). Running behavioral checks...","timestamp":"2026-08-01T14:57:35.702Z"}
+{"level":"info","message":"Page 1: +2 human targets | 0 bots filtered","timestamp":"2026-08-01T14:58:00.048Z"}
+{"level":"info","message":"[Stage 2] Run complete. Added: 2 | Filtered: 0 bots | Total in DB: 444","timestamp":"2026-08-01T14:58:00.394Z"}
+{"level":"info","message":"Page 1: +27 human targets | 0 bots filtered","timestamp":"2026-08-01T14:58:01.573Z"}
+{"level":"info","message":"[Stage 2] Run complete. Added: 27 | Filtered: 0 bots | Total in DB: 1142","timestamp":"2026-08-01T14:58:01.811Z"}
+{"level":"info","message":"Page 1: +42 human targets | 2 bots filtered","timestamp":"2026-08-01T14:58:03.177Z"}
+{"level":"info","message":"[Stage 2] Run complete. Added: 42 | Filtered: 2 bots | Total in DB: 257","timestamp":"2026-08-01T14:58:03.476Z"}

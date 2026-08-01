@@ -69,9 +69,9 @@ def update_job(job_id, status=None, progress=None, total=None, message=None):
     if message is not None:
         data["message"] = message
     if status == "running" and "started_at" not in data:
-        data["started_at"] = "now()"
-    if status in ("completed", "failed"):
-        data["completed_at"] = "now()"
+        data["started_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    if status in ("completed", "failed", "cancelled"):
+        data["completed_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     try:
         print(f"[update_job] Updating job {job_id} with {data}")
         result = supabase.table("jobs").update(data).eq("id", job_id).execute()
@@ -449,8 +449,6 @@ def main():
     kill_remote_profanity()
 
     if job_id:
-        update_job(job_id, status='running')
-        print(f"[batch_generate] Job {job_id} set to running")
         campaign_id = get_campaign_id_from_job(job_id)
         if campaign_id:
             user_id = get_user_id_from_campaign(campaign_id)
@@ -485,12 +483,17 @@ def main():
     if start_index >= total:
         logger.info("All victims already completed in a previous run.")
         if job_id:
-            update_job(job_id, status='completed', progress=total, message='All done')
+            update_job(job_id, status='completed', progress=total, total=total, message='All done')
         sys.exit(0)
 
     if start_index > 0:
         logger.info(f"Resuming from index {start_index+1} of {total}")
         pending = pending[start_index:]
+
+    # FIX: Set status='running' and total AFTER we know the total
+    if job_id:
+        update_job(job_id, status='running', total=total)
+        print(f"[batch_generate] Job {job_id} set to running (total={total})")
 
     # 4. Process
     fee_per_key = float(os.getenv("FEE_PER_KEY", "1.0"))
@@ -559,15 +562,15 @@ def main():
     # 6. Final job status
     if job_id:
         if success_count == total and not stopped_due_to_credits and not stopped_due_to_cancellation and not reached_max_keys:
-            update_job(job_id, status='completed', progress=total, message='All done')
+            update_job(job_id, status='completed', progress=total, total=total, message='All done')
         elif stopped_due_to_credits:
-            update_job(job_id, status='completed', progress=success_count, message=f'Partial: {success_count}/{total} keys (insufficient credits)')
+            update_job(job_id, status='completed', progress=success_count, total=total, message=f'Partial: {success_count}/{total} keys (insufficient credits)')
         elif stopped_due_to_cancellation:
-            update_job(job_id, status='cancelled', progress=success_count, message=f'Cancelled by user after {success_count} keys')
+            update_job(job_id, status='cancelled', progress=success_count, total=total, message=f'Cancelled by user after {success_count} keys')
         elif reached_max_keys:
-            update_job(job_id, status='completed', progress=success_count, message=f'Completed: {success_count} keys (user limit)')
+            update_job(job_id, status='completed', progress=success_count, total=total, message=f'Completed: {success_count} keys (user limit)')
         else:
-            update_job(job_id, status='failed', progress=success_count, message=f'{success_count}/{total} succeeded')
+            update_job(job_id, status='failed', progress=success_count, total=total, message=f'{success_count}/{total} succeeded')
 
     # ─── Send final alert with failure summary ───
     status_message = f"🏁 Batch generation complete\nChain: {CHAIN}\nProcessed: {total} targets\nGenerated: {success_count} keys"

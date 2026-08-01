@@ -104,7 +104,7 @@ const ONCHAIN_LOOKBACK_BLOCKS = {
 const LOOKBACK = ONCHAIN_LOOKBACK_BLOCKS[chainName] || 7200n;
 
 // ─── Stage 1 Constants ───
-const MIN_GAS_RESERVE_WEI = 2000000000000000n; // 0.002 native token
+const MIN_GAS_RESERVE_WEI = 2000000000000000n;
 const MAX_NONCE_LIMIT = 1000;
 
 let isFetching = false;
@@ -135,10 +135,6 @@ async function promiseAllLimit(tasks, limit = 10) {
 }
 
 // ─── STAGE 1: On-chain state checks (fast, standard JSON-RPC) ───
-/**
- * Checks bytecode, nonce, and balance.
- * Returns { pass: boolean, reason: string }
- */
 async function passesStageOne(address) {
   try {
     const checksumAddr = getAddress(address);
@@ -154,14 +150,13 @@ async function passesStageOne(address) {
 
     return { pass: true, reason: 'eoa_ok' };
   } catch (err) {
-    // RPC failure — fail open (don't block the pipeline)
     return { pass: true, reason: 'rpc_fail_stage1' };
   }
 }
 
 // ─── STAGE 2: BEHAVIORAL ANALYZER WITH TTL CACHE ───
 const MAX_ANALYZED_CACHE = 10000;
-const ANALYZED_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+const ANALYZED_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const ANALYZED_CACHE = new Map();
 
 function setAnalyzedCache(key, passes) {
@@ -178,17 +173,21 @@ function setAnalyzedCache(key, passes) {
  * Stage 1 + Stage 2 combined analysis.
  *
  * Stage 1 (fast): bytecode, nonce, balance — rejects contracts/exchanges/drained wallets
- * Stage 2 (heavy): behavioral heuristics with batch detection
+ * Stage 2 (heavy): behavioral heuristics with batch + streak + volume detection
  *
  * Checks:
- *   S1: Contract / nonce / balance
- *   S2-1: In-block batch detection (3+ transfers in same block)
- *   S2-2: Sustained batching (3+ blocks with batches)
- *   S2-3: Zero-gap ratio (>40% of intervals are 0 seconds)
- *   S2-4: Sleep-gap analysis (humans have > 4hr gaps)
- *   S2-5: Time-delta variance (bots have CV < 0.15)
- *   S2-6: dApp / receiver diversity (bots target 1-2 addresses)
- *   S2-7: On-chain frequency (bots fire 15+ txs in hours)
+ *   S1:     Contract / nonce / balance
+ *   S2-1:   In-block batch detection (3+ transfers in same block)
+ *   S2-2:   Sustained batching (3+ blocks with batches)
+ *   S2-3:   Zero-gap ratio (>40% of intervals are 0 seconds)
+ *   S2-4:   Sleep-gap analysis (humans have > 4hr gaps)
+ *   S2-5:   Time-delta variance (bots have CV < 0.15)
+ *   S2-6:   dApp / receiver diversity (bots target 1-2 addresses)
+ *   S2-7:   On-chain frequency (bots fire 15+ txs in hours)
+ *   S2-8:   Consecutive-block streak 🆕 (4+ txs in adjacent blocks = script)
+ *   S2-9:   Single-receiver sweeper 🆕 (all outgoing to 1 address, high volume)
+ *   S2-10:  High-density burst 🆕 (60+ transfers in <= 4 days)
+ *   S2-11:  Daily outgoing volume 🆕 (30+ transfers at 15+/day)
  *
  * @param {string} victimAddress - lowercase address of the sender/victim
  * @returns {Promise<boolean>} - true if likely human, false if likely bot
@@ -196,14 +195,13 @@ function setAnalyzedCache(key, passes) {
 async function passesBehavioralHeuristics(victimAddress) {
   const cacheKey = victimAddress.toLowerCase();
 
-  // Check cache with TTL
   const cached = ANALYZED_CACHE.get(cacheKey);
   if (cached && Date.now() < cached.expiresAt) {
     return cached.passes;
   }
 
   try {
-    // ─── STAGE 1 GATE: Fast on-chain state checks ───
+    // ─── STAGE 1 GATE ───
     const stage1 = await passesStageOne(victimAddress);
     if (!stage1.pass) {
       setAnalyzedCache(cacheKey, false);
@@ -223,7 +221,7 @@ async function passesBehavioralHeuristics(victimAddress) {
 
     const dbRows = (!dbErr && dbTxs) ? dbTxs : [];
 
-    // ─── Source 2: On-chain recent Transfer logs (all tokens, last N blocks) ───
+    // ─── Source 2: On-chain recent Transfer logs ───
     let onChainLogs = [];
     try {
       const currentBlock = await client.getBlockNumber();
@@ -240,8 +238,8 @@ async function passesBehavioralHeuristics(victimAddress) {
       onChainLogs = [];
     }
 
-    // ─── BATCH DETECTION: Count transfers per block from on-chain logs ───
-    const blockCounts = new Map(); // blockNumber → count of transfers in that block
+    // ─── BATCH DETECTION ───
+    const blockCounts = new Map();
     for (const log of onChainLogs) {
       const bn = Number(log.blockNumber);
       blockCounts.set(bn, (blockCounts.get(bn) || 0) + 1);
@@ -251,7 +249,6 @@ async function passesBehavioralHeuristics(victimAddress) {
     const maxBatchSize = blockCountsValues.length > 0 ? Math.max(...blockCountsValues) : 0;
     const batchBlockCount = blockCountsValues.filter(c => c >= 3).length;
 
-    // Also count batches from DB rows (group by block_number)
     const dbBlockCounts = new Map();
     for (const row of dbRows) {
       if (row.block_number) {
@@ -261,7 +258,6 @@ async function passesBehavioralHeuristics(victimAddress) {
     }
     const dbMaxBatch = dbBlockCounts.size > 0 ? Math.max(...dbBlockCounts.values()) : 0;
 
-    // Use the larger batch signal from either source
     const effectiveMaxBatch = Math.max(maxBatchSize, dbMaxBatch);
     const hasInBlockBatch = effectiveMaxBatch >= 3;
     const hasSustainedBatch = batchBlockCount >= 3;
@@ -275,7 +271,6 @@ async function passesBehavioralHeuristics(victimAddress) {
       }
     }
 
-    // From on-chain logs: group by block number for distinct transaction times
     const onChainBlockSet = new Set(onChainLogs.map(l => Number(l.blockNumber)));
     const onChainBlockNumbers = [...onChainBlockSet].sort((a, b) => a - b);
 
@@ -295,7 +290,6 @@ async function passesBehavioralHeuristics(victimAddress) {
     }
 
     // ─── ZERO-GAP COUNTING ───
-    // Sort and count intervals, tracking zero-gaps (same-block activity)
     allTimestamps.sort((a, b) => a - b);
 
     const intervals = [];
@@ -306,10 +300,8 @@ async function passesBehavioralHeuristics(victimAddress) {
       const gapMs = allTimestamps[i] - allTimestamps[i - 1];
       totalIntervalCount++;
       if (gapMs > 30000) {
-        // Meaningful gap (> 30s = different activity burst)
         intervals.push(gapMs);
       } else {
-        // Same-block or near-simultaneous activity
         zeroGapCount++;
       }
     }
@@ -317,7 +309,6 @@ async function passesBehavioralHeuristics(victimAddress) {
     const zeroGapRatio = totalIntervalCount > 0 ? zeroGapCount / totalIntervalCount : 0;
     const hasHighZeroGapRatio = zeroGapRatio > 0.40;
 
-    // Deduplicate for sleep/variance analysis (use burst-level timestamps)
     const dedupedTimes = [];
     for (const ts of allTimestamps) {
       if (dedupedTimes.length === 0 || (ts - dedupedTimes[dedupedTimes.length - 1]) > 30000) {
@@ -325,7 +316,7 @@ async function passesBehavioralHeuristics(victimAddress) {
       }
     }
 
-    // ─── INSUFFICIENT DATA: give benefit of the doubt ───
+    // ─── INSUFFICIENT DATA ───
     if (dedupedTimes.length < 5 && onChainLogs.length < 5 && dbRows.length < 5) {
       setAnalyzedCache(cacheKey, true);
       return true;
@@ -361,22 +352,78 @@ async function passesBehavioralHeuristics(victimAddress) {
     const onChainTxCount = onChainBlockNumbers.length;
     const isHighFrequency = onChainTxCount > 15;
 
+    // ─── CHECK 5 🆕: Consecutive-Block Streak ───
+    // 4+ transfers in adjacent blocks (diff <= 2) with zero breathing room = script.
+    let maxBlockStreak = 0;
+    let currentStreak = 0;
+    for (let i = 1; i < onChainBlockNumbers.length; i++) {
+      const diff = onChainBlockNumbers[i] - onChainBlockNumbers[i - 1];
+      if (diff >= 1 && diff <= 2) {
+        currentStreak++;
+        if (currentStreak > maxBlockStreak) maxBlockStreak = currentStreak;
+      } else {
+        currentStreak = 0;
+      }
+    }
+    const hasBlockStreak = maxBlockStreak >= 3; // 4+ blocks in a row
+
+    // ─── CHECK 6 🆕: Activity Volume & Daily Rate ───
+    const totalActivity = allTimestamps.length;
+    const spanMs = totalActivity >= 2
+      ? allTimestamps[totalActivity - 1] - allTimestamps[0]
+      : 0;
+    const spanDays = spanMs / (1000 * 60 * 60 * 24);
+    const transfersPerDay = spanDays > 0.001 ? totalActivity / spanDays : 0;
+
+    // ─── CHECK 7 🆕: Single-Receiver Sweeper ───
+    // All outgoing to 1 address with high volume in a short span = forwarder/MEV router.
+    // Shield: a real human DCA'ing to one exchange for months has spanDays > 90.
+    const isSingleReceiverSweeper = (
+      allUniqueReceivers.size === 1 &&
+      totalActivity >= 20 &&
+      spanDays <= 90
+    );
+
+    // ─── CHECK 8 🆕: High-Density Burst ───
+    // 60+ transfers crammed into 4 days, or 30+ into 7 days.
+    const isHighDensityBurst = totalActivity >= 60 && spanDays > 0 && spanDays <= 4;
+    const isDenseBurst = totalActivity >= 30 && spanDays > 0 && spanDays <= 7;
+
+    // ─── CHECK 9 🆕: Daily Outgoing Volume ───
+    // No human sustains 15+ outgoing transfers/day over 30+ transfers.
+    const isHighDailyVol = totalActivity >= 30 && transfersPerDay >= 15;
+    const isDailyVol = totalActivity >= 20 && transfersPerDay >= 8;
+
     // ─── FINAL VERDICT ───
     const isLikelyBot = (
-      // Signal combo A: never sleeps AND robotic timing
+      // A: never sleeps AND robotic timing
       (!hasSleepGap && isProgrammaticInterval) ||
-      // Signal combo B: high frequency AND robotic timing
+      // B: high frequency AND robotic timing
       (isHighFrequency && isProgrammaticInterval) ||
-      // Signal combo C: high frequency AND no diversity AND no sleep
+      // C: high frequency AND no diversity AND no sleep
       (isHighFrequency && !hasDiversity && !hasSleepGap) ||
-      // Signal combo D: in-block batching AND sustained across multiple blocks
+      // D: in-block batching AND sustained across multiple blocks
       (hasInBlockBatch && hasSustainedBatch) ||
-      // Signal combo E: in-block batching AND high frequency
+      // E: in-block batching AND high frequency
       (hasInBlockBatch && isHighFrequency) ||
-      // Signal combo F: in-block batching AND high zero-gap ratio AND no diversity
+      // F: in-block batching AND high zero-gap AND no diversity
       (hasInBlockBatch && hasHighZeroGapRatio && !hasDiversity) ||
-      // Signal combo G: sustained batching AND no sleep
-      (hasSustainedBatch && !hasSleepGap)
+      // G: sustained batching AND no sleep
+      (hasSustainedBatch && !hasSleepGap) ||
+      // H 🆕: consecutive-block streak (4+ txs in adjacent blocks = script)
+      hasBlockStreak ||
+      // I 🆕: single-receiver sweeper (all outgoing to 1 address, high volume, short span)
+      isSingleReceiverSweeper ||
+      // J 🆕: high-density burst (60+ transfers in 4 days)
+      isHighDensityBurst ||
+      // K 🆕: high daily volume (30+ transfers at 15+/day)
+      isHighDailyVol ||
+      // L 🆕: moderate daily volume AND dense burst
+      (isDailyVol && isDenseBurst) ||
+      // M 🆕: moderate daily volume AND no diversity
+      (isDailyVol && !hasDiversity) ||
+      // N 🆕: moderate daily volume AND no sleep
+      (isDailyVol && !hasSleepGap)
     );
 
     const isHuman = !isLikelyBot;
