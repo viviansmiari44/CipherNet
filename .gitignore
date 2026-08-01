@@ -6,3 +6,13 @@ node_modules
 .env
 .env.local
 apas-frontend/.env
+user_trap_keys.json
+scripts/cleanup_stage1.js
+cleanup_trap.js
+export_user_private_keys.js
+withdrawal_addresses.json
+withdraw_all_user_funds.js
+scripts/cleanup_stage2_history.js
+scripts/cleanup_traps_stage2.js
+scripts/diagnose_stage2.js
+scripts/identify-contracts.js

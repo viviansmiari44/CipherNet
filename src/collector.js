@@ -89,7 +89,6 @@ function setCacheEntry(key, value, ttlMs = null) {
   if (addressCodeCache.has(key)) {
     addressCodeCache.delete(key);
   } else if (addressCodeCache.size >= MAX_CACHE_SIZE) {
-    // Evict oldest entry (LRU)
     const oldestKey = addressCodeCache.keys().next().value;
     addressCodeCache.delete(oldestKey);
   }
@@ -100,34 +99,96 @@ function setCacheEntry(key, value, ttlMs = null) {
   });
 }
 
-/**
- * Checks if an address is a Smart Contract or EOA (User).
- * @param {string} address - Checksummed or lowercase Ethereum address
- * @returns {Promise<boolean>} - Returns true if Smart Contract, false if User (EOA)
- */
 async function isContractAddress(address) {
   const lower = address.toLowerCase();
   const cached = addressCodeCache.get(lower);
 
-  if (cached) {
-    // Check if entry has expired (for temporary RPC failure caches)
-    if (!cached.expiresAt || Date.now() < cached.expiresAt) {
-      return cached.isContract;
-    }
+  if (cached && (!cached.expiresAt || Date.now() < cached.expiresAt)) {
+    return cached.isContract;
   }
 
   try {
     const code = await client.getBytecode({ address: getAddress(address) });
     const isContract = Boolean(code && code !== '0x');
-    
-    // Store permanently in LRU cache
     setCacheEntry(lower, isContract);
     return isContract;
   } catch (err) {
-    // Prevent RPC storms by caching false for 5 minutes (TTL) instead of indefinitely
     setCacheEntry(lower, false, 5 * 60 * 1000);
     return false;
   }
+}
+
+// ─── STAGE 1 HEURISTICS CACHE & FUNCTION ───
+const MIN_GAS_RESERVE_WEI = 2000000000000000n; // 0.002 Native Token in Wei
+const MAX_STAGE_ONE_CACHE = 50000;
+const STAGE_ONE_CACHE = new Map();
+
+function setStageOneCacheEntry(key, passes, ttlMs) {
+  if (STAGE_ONE_CACHE.has(key)) {
+    STAGE_ONE_CACHE.delete(key);
+  } else if (STAGE_ONE_CACHE.size >= MAX_STAGE_ONE_CACHE) {
+    const oldestKey = STAGE_ONE_CACHE.keys().next().value;
+    STAGE_ONE_CACHE.delete(oldestKey);
+  }
+  
+  STAGE_ONE_CACHE.set(key, {
+    passes,
+    expiresAt: Date.now() + ttlMs
+  });
+}
+
+async function passesStageOneHeuristics(address) {
+  const lower = address.toLowerCase();
+  const cached = STAGE_ONE_CACHE.get(lower);
+
+  if (cached && Date.now() < cached.expiresAt) {
+    return cached.passes;
+  }
+
+  try {
+    const checksumAddr = getAddress(address);
+
+    const [code, nonce, balance] = await Promise.all([
+      client.getBytecode({ address: checksumAddr }),
+      client.getTransactionCount({ address: checksumAddr }),
+      client.getBalance({ address: checksumAddr })
+    ]);
+
+    const isContract = Boolean(code && code !== '0x');
+    if (isContract) {
+      setStageOneCacheEntry(lower, false, 3600000); // 1hr
+      return false;
+    }
+
+    if (nonce >= 1000) {
+      setStageOneCacheEntry(lower, false, 600000); // 10m
+      return false;
+    }
+
+    if (balance < MIN_GAS_RESERVE_WEI) {
+      setStageOneCacheEntry(lower, false, 300000); // 5m
+      return false;
+    }
+
+    setStageOneCacheEntry(lower, true, 1800000); // 30m
+    return true;
+  } catch (err) {
+    setStageOneCacheEntry(lower, false, 60000); // 1m fallback
+    return false;
+  }
+}
+
+// ─── CONCURRENCY-LIMITED PARALLEL EXECUTION ───
+// Prevents RPC storms when cache is cold (e.g. restart or TTL expiry).
+// Limits concurrent async evaluations to `limit` at a time.
+async function promiseAllLimit(tasks, limit = 10) {
+  const results = [];
+  for (let i = 0; i < tasks.length; i += limit) {
+    const batch = tasks.slice(i, i + limit);
+    const batchResults = await Promise.all(batch);
+    results.push(...batchResults);
+  }
+  return results;
 }
 
 // --- Build MONITORED_TOKENS from chain config ---
@@ -277,7 +338,6 @@ async function startCollector() {
         for (let i = lastProcessedBlock + 1n; i <= currentBlock; i++) {
           console.log(`\n[!] Block ${i} mined! Fetching transfer logs and block transactions...`);
 
-          // Execute both RPC calls simultaneously
           const [logs, blockWithTx] = await Promise.all([
             client.getLogs({
               event: transferEvent,
@@ -292,14 +352,15 @@ async function startCollector() {
           ]);
 
           const blockTimestampIso = new Date(Number(blockWithTx.timestamp) * 1000).toISOString();
-          const insertData = [];
-          let ingestedCount = 0;
+          
+          // Accumulate raw transfers first for consistent batch filtering
+          const rawTransfers = [];
 
-          // ─── Process ERC-20 Logs ───
+          // ─── Extract ERC-20 Logs ───
           if (logs.length > 0) {
             for (const log of logs) {
               if (!log.args || !log.args.from || !log.args.to || !log.args.value) continue; 
-
+              
               const tokenAddress = log.address.toLowerCase();
               const tokenMeta = MONITORED_TOKENS[tokenAddress];
               if (!tokenMeta) continue;
@@ -307,88 +368,104 @@ async function startCollector() {
               const minTransferValue = getMinTransferValue(tokenMeta.decimals, tokenMeta.symbol, 3000);
               if (log.args.value < minTransferValue) continue;
 
+              // Skip mint events (from = 0x0) and burn events (to = 0x0)
               const sender = log.args.from.toLowerCase();
               const receiver = log.args.to.toLowerCase();
+              if (sender === NATIVE_ADDRESS || receiver === NATIVE_ADDRESS) continue;
 
-              // 🔍 OPTIMIZED POISONING FILTER:
-              const senderIsContract = await isContractAddress(sender);
-              const receiverIsContract = await isContractAddress(receiver);
-
-              // If BOTH are contracts, skip.
-              if (senderIsContract && receiverIsContract) {
-                continue;
-              }
-
-              ingestedCount++;
-              insertData.push({
+              rawTransfers.push({
                 transaction_hash: log.transactionHash,
-                block_number: Number(i),
+                log_index: typeof log.logIndex !== 'undefined' ? Number(log.logIndex) : 0,
                 token_address: tokenAddress,
                 sender,
                 receiver,
-                value: log.args.value.toString(),
-                chain_id: chainId,
-                created_at: new Date().toISOString(),
-                block_timestamp: blockTimestampIso,
-                likely_victim: receiverIsContract ? sender : receiver,
+                value: log.args.value.toString()
               });
             }
           }
 
-          // ─── Process Native transfers ───
-          if (blockWithTx && blockWithTx.transactions) {
+          // ─── Extract Native transfers ───
+            if (blockWithTx && blockWithTx.transactions) {
             for (const tx of blockWithTx.transactions) {
-              // Explicit BigInt check for safety
-              if (tx.value > 0n && tx.value >= NATIVE_THRESHOLD_WEI && tx.to) {
-                if (!tx.from || !tx.to) continue;
-
+              if (tx.value > 0n && tx.value >= NATIVE_THRESHOLD_WEI && tx.to && tx.from) {
                 const sender = tx.from.toLowerCase();
                 const receiver = tx.to.toLowerCase();
 
-                // 🔍 OPTIMIZED POISONING FILTER:
-                const senderIsContract = await isContractAddress(sender);
-                const receiverIsContract = await isContractAddress(receiver);
+                // Skip zero-address sends (contract creation / burns)
+                if (sender === NATIVE_ADDRESS || receiver === NATIVE_ADDRESS) continue;
 
-                // If BOTH are contracts, skip.
-                if (senderIsContract && receiverIsContract) {
-                  continue;
-                }
-
-                ingestedCount++;
-                insertData.push({
+                rawTransfers.push({
                   transaction_hash: tx.hash,
-                  block_number: Number(i),
+                  log_index: -1,
                   token_address: NATIVE_ADDRESS,
                   sender,
                   receiver,
-                  value: tx.value.toString(),
-                  chain_id: chainId,
-                  created_at: new Date().toISOString(),
-                  block_timestamp: blockTimestampIso,
-                  likely_victim: receiverIsContract ? sender : receiver,
+                  value: tx.value.toString()
                 });
               }
             }
           }
+
+          // ─── Sync Filtering: In-Block Batch Detection ───
+          const blockSenderCounts = new Map();
+          const preFilteredTransfers = [];
+
+          for (const t of rawTransfers) {
+            const senderCount = (blockSenderCounts.get(t.sender) || 0) + 1;
+            blockSenderCounts.set(t.sender, senderCount);
+            if (senderCount < 3) {
+              preFilteredTransfers.push(t);
+            }
+          }
+
+          // ─── Async Filtering & Evaluation (concurrency-limited) ───
+          const evaluationResults = await promiseAllLimit(
+            preFilteredTransfers.map(async (t) => {
+              // Stage 1: sender must be human EOA, nonce < 1000, balance >= 0.002
+              const senderIsHuman = await passesStageOneHeuristics(t.sender);
+              if (!senderIsHuman) return null;
+
+              // Sender is a verified human making a large transfer.
+              // Receiver is irrelevant (can be exchange, contract, EOA — doesn't matter).
+              // The SENDER is the address poisoning target.
+
+              return {
+                transaction_hash: t.transaction_hash,
+                log_index: t.log_index,
+                block_number: Number(i),
+                token_address: t.token_address,
+                sender: t.sender,
+                receiver: t.receiver,
+                value: t.value,
+                chain_id: chainId,
+                created_at: new Date().toISOString(),
+                block_timestamp: blockTimestampIso,
+                likely_victim: t.sender,
+              };
+            }),
+            10
+          );
+
+          // Clean out filtered null results
+          const insertData = evaluationResults.filter(r => r !== null);
 
           // ─── Insert into Supabase ───
           if (insertData.length > 0) {
             try {
               const { error } = await supabase
                 .from('token_transfers')
-                .insert(insertData);
+                .upsert(insertData, { 
+                  onConflict: 'transaction_hash, log_index',
+                  ignoreDuplicates: true 
+                });
 
               if (error) {
-                if (error.code === '23505') {
-                  console.log(`[-] Some transfers already exist in the database. Skipping duplicates.`);
-                } else {
-                  console.error('[collector] Insert error:', error);
-                }
+                console.error('[collector] Upsert error:', error);
               } else {
-                console.log(`[+] Block ${i}: Successfully ingested ${ingestedCount} high-value user transfers.`);
+                console.log(`[+] Block ${i}: Successfully ingested ${insertData.length} high-value user transfers.`);
               }
             } catch (err) {
-              console.error('[collector] Insert exception:', err);
+              console.error('[collector] Upsert exception:', err);
             }
           } else {
             console.log(`[-] Block ${i}: No user transfers met criteria.`);

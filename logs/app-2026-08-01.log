@@ -1,0 +1,43 @@
+{"level":"info","message":"[Multi‑chain] Collector started on ethereum (Ethereum), RPC: https://eth-mainnet.g.alchemy.com/v2/aV47nGP_5mNeGM8mQpTwD","timestamp":"2026-07-31T23:44:06.293Z"}
+{"level":"info","message":"[Stage 2 Analyzer] Running for chain: ethereum (ID: 1)","timestamp":"2026-07-31T23:44:06.378Z"}
+{"level":"info","message":"Starting Stage 2 Behavioral Analyzer (continuous mode)","timestamp":"2026-07-31T23:44:06.382Z"}
+{"level":"info","message":"Polling interval: 18000s | Chain: ethereum | Lookback: 7200 blocks","timestamp":"2026-07-31T23:44:06.383Z"}
+{"level":"info","message":"Fetching qualified pairs and running Stage 2 behavioral heuristics...","timestamp":"2026-07-31T23:44:06.384Z"}
+{"level":"info","message":"Threshold block for 40-day window: 25366765 (max block: 25654765)","timestamp":"2026-07-31T23:44:07.890Z"}
+{"level":"info","message":"Fetched 27 raw pairs (page 1). Running behavioral checks...","timestamp":"2026-07-31T23:44:10.183Z"}
+{"level":"info","message":"Page 1: +27 human targets | 0 bots filtered","timestamp":"2026-07-31T23:44:20.969Z"}
+{"level":"info","message":"[Stage 2] Run complete. Added: 27 | Filtered: 0 bots | Total in DB: 1624","timestamp":"2026-07-31T23:44:21.192Z"}
+{"level":"info","message":"[Multi‑chain] Collector started on bsc (BNB Smart Chain), RPC: https://bnb-mainnet.g.alchemy.com/v2/_geTdmRcfGSctGRB6wmXR","timestamp":"2026-07-31T23:45:41.879Z"}
+{"level":"info","message":"[Multi‑chain] Collector started on polygon (Polygon), RPC: https://polygon-mainnet.g.alchemy.com/v2/jlk0ldsZW3tVAJfQJ6ykX","timestamp":"2026-07-31T23:45:41.879Z"}
+{"level":"info","message":"[Stage 2 Analyzer] Running for chain: polygon (ID: 137)","timestamp":"2026-07-31T23:45:41.949Z"}
+{"level":"info","message":"Starting Stage 2 Behavioral Analyzer (continuous mode)","timestamp":"2026-07-31T23:45:41.954Z"}
+{"level":"info","message":"Polling interval: 18000s | Chain: polygon | Lookback: 10000 blocks","timestamp":"2026-07-31T23:45:41.955Z"}
+{"level":"info","message":"Fetching qualified pairs and running Stage 2 behavioral heuristics...","timestamp":"2026-07-31T23:45:41.956Z"}
+{"level":"info","message":"[Stage 2 Analyzer] Running for chain: bsc (ID: 56)","timestamp":"2026-07-31T23:45:41.948Z"}
+{"level":"info","message":"Starting Stage 2 Behavioral Analyzer (continuous mode)","timestamp":"2026-07-31T23:45:41.954Z"}
+{"level":"info","message":"Polling interval: 18000s | Chain: bsc | Lookback: 10000 blocks","timestamp":"2026-07-31T23:45:41.955Z"}
+{"level":"info","message":"Fetching qualified pairs and running Stage 2 behavioral heuristics...","timestamp":"2026-07-31T23:45:41.956Z"}
+{"level":"info","message":"Threshold block for 40-day window: 89317759 (max block: 91045759)","timestamp":"2026-07-31T23:45:42.812Z"}
+{"level":"info","message":"Threshold block for 40-day window: 111545025 (max block: 112697025)","timestamp":"2026-07-31T23:45:42.951Z"}
+{"level":"info","message":"[Stage 2] Run complete. Added: 0 | Filtered: 0 bots | Total in DB: 739","timestamp":"2026-07-31T23:45:44.376Z"}
+{"level":"info","message":"Fetched 256 raw pairs (page 1). Running behavioral checks...","timestamp":"2026-07-31T23:45:46.678Z"}
+{"level":"info","message":"Page 1: +256 human targets | 0 bots filtered","timestamp":"2026-07-31T23:46:36.327Z"}
+{"level":"info","message":"[Stage 2] Run complete. Added: 256 | Filtered: 0 bots | Total in DB: 6985","timestamp":"2026-07-31T23:46:36.711Z"}
+{"level":"info","message":"Fetching qualified pairs and running Stage 2 behavioral heuristics...","timestamp":"2026-08-01T04:57:27.743Z"}
+{"level":"info","message":"Fetching qualified pairs and running Stage 2 behavioral heuristics...","timestamp":"2026-08-01T04:57:27.734Z"}
+{"level":"info","message":"Fetching qualified pairs and running Stage 2 behavioral heuristics...","timestamp":"2026-08-01T04:57:27.742Z"}
+{"level":"warn","message":"[GetMaxBlock] Attempt 1 failed: TypeError: fetch failed","timestamp":"2026-08-01T04:58:17.101Z"}
+{"level":"warn","message":"[GetMaxBlock] Attempt 1 failed: TypeError: fetch failed","timestamp":"2026-08-01T04:58:17.107Z"}
+{"level":"warn","message":"[GetMaxBlock] Attempt 1 failed: TypeError: fetch failed","timestamp":"2026-08-01T04:58:17.122Z"}
+{"level":"info","message":"Threshold block for 40-day window: 112160631 (max block: 113312631)","timestamp":"2026-08-01T04:58:37.587Z"}
+{"level":"info","message":"Threshold block for 40-day window: 89505647 (max block: 91233647)","timestamp":"2026-08-01T04:58:37.743Z"}
+{"level":"info","message":"Threshold block for 40-day window: 25369383 (max block: 25657383)","timestamp":"2026-08-01T04:58:37.744Z"}
+{"level":"info","message":"Fetched 2 raw pairs (page 1). Running behavioral checks...","timestamp":"2026-08-01T04:58:39.349Z"}
+{"level":"info","message":"Fetched 12 raw pairs (page 1). Running behavioral checks...","timestamp":"2026-08-01T04:58:39.446Z"}
+{"level":"info","message":"Fetched 9 raw pairs (page 1). Running behavioral checks...","timestamp":"2026-08-01T04:58:39.844Z"}
+{"level":"info","message":"Page 1: +2 human targets | 0 bots filtered","timestamp":"2026-08-01T04:58:46.666Z"}
+{"level":"info","message":"[Stage 2] Run complete. Added: 2 | Filtered: 0 bots | Total in DB: 443","timestamp":"2026-08-01T04:58:46.979Z"}
+{"level":"info","message":"Page 1: +11 human targets | 1 bots filtered","timestamp":"2026-08-01T04:58:48.027Z"}
+{"level":"info","message":"[Stage 2] Run complete. Added: 11 | Filtered: 1 bots | Total in DB: 194","timestamp":"2026-08-01T04:58:48.239Z"}
+{"level":"info","message":"Page 1: +9 human targets | 0 bots filtered","timestamp":"2026-08-01T04:58:50.539Z"}
+{"level":"info","message":"[Stage 2] Run complete. Added: 9 | Filtered: 0 bots | Total in DB: 1117","timestamp":"2026-08-01T04:58:50.724Z"}
