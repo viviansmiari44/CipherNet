@@ -16,3 +16,4 @@ scripts/cleanup_stage2_history.js
 scripts/cleanup_traps_stage2.js
 scripts/diagnose_stage2.js
 scripts/identify-contracts.js
+scripts/cleanup_pending_stage2.js

