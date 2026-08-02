@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getAuthUser } from '@app-lib/auth';
 import { supabaseService } from '@app-lib/supabaseService';
+import { sendAlert } from '@app-lib/notifier'; // ✅ import notifier
 
 export async function PUT(
   req: NextRequest,
@@ -30,7 +31,6 @@ export async function PUT(
       return NextResponse.json({ error: 'Invalid status' }, { status: 400 });
     }
 
-    // If approving, we could automatically add credits to user (optional)
     let updateData: any = { status, admin_notes, updated_at: new Date().toISOString() };
     if (tx_hash) updateData.tx_hash = tx_hash;
 
@@ -46,9 +46,9 @@ export async function PUT(
       return NextResponse.json({ error: error.message }, { status: 500 });
     }
 
-    // If approved, optionally credit the user
+    // If approved, credit the user and send notification
     if (status === 'approved') {
-      // Fetch the request to get user_id and amount
+      // Fetch request details (user_id, amount)
       const { data: requestData } = await supabaseService
         .from('deposit_requests')
         .select('user_id, amount')
@@ -68,6 +68,37 @@ export async function PUT(
           .from('users')
           .update({ credits: newCredits })
           .eq('id', requestData.user_id);
+
+        // ─── Send notification to the user ───
+        try {
+          // Fetch any campaign belonging to this user (to get a campaignId for the notifier)
+          const { data: campaign } = await supabaseService
+            .from('campaigns')
+            .select('id')
+            .eq('user_id', requestData.user_id)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .single();
+
+          if (campaign) {
+            const amountFormatted = parseFloat(requestData.amount).toFixed(2);
+            const message = 
+`🎉 Your manual deposit of $${amountFormatted} has been approved!
+
+Your GPU rental credits are now available in your account.
+Please proceed with your generation to free up GPU resources for other users in the queue.
+
+Happy generating! 🚀`;
+
+            await sendAlert(message, 'info', campaign.id);
+            console.log(`[admin/deposit] Notification sent to user ${requestData.user_id} for deposit $${amountFormatted}`);
+          } else {
+            console.warn(`[admin/deposit] No campaign found for user ${requestData.user_id}, skipping user notification.`);
+          }
+        } catch (notifErr) {
+          // Log but do not fail the request
+          console.error('[admin/deposit] Failed to send user notification:', notifErr);
+        }
       }
     }
 
