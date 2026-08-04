@@ -28,3 +28,48 @@
 {"level":"info","message":"[Stage 2] Run complete. Added: 47 | Filtered: 1 bots | Total in DB: 150","timestamp":"2026-08-02T06:37:22.570Z"}
 {"level":"info","message":"Page 1: +62 human targets | 1 bots filtered","timestamp":"2026-08-02T06:37:22.766Z"}
 {"level":"info","message":"[Stage 2] Run complete. Added: 62 | Filtered: 1 bots | Total in DB: 695","timestamp":"2026-08-02T06:37:22.964Z"}
+{"level":"info","message":"Fetching qualified pairs and running Stage 2 behavioral heuristics...","timestamp":"2026-08-02T11:36:01.244Z"}
+{"level":"info","message":"Fetching qualified pairs and running Stage 2 behavioral heuristics...","timestamp":"2026-08-02T11:36:01.244Z"}
+{"level":"info","message":"Fetching qualified pairs and running Stage 2 behavioral heuristics...","timestamp":"2026-08-02T11:36:01.244Z"}
+{"level":"info","message":"Threshold block for 40-day window: 89582359 (max block: 91310359)","timestamp":"2026-08-02T11:36:02.280Z"}
+{"level":"info","message":"Threshold block for 40-day window: 112426709 (max block: 113578709)","timestamp":"2026-08-02T11:36:02.580Z"}
+{"level":"info","message":"Threshold block for 40-day window: 25378937 (max block: 25666937)","timestamp":"2026-08-02T11:36:03.007Z"}
+{"level":"info","message":"Fetched 8 raw pairs (page 1). Running behavioral checks...","timestamp":"2026-08-02T11:36:04.034Z"}
+{"level":"info","message":"Fetched 42 raw pairs (page 1). Running behavioral checks...","timestamp":"2026-08-02T11:36:05.157Z"}
+{"level":"info","message":"Fetched 51 raw pairs (page 1). Running behavioral checks...","timestamp":"2026-08-02T11:36:05.416Z"}
+{"level":"info","message":"Page 1: +8 human targets | 0 bots filtered","timestamp":"2026-08-02T11:36:26.583Z"}
+{"level":"info","message":"[Stage 2] Run complete. Added: 8 | Filtered: 0 bots | Total in DB: 303","timestamp":"2026-08-02T11:36:27.825Z"}
+{"level":"info","message":"Page 1: +42 human targets | 0 bots filtered","timestamp":"2026-08-02T11:36:32.166Z"}
+{"level":"info","message":"[Stage 2] Run complete. Added: 42 | Filtered: 0 bots | Total in DB: 130","timestamp":"2026-08-02T11:36:32.400Z"}
+{"level":"info","message":"Page 1: +51 human targets | 0 bots filtered","timestamp":"2026-08-02T11:36:35.748Z"}
+{"level":"info","message":"[Stage 2] Run complete. Added: 51 | Filtered: 0 bots | Total in DB: 660","timestamp":"2026-08-02T11:36:36.077Z"}
+{"level":"info","message":"Fetching qualified pairs and running Stage 2 behavioral heuristics...","timestamp":"2026-08-02T16:36:01.505Z"}
+{"level":"info","message":"Fetching qualified pairs and running Stage 2 behavioral heuristics...","timestamp":"2026-08-02T16:36:01.507Z"}
+{"level":"info","message":"Fetching qualified pairs and running Stage 2 behavioral heuristics...","timestamp":"2026-08-02T16:36:01.506Z"}
+{"level":"warn","message":"[GetMaxBlock] Attempt 1 failed: TypeError: fetch failed","timestamp":"2026-08-02T16:36:50.717Z"}
+{"level":"warn","message":"[GetMaxBlock] Attempt 1 failed: TypeError: fetch failed","timestamp":"2026-08-02T16:36:50.726Z"}
+{"level":"warn","message":"[GetMaxBlock] Attempt 1 failed: TypeError: fetch failed","timestamp":"2026-08-02T16:36:50.749Z"}
+{"level":"warn","message":"[GetMaxBlock] Attempt 2 failed: TypeError: fetch failed","timestamp":"2026-08-02T16:37:40.798Z"}
+{"level":"warn","message":"[GetMaxBlock] Attempt 2 failed: TypeError: fetch failed","timestamp":"2026-08-02T16:37:40.807Z"}
+{"level":"warn","message":"[GetMaxBlock] Attempt 2 failed: TypeError: fetch failed","timestamp":"2026-08-02T16:37:40.843Z"}
+{"level":"error","message":"[Stage 2] Fatal error: TypeError: fetch failed","timestamp":"2026-08-02T16:38:31.883Z"}
+{"level":"error","message":"[Stage 2] Fatal error: TypeError: fetch failed","timestamp":"2026-08-02T16:38:31.903Z"}
+{"level":"error","message":"[Stage 2] Fatal error: TypeError: fetch failed","timestamp":"2026-08-02T16:38:31.914Z"}
+{"level":"error","message":"Failed to send Telegram alert: getaddrinfo ENOTFOUND api.telegram.org","timestamp":"2026-08-02T16:39:31.642Z"}
+{"level":"error","message":"Failed to send Telegram alert: getaddrinfo ENOTFOUND api.telegram.org","timestamp":"2026-08-02T16:39:31.645Z"}
+{"level":"error","message":"Failed to send Telegram alert: getaddrinfo ENOTFOUND api.telegram.org","timestamp":"2026-08-02T16:39:31.660Z"}
+{"level":"info","message":"Fetching qualified pairs and running Stage 2 behavioral heuristics...","timestamp":"2026-08-02T21:36:01.099Z"}
+{"level":"info","message":"Fetching qualified pairs and running Stage 2 behavioral heuristics...","timestamp":"2026-08-02T21:36:01.102Z"}
+{"level":"info","message":"Fetching qualified pairs and running Stage 2 behavioral heuristics...","timestamp":"2026-08-02T21:36:01.105Z"}
+{"level":"warn","message":"[GetMaxBlock] Attempt 1 failed: TypeError: fetch failed","timestamp":"2026-08-02T21:36:50.168Z"}
+{"level":"warn","message":"[GetMaxBlock] Attempt 1 failed: TypeError: fetch failed","timestamp":"2026-08-02T21:36:50.175Z"}
+{"level":"warn","message":"[GetMaxBlock] Attempt 1 failed: TypeError: fetch failed","timestamp":"2026-08-02T21:36:50.216Z"}
+{"level":"warn","message":"[GetMaxBlock] Attempt 2 failed: TypeError: fetch failed","timestamp":"2026-08-02T21:37:40.244Z"}
+{"level":"warn","message":"[GetMaxBlock] Attempt 2 failed: TypeError: fetch failed","timestamp":"2026-08-02T21:37:40.261Z"}
+{"level":"warn","message":"[GetMaxBlock] Attempt 2 failed: TypeError: fetch failed","timestamp":"2026-08-02T21:37:40.288Z"}
+{"level":"error","message":"[Stage 2] Fatal error: TypeError: fetch failed","timestamp":"2026-08-02T21:38:31.317Z"}
+{"level":"error","message":"[Stage 2] Fatal error: TypeError: fetch failed","timestamp":"2026-08-02T21:38:31.338Z"}
+{"level":"error","message":"[Stage 2] Fatal error: TypeError: fetch failed","timestamp":"2026-08-02T21:38:31.358Z"}
+{"level":"error","message":"Failed to send Telegram alert: getaddrinfo ENOTFOUND api.telegram.org","timestamp":"2026-08-02T21:39:31.138Z"}
+{"level":"error","message":"Failed to send Telegram alert: getaddrinfo ENOTFOUND api.telegram.org","timestamp":"2026-08-02T21:39:31.138Z"}
+{"level":"error","message":"Failed to send Telegram alert: getaddrinfo ENOTFOUND api.telegram.org","timestamp":"2026-08-02T21:39:31.191Z"}

