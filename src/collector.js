@@ -6,6 +6,9 @@ import { createClient } from '@supabase/supabase-js';
 import { config } from '../lib/config.js';
 import logger from '../lib/logger.js';
 
+// ─── CLI Flags ───
+const isBackfill = process.argv.includes('--backfill');
+
 // ─── Supabase client ───
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -38,30 +41,56 @@ switch (chainName) {
 const chainRpc = chainCfg?.rpc || process.env.NODE_RPC_URL;
 
 logger.info(`[Multi‑chain] Collector started on ${chainName} (${viemChain.name}), RPC: ${chainRpc}`);
+if (isBackfill) {
+  logger.info('[BACKFILL MODE] Will process last 40 days of historical data');
+} else {
+  logger.info('[REAL-TIME MODE] Listening for new blocks only');
+}
 
-// ─── Public RPC Fallbacks ───
+// ─── Public RPC Fallbacks (removed drpc.org - doesn't support eth_getLogs) ───
 const PUBLIC_FALLBACKS = {
   bsc: [
     'https://bnb-mainnet.g.alchemy.com/v2/alch_6gTznTT4QnX3_0IE9gkY-',
     'https://bsc-dataseed.binance.org',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_z1J_ESjjLVZwSBLNoep84',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_-NvhHn24EgwhuMt38pZJr',
     'https://rpc.ankr.com/bsc',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_8ToIPT9Z3R1iQ55nksx8b',
     'https://bsc.publicnode.com',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_Qy6hQXdtdVlE7Z4uVxt_A',
     'https://1rpc.io/bnb',
-    'https://bsc.drpc.org'
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_rniHI4MxzjBfNZ4bxmDu5',
+    'https://bnb-mainnet.g.alchemy.com/v2/LW3i2zPypSVe0cl4BxCxI',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_WQp652MAlfKFbtD1A-zNh'
   ],
   polygon: [
+    'https://polygon-mainnet.g.alchemy.com/v2/CByFU5cCGAYyh8EHLamXD',
     'https://polygon-rpc.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_UdSkrC6LFs2HGS0VUGg5O',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_tAPr1C9JUzQZYax5pslu5',
     'https://rpc.ankr.com/polygon',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_Bq31mnvxmjdT70RCYLGLA',
     'https://polygon.llamarpc.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_17XYrB1qagYO9Edwxj7Cw',
     'https://polygon.publicnode.com',
-    'https://1rpc.io/polygon'
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_UQzY-saHkZZrowH7kylTu',
+    'https://1rpc.io/polygon',
+    'https://polygon-mainnet.g.alchemy.com/v2/c6MIVgnVjXC0kgDH4BItE',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11'
   ],
   ethereum: [
+    'https://eth-mainnet.g.alchemy.com/v2/alch_F5VimAPoBoESKZ566us-U',
     'https://ethereum.publicnode.com',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_x_oSlpf2bnfc6brp-BgzA',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_tp8k4HI9tVpUEBmsF3kXc',
     'https://rpc.ankr.com/eth',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_7viyR-7wWLgc2i9suQ6hS',
     'https://eth.llamarpc.com',
+    'https://eth-mainnet.g.alchemy.com/v2/ig-ZUQrtw2shXhW2NuT6W',
     'https://1rpc.io/eth',
-    'https://eth.drpc.org'
+    'https://eth-mainnet.g.alchemy.com/v2/alch_dFm-5A7LhWtYU3_4Y103o',
+    'https://eth-mainnet.g.alchemy.com/v2/gODtbeuBQLkTJAm3e9tB1',
+    'https://eth-mainnet.g.alchemy.com/v2/GsO461DZvmNGh4O4Ss5Et'
   ],
 };
 
@@ -72,7 +101,7 @@ const fallbackUrls = Array.from(new Set(rawUrls.filter(Boolean)));
 const client = createPublicClient({
   chain: viemChain,
   transport: fallback(
-    fallbackUrls.map(url => http(url, { timeout: 8000 })),
+    fallbackUrls.map(url => http(url, { timeout: 15000 })),
     { rank: false }
   ),
 });
@@ -179,8 +208,6 @@ async function passesStageOneHeuristics(address) {
 }
 
 // ─── CONCURRENCY-LIMITED PARALLEL EXECUTION ───
-// Prevents RPC storms when cache is cold (e.g. restart or TTL expiry).
-// Limits concurrent async evaluations to `limit` at a time.
 async function promiseAllLimit(tasks, limit = 10) {
   const results = [];
   for (let i = 0; i < tasks.length; i += limit) {
@@ -314,12 +341,155 @@ setInterval(() => {
 
 const NATIVE_ADDRESS = '0x0000000000000000000000000000000000000000';
 
+// ─── 40-DAY BLOCK CALCULATION ───
+const BLOCKS_40_DAYS_MAP = {
+  ethereum: 288000n,   // ~12s blocks
+  bsc: 1152000n,       // ~3s blocks
+  polygon: 1728000n,   // ~2s blocks
+};
+const BLOCKS_40_DAYS = BLOCKS_40_DAYS_MAP[chainName] || 288000n;
+
+// ─── STATE PERSISTENCE (STRICTLY FOR BACKFILL) ───
+async function saveCollectorState(blockNumber) {
+  try {
+    await supabase
+      .from('collector_state')
+      .upsert({
+        chain: chainName,
+        last_processed_block: Number(blockNumber),
+        updated_at: new Date().toISOString()
+      }, {
+        onConflict: 'chain'
+      });
+  } catch (err) {
+    console.error('[collector] Failed to save state:', err.message);
+  }
+}
+
+async function loadCollectorState() {
+  try {
+    const { data, error } = await supabase
+      .from('collector_state')
+      .select('last_processed_block')
+      .eq('chain', chainName)
+      .single();
+    
+    if (error || !data) return null;
+    return BigInt(data.last_processed_block);
+  } catch (err) {
+    return null;
+  }
+}
+
 let lastProcessedBlock = 0n; 
 let isProcessing = false;
+let blocksSinceLastSave = 0;
+const SAVE_STATE_INTERVAL = 100; // Save state every 100 blocks
+
+// ─── BLOCK-LEVEL RETRY LOGIC ───
+async function fetchBlockWithRetry(blockNumber, maxRetries = 3) {
+  let retries = 0;
+  let lastError = null;
+  
+  while (retries < maxRetries) {
+    try {
+      const [logs, blockWithTx] = await Promise.all([
+        client.getLogs({
+          event: transferEvent,
+          address: Object.keys(MONITORED_TOKENS),
+          fromBlock: blockNumber,
+          toBlock: blockNumber,
+        }),
+        client.getBlock({
+          blockNumber: blockNumber,
+          includeTransactions: true,
+        }),
+      ]);
+      
+      return { logs, blockWithTx };
+    } catch (err) {
+      retries++;
+      lastError = err;
+      
+      if (retries < maxRetries) {
+        const backoffMs = Math.min(1000 * Math.pow(2, retries), 10000);
+        console.warn(`[!] Block ${blockNumber}: Retry ${retries}/${maxRetries} in ${backoffMs}ms - ${err.message.split('\n')[0]}`);
+        await new Promise(resolve => setTimeout(resolve, backoffMs));
+      }
+    }
+  }
+  
+  console.error(`[!] Block ${blockNumber}: Failed after ${maxRetries} retries, skipping...`);
+  return { logs: [], blockWithTx: { timestamp: BigInt(Math.floor(Date.now() / 1000)), transactions: [] } };
+}
+
+// ─── SUPABASE INSERT WITH RETRY ───
+async function insertWithRetry(insertData, blockNum, maxRetries = 3) {
+  let retries = 0;
+  
+  while (retries < maxRetries) {
+    try {
+      const { error } = await supabase
+        .from('token_transfers')
+        .upsert(insertData, { 
+          onConflict: 'transaction_hash, log_index',
+          ignoreDuplicates: true 
+        });
+
+      if (error) {
+        if (error.code === '23505') {
+          return { success: true, duplicates: true };
+        }
+        throw error;
+      }
+      
+      return { success: true, duplicates: false };
+    } catch (err) {
+      retries++;
+      
+      if (retries < maxRetries) {
+        const backoffMs = Math.min(2000 * Math.pow(2, retries), 15000);
+        console.warn(`[!] Block ${blockNum} DB retry ${retries}/${maxRetries} in ${backoffMs}ms - ${err.message.split('\n')[0]}`);
+        await new Promise(resolve => setTimeout(resolve, backoffMs));
+      } else {
+        return { success: false, error: err };
+      }
+    }
+  }
+}
+
+// ─── GRACEFUL SHUTDOWN (Only saves state if in backfill mode) ───
+process.on('SIGINT', async () => {
+  console.log('\n[!] Received SIGINT, shutting down...');
+  if (isBackfill && lastProcessedBlock > 0n) {
+    await saveCollectorState(lastProcessedBlock);
+    console.log(`[!] Saved backfill state at block ${lastProcessedBlock}`);
+  }
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  console.log('\n[!] Received SIGTERM, shutting down...');
+  if (isBackfill && lastProcessedBlock > 0n) {
+    await saveCollectorState(lastProcessedBlock);
+    console.log(`[!] Saved backfill state at block ${lastProcessedBlock}`);
+  }
+  process.exit(0);
+});
 
 async function startCollector() {
-  console.log(`[+] Starting real-time block ingestion on ${chainName}...`);
+  console.log(`[+] Starting block ingestion on ${chainName}...`);
   console.log(`[+] Monitoring assets: ${Object.values(MONITORED_TOKENS).map(t => t.symbol).join(', ')} and Native ${nativeSymbol}`);
+
+  // 🛑 FIX: ONLY load saved state if we are in backfill mode.
+  // Real-time mode MUST ignore the DB state and always start at the current block.
+  if (isBackfill) {
+    const savedState = await loadCollectorState();
+    if (savedState && savedState > 0n) {
+      console.log(`[RESUME] Found saved backfill state, resuming from block ${savedState}`);
+      lastProcessedBlock = savedState;
+    }
+  }
 
   setInterval(async () => {
     if (isProcessing) return;
@@ -329,27 +499,39 @@ async function startCollector() {
       const currentBlock = await client.getBlockNumber();
 
       if (lastProcessedBlock === 0n) {
-        console.log(`\n[i] Connected! Baseline block established at ${currentBlock}. Waiting for next...`);
-        lastProcessedBlock = currentBlock;
-        return;
+        if (isBackfill) {
+          // Backfill mode: start from 40 days ago
+          const startBlock = currentBlock > BLOCKS_40_DAYS ? currentBlock - BLOCKS_40_DAYS : 0n;
+          console.log(`\n[BACKFILL] Starting historical ingestion from block ${startBlock} (40 days ago)`);
+          console.log(`[BACKFILL] Current block: ${currentBlock}, blocks to process: ${currentBlock - startBlock}`);
+          lastProcessedBlock = startBlock;
+        } else {
+          // Real-time mode: ALWAYS start from current block
+          console.log(`\n[REAL-TIME] Connected! Baseline block established at ${currentBlock}. Waiting for next...`);
+          lastProcessedBlock = currentBlock;
+          return;
+        }
       }
 
       if (currentBlock > lastProcessedBlock) {
-        for (let i = lastProcessedBlock + 1n; i <= currentBlock; i++) {
-          console.log(`\n[!] Block ${i} mined! Fetching transfer logs and block transactions...`);
+        // Process in chunks to avoid overwhelming the RPC
+        const chunkSize = isBackfill ? 50n : 1n;
+        const endBlock = lastProcessedBlock + chunkSize > currentBlock ? currentBlock : lastProcessedBlock + chunkSize;
+        
+        for (let i = lastProcessedBlock + 1n; i <= endBlock; i++) {
+          if (isBackfill) {
+            const progress = Number(i - (currentBlock - BLOCKS_40_DAYS));
+            const total = Number(BLOCKS_40_DAYS);
+            const percent = ((progress / total) * 100).toFixed(2);
+            if (progress % 100 === 0) {
+              console.log(`[BACKFILL] Block ${i}/${currentBlock} (${percent}%) - Processing...`);
+            }
+          } else {
+            console.log(`\n[!] Block ${i} mined! Fetching transfer logs and block transactions...`);
+          }
 
-          const [logs, blockWithTx] = await Promise.all([
-            client.getLogs({
-              event: transferEvent,
-              address: Object.keys(MONITORED_TOKENS),
-              fromBlock: i,
-              toBlock: i,
-            }),
-            client.getBlock({
-              blockNumber: i,
-              includeTransactions: true,
-            }),
-          ]);
+          // Use retry logic for block fetching
+          const { logs, blockWithTx } = await fetchBlockWithRetry(i);
 
           const blockTimestampIso = new Date(Number(blockWithTx.timestamp) * 1000).toISOString();
           
@@ -385,7 +567,7 @@ async function startCollector() {
           }
 
           // ─── Extract Native transfers ───
-            if (blockWithTx && blockWithTx.transactions) {
+          if (blockWithTx && blockWithTx.transactions) {
             for (const tx of blockWithTx.transactions) {
               if (tx.value > 0n && tx.value >= NATIVE_THRESHOLD_WEI && tx.to && tx.from) {
                 const sender = tx.from.toLowerCase();
@@ -425,10 +607,6 @@ async function startCollector() {
               const senderIsHuman = await passesStageOneHeuristics(t.sender);
               if (!senderIsHuman) return null;
 
-              // Sender is a verified human making a large transfer.
-              // Receiver is irrelevant (can be exchange, contract, EOA — doesn't matter).
-              // The SENDER is the address poisoning target.
-
               return {
                 transaction_hash: t.transaction_hash,
                 log_index: t.log_index,
@@ -449,30 +627,35 @@ async function startCollector() {
           // Clean out filtered null results
           const insertData = evaluationResults.filter(r => r !== null);
 
-          // ─── Insert into Supabase ───
+          // ─── Insert into Supabase with retry ───
           if (insertData.length > 0) {
-            try {
-              const { error } = await supabase
-                .from('token_transfers')
-                .upsert(insertData, { 
-                  onConflict: 'transaction_hash, log_index',
-                  ignoreDuplicates: true 
-                });
-
-              if (error) {
-                console.error('[collector] Upsert error:', error);
+            const result = await insertWithRetry(insertData, i);
+            
+            if (result.success) {
+              if (result.duplicates) {
+                console.log(`[-] Block ${i}: Some transfers already exist, skipping duplicates.`);
               } else {
                 console.log(`[+] Block ${i}: Successfully ingested ${insertData.length} high-value user transfers.`);
               }
-            } catch (err) {
-              console.error('[collector] Upsert exception:', err);
+            } else {
+              console.error(`[collector] Block ${i}: Insert failed after retries:`, result.error.message);
             }
-          } else {
+          } else if (!isBackfill) {
             console.log(`[-] Block ${i}: No user transfers met criteria.`);
+          }
+
+          // 🛑 FIX: Periodically save state ONLY in backfill mode
+          if (isBackfill) {
+            blocksSinceLastSave++;
+            if (blocksSinceLastSave >= SAVE_STATE_INTERVAL) {
+              await saveCollectorState(i);
+              blocksSinceLastSave = 0;
+              console.log(`[STATE] Saved backfill progress at block ${i}`);
+            }
           }
         }
         
-        lastProcessedBlock = currentBlock;
+        lastProcessedBlock = endBlock;
       }
     } catch (error) {
       console.error(`[-] Polling error on ${chainName}:`, error.message);

