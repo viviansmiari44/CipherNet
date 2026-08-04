@@ -126,7 +126,7 @@ async function withRetry(fn, context, maxAttempts = 3, baseDelay = 1000) {
   throw lastError;
 }
 
-async function promiseAllLimit(tasks, limit = 10) {
+async function promiseAllLimit(tasks, limit = 5) {
   const results = [];
   for (let i = 0; i < tasks.length; i += limit) {
     results.push(...await Promise.all(tasks.slice(i, i + limit)));
@@ -483,7 +483,7 @@ async function fetchPendingTargets() {
 
       logger.info(`Fetched ${rows.length} raw pairs (page ${pageCount}). Running Stage 1 + Stage 2 checks...`);
 
-      const TIMEOUT_MS = 30000;
+      const TIMEOUT_MS = 90000;
 
       const evaluationResults = await promiseAllLimit(
         rows.map(async (row, index) => {
