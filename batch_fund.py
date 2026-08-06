@@ -745,10 +745,26 @@ def main():
         logger.info("Fetching existing trap balances for dynamic balance equalization...")
         trap_balances = get_trap_balances(unique_addresses)
 
-        # Prioritize 0-balance / lowest-balance traps first during execution
+        # 4. Generate equalized plan
+        assets_to_send = 0
+        if usdc_bal > 0: assets_to_send += 1
+        if "USDC_NATIVE" in TOKEN_CONFIG and native_usdc_bal > 0: assets_to_send += 1
+        if usdt_bal > 0: assets_to_send += 1
+        
+        txs_per_address = (1 if native_bal > 0 else 0) + assets_to_send
+        total_txs = txs_per_address * num_targets
+
+        plan = compute_funding_plan(unique_addresses, native_bal, usdc_bal, native_usdc_bal, usdt_bal, total_txs, trap_balances)
+
+        # 🚨 FIX: Re-sort active plan targets AFTER dynamic calculation 
+        # (Prioritizes 0-balance / lowest-balance traps across native & tokens first)
         unique_addresses = sorted(
-            unique_addresses, 
-            key=lambda a: trap_balances.get("native", {}).get(a, 0)
+            list(plan.keys()),
+            key=lambda a: (
+                trap_balances.get("native", {}).get(a, 0),
+                trap_balances.get("USDC", {}).get(a, 0),
+                trap_balances.get("USDT", {}).get(a, 0)
+            )
         )
 
         # 4. Generate equalized plan

