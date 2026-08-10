@@ -1,3 +1,9 @@
 {"level":"info","message":"Fetching qualified pairs and running Stage 1 + Stage 2 heuristics...","timestamp":"2026-08-10T01:15:24.178Z"}
 {"level":"info","message":"No transfers found in database for this chain yet.","timestamp":"2026-08-10T01:15:26.419Z"}
 {"level":"info","message":"Received SIGINT. Shutting down gracefully...","timestamp":"2026-08-10T04:31:31.335Z"}
+{"level":"info","message":"Watching new blocks for victim → counterparty transactions (poll every 15s)...","timestamp":"2026-08-10T21:31:36.555Z"}
+{"level":"info","message":"Re‑poisoner is running. Press Ctrl+C to stop.","timestamp":"2026-08-10T21:31:36.563Z"}
+{"level":"info","message":"Received SIGINT. Shutting down gracefully...","timestamp":"2026-08-10T21:31:43.649Z"}
+{"level":"info","message":"Watching new blocks for victim → counterparty transactions (poll every 15s)...","timestamp":"2026-08-10T21:35:35.434Z"}
+{"level":"info","message":"Re‑poisoner is running. Press Ctrl+C to stop.","timestamp":"2026-08-10T21:35:35.440Z"}
+{"level":"info","message":"Received SIGINT. Shutting down gracefully...","timestamp":"2026-08-10T21:35:39.938Z"}

