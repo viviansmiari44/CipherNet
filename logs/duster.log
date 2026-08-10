@@ -60368,3 +60368,6 @@ Connection reset by 45.12.114.97 port 1318
 2026-07-25 21:30:49,700 - duster - INFO - Sending 5.004399 USDT to 0x51c7bc746828c245158ecae094566c1a71c12a7f (Nonce: 26)
 2026-07-25 21:30:55,382 - duster - INFO - Broadcasted TX: 3190c2c9e8be6480369830727b8f8322cc4909e9d0350cc9b81dc07e3e0e348b (Nonce: 26)
 2026-07-25 21:31:01,311 - duster - INFO - ✅ TX confirmed: 3190c2c9e8be6480369830727b8f8322cc4909e9d0350cc9b81dc07e3e0e348b
+2026-08-11 00:39:45,339 - duster - INFO - Connected to RPC: https://ethereum.publicnode.com
+2026-08-11 00:39:45,342 - duster - INFO - Using vault file for legacy mode
+2026-08-11 00:39:45,343 - duster - ERROR - vault_ethereum.txt not found.
