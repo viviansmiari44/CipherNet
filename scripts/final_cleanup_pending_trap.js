@@ -484,8 +484,6 @@ async function runCleanup() {
     console.log(`[+] Unique victim addresses to analyze: ${uniqueAddresses.length}\n`);
 
     traps = null;
-    campaigns = null;
-    users = null;
 
     // ─── Analyze ───
     const reasonCounts = new Map();
