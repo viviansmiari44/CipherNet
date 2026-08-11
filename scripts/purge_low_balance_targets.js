@@ -17,10 +17,10 @@ import { createClient } from '@supabase/supabase-js';
 // ─── CLI Flags ───
 const isDryRun = process.argv.includes('--dry-run');
 const THRESHOLD_USD = 3000;
-const BATCH_SIZE = 25;          // addresses per parallel batch
+const BATCH_SIZE = 15;          // addresses per parallel batch
 const PURGE_INTERVAL = 3000;    // delete every 3000 addresses checked
 const DELETE_CHUNK = 500;       // Supabase delete chunk size
-const RPC_TIMEOUT_MS = 15000;
+const RPC_TIMEOUT_MS = 30000;
 
 console.log('\n══════════════════════════════════════════════════');
 if (isDryRun) {
@@ -175,53 +175,67 @@ async function deleteBatch(ids, chainName) {
     return deleted;
 }
 
-/**
- * Check total USD balance of an address using Alchemy + native balance
- */
-async function checkBalance(address, chainName) {
+async function checkBalanceWithRetry(address, chainName, maxRetries = 5) {
     const cfg = CHAINS[chainName];
     if (!cfg) return { totalUsd: 0, error: 'unknown chain' };
 
     const client = CHAIN_CLIENTS[chainName];
     const tokenAddrs = Object.values(cfg.stablecoins);
 
-    try {
-        const [nativeBal, tokenResult] = await Promise.all([
-            client.getBalance({ address }),
-            client.request({
-                method: 'alchemy_getTokenBalances',
-                params: [address, tokenAddrs],
-            }).catch(() => null),
-        ]);
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            const [nativeBal, tokenResult] = await Promise.all([
+                client.getBalance({ address }),
+                client.request({
+                    method: 'alchemy_getTokenBalances',
+                    params: [address, tokenAddrs],
+                }).catch(() => null),
+            ]);
 
-        let totalUsd = 0;
+            let totalUsd = 0;
 
-        // Native
-        const nativeSymbol = chainName === 'ethereum' ? 'ETH' : chainName === 'bsc' ? 'BNB' : 'MATIC';
-        const nativeDecimal = cfg.decimals[nativeSymbol];
-        const nativeAmount = Number(nativeBal) / (10 ** nativeDecimal);
-        totalUsd += nativeAmount * (prices[nativeSymbol] || prices[chainName] || 0);
+            // Native
+            const nativeSymbol = chainName === 'ethereum' ? 'ETH' : chainName === 'bsc' ? 'BNB' : 'MATIC';
+            const nativeDecimal = cfg.decimals[nativeSymbol];
+            const nativeAmount = Number(nativeBal) / (10 ** nativeDecimal);
+            totalUsd += nativeAmount * (prices[nativeSymbol] || prices[chainName] || 0);
 
-        // Stablecoins
-        if (tokenResult && tokenResult.tokenBalances) {
-            const symbolByAddr = {};
-            for (const [sym, addr] of Object.entries(cfg.stablecoins)) {
-                symbolByAddr[addr.toLowerCase()] = sym;
+            // Stablecoins
+            if (tokenResult && tokenResult.tokenBalances) {
+                const symbolByAddr = {};
+                for (const [sym, addr] of Object.entries(cfg.stablecoins)) {
+                    symbolByAddr[addr.toLowerCase()] = sym;
+                }
+                for (const tb of tokenResult.tokenBalances) {
+                    if (!tb.tokenBalance || tb.tokenBalance === '0x0') continue;
+                    const sym = symbolByAddr[tb.contractAddress?.toLowerCase()];
+                    if (!sym) continue;
+                    const decimals = cfg.decimals[sym] || 18;
+                    const amount = Number(BigInt(tb.tokenBalance)) / (10 ** decimals);
+                    totalUsd += amount * (prices[sym] || 1);
+                }
             }
-            for (const tb of tokenResult.tokenBalances) {
-                if (!tb.tokenBalance || tb.tokenBalance === '0x0') continue;
-                const sym = symbolByAddr[tb.contractAddress?.toLowerCase()];
-                if (!sym) continue;
-                const decimals = cfg.decimals[sym] || 18;
-                const amount = Number(BigInt(tb.tokenBalance)) / (10 ** decimals);
-                totalUsd += amount * (prices[sym] || 1);
+
+            return { totalUsd, nativeAmount, error: null };
+        } catch (err) {
+            const errMsg = err.message || String(err);
+
+            // Check if it's a rate limit error
+            if (errMsg.includes('429') || errMsg.includes('rate limit') || errMsg.includes('Too Many Requests')) {
+                if (attempt < maxRetries) {
+                    // Exponential backoff: 1s, 2s, 4s, 8s, 16s
+                    const delay = Math.pow(2, attempt - 1) * 1000;
+                    await sleep(delay);
+                    continue;
+                }
             }
+
+            // For other errors or max retries reached
+            return { totalUsd: 0, error: errMsg };
         }
-
-        return { totalUsd, nativeAmount, error: null };
-    } catch (err) {
-        return { totalUsd: 0, error: err.message };
     }
+
+    return { totalUsd: 0, error: 'max retries exceeded' };
 }
 
 async function processChain(chainName, rows) {
@@ -235,13 +249,14 @@ async function processChain(chainName, rows) {
     const sampleBelow = [];
     const sampleAbove = [];
     let checkedSinceLastPurge = 0;
+    let consecutiveErrors = 0;
 
     // Process in parallel batches
     for (let i = 0; i < rows.length; i += BATCH_SIZE) {
         const batch = rows.slice(i, i + BATCH_SIZE);
         const results = await Promise.all(
             batch.map(async (row) => {
-                const result = await checkBalance(row.victim, chainName);
+                const result = await checkBalanceWithRetry(row.victim, chainName);
                 return { row, ...result };
             })
         );
@@ -251,8 +266,20 @@ async function processChain(chainName, rows) {
 
             if (r.error) {
                 errors++;
+                consecutiveErrors++;
+
+                // If we hit 10 consecutive errors, add extra delay
+                if (consecutiveErrors >= 10) {
+                    console.log(`\n  ⚠️  ${consecutiveErrors} consecutive errors, cooling down 5s...`);
+                    await sleep(5000);
+                    consecutiveErrors = 0;
+                }
                 continue;
             }
+
+            // Reset consecutive error counter on success
+            consecutiveErrors = 0;
+
             if (r.totalUsd < THRESHOLD_USD) {
                 belowThreshold++;
                 toDelete.push(r.row.id);
@@ -267,11 +294,11 @@ async function processChain(chainName, rows) {
             }
         }
 
-        // 🆕 INCREMENTAL DELETE: Every PURGE_INTERVAL addresses
+        // INCREMENTAL DELETE: Every PURGE_INTERVAL addresses
         if (checkedSinceLastPurge >= PURGE_INTERVAL && toDelete.length > 0) {
             const deleted = await deleteBatch(toDelete, chainName);
             totalDeleted += deleted;
-            toDelete.length = 0; // Clear the array
+            toDelete.length = 0;
             checkedSinceLastPurge = 0;
         }
 
@@ -282,7 +309,8 @@ async function processChain(chainName, rows) {
             );
         }
 
-        await sleep(50); // gentle rate limit
+        // Adaptive sleep: longer after errors, shorter on success
+        await sleep(consecutiveErrors > 0 ? 200 : 100);
     }
     process.stdout.write('\n');
 
