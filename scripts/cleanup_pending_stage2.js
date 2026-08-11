@@ -571,15 +571,15 @@ async function runCleanup() {
       }
     }
 
-    if ((i + BATCH_SIZE) % 50 === 0 || i + BATCH_SIZE >= uniqueAddresses.length) {
+    if ((i + BATCH_SIZE) % 80 === 0 || i + BATCH_SIZE >= uniqueAddresses.length) {
       console.log(
         `  └─ Progress: ${Math.min(i + BATCH_SIZE, uniqueAddresses.length)} / ${uniqueAddresses.length}` +
         ` | ✅ ${humanCount} | ❌ ${invalidCount} (S1:${stage1Rejects} S2:${stage2Rejects}) | ⚠️ ${rpcFailCount} RPC`
       );
     }
 
-    // Purge every 4,000 address filters
-    if (analyzedCount - lastPurgeAt >= 4000) {
+    // Purge every 1,000 address filters
+    if (analyzedCount - lastPurgeAt >= 1000) {
       await purgePendingTargets(pendingPurgeByChain);
       lastPurgeAt = analyzedCount;
     }
