@@ -55,28 +55,28 @@ export default function TrapsList({
 
 
   const toggleFunding = async (trapId: string, currentStatus: boolean) => {
-  setToggling((prev) => ({ ...prev, [trapId]: true }));
-  try {
-    const res = await fetch(`/api/traps/${trapId}/funding-toggle`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ funding_enabled: !currentStatus }),
-    });
-    if (!res.ok) {
-      const error = await res.json();
-      alert('Failed to update funding: ' + (error.error || 'Unknown error'));
-      return;
+    setToggling((prev) => ({ ...prev, [trapId]: true }));
+    try {
+      const res = await fetch(`/api/traps/${trapId}/funding-toggle`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ funding_enabled: !currentStatus }),
+      });
+      if (!res.ok) {
+        const error = await res.json();
+        alert('Failed to update funding: ' + (error.error || 'Unknown error'));
+        return;
+      }
+      const updated = await res.json();
+      setTraps((prev) =>
+        prev.map((t) => (t.id === trapId ? { ...t, funding_enabled: updated.funding_enabled } : t))
+      );
+    } catch (err) {
+      alert('Network error');
+    } finally {
+      setToggling((prev) => ({ ...prev, [trapId]: false }));
     }
-    const updated = await res.json();
-    setTraps((prev) =>
-      prev.map((t) => (t.id === trapId ? { ...t, funding_enabled: updated.funding_enabled } : t))
-    );
-  } catch (err) {
-    alert('Network error');
-  } finally {
-    setToggling((prev) => ({ ...prev, [trapId]: false }));
-  }
-};
+  };
 
   const handleSearchSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -91,7 +91,7 @@ export default function TrapsList({
   };
 
   // ─── Fetch traps (paginated) ───
-    const fetchTraps = async (showLoading = true, currentSearch: string = activeSearch) => {
+  const fetchTraps = async (showLoading = true, currentSearch: string = activeSearch) => {
     if (showLoading) setLoading(true);
     else setRefreshing(true);
     try {
@@ -163,7 +163,7 @@ export default function TrapsList({
   };
 
   // ─── Initial load and polling ───
-    useEffect(() => {
+  useEffect(() => {
     fetchTraps(true, activeSearch);
     fetchBalances();
     const interval = setInterval(() => {
@@ -215,9 +215,9 @@ export default function TrapsList({
 
   return (
     <div>
-            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-4">
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-4">
         <h3 className="text-lg font-semibold text-white">Traps ({total})</h3>
-        
+
         <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 w-full sm:w-auto">
           {/* Search Bar */}
           <form onSubmit={handleSearchSubmit} className="flex items-center gap-2 flex-1 sm:flex-none">
@@ -302,7 +302,7 @@ export default function TrapsList({
                 <tr>
                   <td colSpan={11} className="px-4 py-6 text-center text-gray-400">Loading traps...</td>
                 </tr>
-                  ) : traps.length === 0 ? (
+              ) : traps.length === 0 ? (
                 <tr>
                   <td colSpan={11} className="px-4 py-6 text-center text-gray-400">
                     {activeSearch ? 'No traps match your search.' : 'No traps found.'}
@@ -425,35 +425,33 @@ export default function TrapsList({
                       {/* Status */}
                       <td className="px-4 py-3">
                         <span
-                          className={`px-2 py-1 text-xs rounded-full ${
-                            trap.is_caught
-                              ? 'bg-red-500/20 text-red-400 border border-red-500/30'
-                              : 'bg-green-500/20 text-green-400 border border-green-500/30'
-                          }`}
+                          className={`px-2 py-1 text-xs rounded-full ${trap.is_caught
+                            ? 'bg-red-500/20 text-red-400 border border-red-500/30'
+                            : 'bg-green-500/20 text-green-400 border border-green-500/30'
+                            }`}
                         >
                           {trap.is_caught ? 'Caught' : 'Active'}
                         </span>
                       </td>
 
-                       {/* Funding */}
+                      {/* Funding */}
                       <td className="px-4 py-3">
-                      <button
-                        onClick={() => toggleFunding(trap.id, trap.funding_enabled)}
-                        disabled={toggling[trap.id]}
-                        className={`px-2 py-1 text-xs rounded transition-colors ${
-                          trap.funding_enabled
+                        <button
+                          onClick={() => toggleFunding(trap.id, trap.funding_enabled)}
+                          disabled={toggling[trap.id]}
+                          className={`px-2 py-1 text-xs rounded transition-colors ${trap.funding_enabled
                             ? 'bg-green-600/30 text-green-400 hover:bg-green-600/50'
                             : 'bg-red-600/30 text-red-400 hover:bg-red-600/50'
-                        } disabled:opacity-50`}
-                      >
-                        {toggling[trap.id] ? '…' : trap.funding_enabled ? 'On' : 'Off'}
-                      </button>
-                    </td>
+                            } disabled:opacity-50`}
+                        >
+                          {toggling[trap.id] ? '…' : trap.funding_enabled ? 'On' : 'Off'}
+                        </button>
+                      </td>
 
                       {/* Actions */}
                       <td className="px-4 py-3">
                         <div className="flex items-center gap-1">
-                          {/* <button
+                          <button
                             onClick={() => copyPrivateKey(trap.id, trap.trap_address)}
                             disabled={isCopying}
                             className="flex items-center gap-1 px-2 py-1 text-xs bg-gray-700/50 hover:bg-gray-600/50 rounded transition-colors disabled:opacity-50"
@@ -469,7 +467,7 @@ export default function TrapsList({
                                 <span>Copy Key</span>
                               </>
                             )}
-                          </button> */}
+                          </button>
                           <button
                             onClick={() => deleteTrap(trap.id)}
                             disabled={isDeleting}
