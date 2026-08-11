@@ -211,12 +211,20 @@ async function checkBalanceWithRetry(address, chainName, maxRetries = 5) {
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-            const [nativeBal, tokenResult] = await Promise.all([
-                client.getBalance({ address }),
-                client.request({
-                    method: 'alchemy_getTokenBalances',
-                    params: [address, tokenAddrs],
-                }).catch(() => null),
+            // Add timeout wrapper for RPC calls
+            const timeoutPromise = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('RPC timeout')), RPC_TIMEOUT_MS)
+            );
+
+            const [nativeBal, tokenResult] = await Promise.race([
+                Promise.all([
+                    client.getBalance({ address }),
+                    client.request({
+                        method: 'alchemy_getTokenBalances',
+                        params: [address, tokenAddrs],
+                    }).catch(() => null),
+                ]),
+                timeoutPromise
             ]);
 
             let totalUsd = 0;
@@ -267,6 +275,7 @@ async function checkBalanceWithRetry(address, chainName, maxRetries = 5) {
 
 async function processChain(chainName, rows) {
     console.log(`\n🔗 Chain: ${chainName.toUpperCase()} — ${rows.length} targets`);
+    console.log(`   Starting balance checks (BATCH_SIZE=${BATCH_SIZE})...`);
 
     let belowThreshold = 0;
     let aboveThreshold = 0;
@@ -277,10 +286,18 @@ async function processChain(chainName, rows) {
     const sampleAbove = [];
     let checkedSinceLastPurge = 0;
     let consecutiveErrors = 0;
+    const startTime = Date.now();
 
     // Process in parallel batches
     for (let i = 0; i < rows.length; i += BATCH_SIZE) {
         const batch = rows.slice(i, i + BATCH_SIZE);
+
+        // Debug: Log first batch
+        if (i === 0) {
+            console.log(`   Processing first batch of ${batch.length} addresses...`);
+            console.log(`   First address: ${batch[0].victim}`);
+        }
+
         const results = await Promise.all(
             batch.map(async (row) => {
                 const result = await checkBalanceWithRetry(row.victim, chainName);
@@ -330,9 +347,13 @@ async function processChain(chainName, rows) {
         }
 
         const done = Math.min(i + BATCH_SIZE, rows.length);
-        if (done % 200 === 0 || done === rows.length) {
+
+        // Show progress every batch (more frequent feedback)
+        if (done % BATCH_SIZE === 0 || done === rows.length) {
+            const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+            const rate = (done / (elapsed || 1)).toFixed(1);
             process.stdout.write(
-                `\r  └─ Progress: ${done}/${rows.length} | Below: ${belowThreshold} | Above: ${aboveThreshold} | Deleted: ${totalDeleted} | Errors: ${errors}`
+                `\r  └─ Progress: ${done}/${rows.length} (${rate}/s) | Below: ${belowThreshold} | Above: ${aboveThreshold} | Deleted: ${totalDeleted} | Errors: ${errors}    `
             );
         }
 
