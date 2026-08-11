@@ -617,10 +617,27 @@ def fetch_last_transfer_from_blockchain(victim_address, counterparty_address):
                             
                             # Native transfer
                             if t.get('category') == 'external':
-                                value_hex = t.get('value', '0x0')
-                                value_wei = int(value_hex, 16) if isinstance(value_hex, str) else int(value_hex)
+                                value_raw = t.get('value', 0)
+
+                                # Alchemy returns native values as decimal floats, not hex
+                                if isinstance(value_raw, str):
+                                    # Handle scientific notation like "1e-18" or "2.8e-17"
+                                    try:
+                                        value_float = float(value_raw)
+                                        # Convert to wei (multiply by 10^18)
+                                        value_wei = int(value_float * (10 ** 18))
+                                    except ValueError:
+                                        # If it's actually hex (starts with 0x), parse as hex
+                                        if value_raw.startswith('0x'):
+                                            value_wei = int(value_raw, 16)
+                                        else:
+                                            value_wei = int(value_raw)
+                                else:
+                                    # Already a number (float or int)
+                                    value_wei = int(float(value_raw) * (10 ** 18))
+                                
                                 if value_wei > 0:
-                                    logger.info(f"[Alchemy:{url[:30]}...] Found {NATIVE_SYMBOL} transfer: {w3.from_wei(value_wei, 'ether')}")
+                                    logger.info(f"[Alchemy:{url[:30]}...] Found {NATIVE_SYMBOL} transfer: {w3.from_wei(value_wei, 'ether')} ETH")
                                     return (NATIVE_SYMBOL, value_wei)
                             
                             # ERC-20 transfer
