@@ -646,8 +646,9 @@ def fetch_last_transfer_from_blockchain(victim_address, counterparty_address):
     Fetch the most recent transfer from victim to counterparty.
     
     Strategy:
-    1. Try explicit Alchemy RPCs using alchemy_getAssetTransfers (searches ENTIRE history instantly).
-    2. Fall back to global w3 (Free RPCs) using chunked eth_getLogs (safe 10k block chunks).
+    1. Try all Alchemy RPCs (with failover for rate limits/errors)
+    2. If ANY Alchemy succeeds but finds nothing, that's definitive - skip slow fallback
+    3. Only use slow fallback if ALL Alchemy URLs failed with errors
     
     Returns (asset_symbol, amount_in_smallest_units) or (None, None).
     """
@@ -658,15 +659,17 @@ def fetch_last_transfer_from_blockchain(victim_address, counterparty_address):
         counterparty_lower = counterparty_address.lower()
         
         # ═══════════════════════════════════════════════════════
-        # METHOD 1: Explicit Alchemy RPCs (Instant Full History)
+        # METHOD 1: Try all Alchemy RPCs with failover
         # ═══════════════════════════════════════════════════════
         alchemy_urls = ALCHEMY_RPCS.get(CHAIN.lower(), [])
+        alchemy_success_but_no_result = False
         
-        for url in alchemy_urls:
+        for url_idx, url in enumerate(alchemy_urls):
             try:
                 # Create a temporary Web3 instance for this specific Alchemy URL
                 alchemy_w3 = Web3(Web3.HTTPProvider(url, request_kwargs={'timeout': 10}))
                 if not alchemy_w3.is_connected():
+                    logger.debug(f"[Alchemy:{url[:30]}...] Connection failed, trying next")
                     continue
 
                 categories = ['external', 'erc20']
@@ -684,6 +687,7 @@ def fetch_last_transfer_from_blockchain(victim_address, counterparty_address):
                     'withMetadata': False,
                 }])
                 
+                # Alchemy call succeeded - check results
                 if 'result' in result and result['result'].get('transfers'):
                     transfers = result['result']['transfers']
                     
@@ -695,21 +699,16 @@ def fetch_last_transfer_from_blockchain(victim_address, counterparty_address):
                             if t.get('category') == 'external':
                                 value_raw = t.get('value', 0)
 
-                                # Alchemy returns native values as decimal floats, not hex
                                 if isinstance(value_raw, str):
-                                    # Handle scientific notation like "1e-18" or "2.8e-17"
                                     try:
                                         value_float = float(value_raw)
-                                        # Convert to wei (multiply by 10^18)
                                         value_wei = int(value_float * (10 ** 18))
                                     except ValueError:
-                                        # If it's actually hex (starts with 0x), parse as hex
                                         if value_raw.startswith('0x'):
                                             value_wei = int(value_raw, 16)
                                         else:
                                             value_wei = int(value_raw)
                                 else:
-                                    # Already a number (float or int)
                                     value_wei = int(float(value_raw) * (10 ** 18))
                                 
                                 if value_wei > 0:
@@ -718,16 +717,14 @@ def fetch_last_transfer_from_blockchain(victim_address, counterparty_address):
                             
                             # ERC-20 transfer
                             elif t.get('category') == 'erc20':
-                                # Alchemy returns exact raw hex in rawContract.value to avoid float precision loss
                                 raw_contract = t.get('rawContract', {})
                                 raw_hex = raw_contract.get('value')
                                 
                                 if raw_hex:
                                     value_units = int(raw_hex, 16)
                                 else:
-                                    # Fallback if rawContract is missing (multiply float by decimals)
                                     token_addr = raw_contract.get('address', '').lower()
-                                    decimals = 6 # default
+                                    decimals = 6
                                     for sym, addr in TOKEN_CONFIG.items():
                                         if addr.lower() == token_addr:
                                             decimals = config.get_token_decimals().get(sym, 6) if hasattr(config, 'get_token_decimals') else 6
@@ -740,25 +737,39 @@ def fetch_last_transfer_from_blockchain(victim_address, counterparty_address):
                                         if addr.lower() == token_contract:
                                             logger.info(f"[Alchemy:{url[:30]}...] Found {symbol} transfer: {value_units} units")
                                             return (symbol, value_units)
-                                            
-                # If we got here, Alchemy worked but didn't find the transfer in the last 5
-                # We can break the loop because Alchemy searched the whole history
-                logger.info(f"[Alchemy] Searched entire history via {url[:30]}..., no match found.")
-                break 
+                
+                # Alchemy succeeded but found no matching transfers
+                # This is definitive - don't try slow fallback
+                logger.info(f"[Alchemy:{url[:30]}...] Search successful, no transfers found")
+                alchemy_success_but_no_result = True
+                break  # No need to try other Alchemy URLs
                 
             except Exception as e:
-                logger.debug(f"[Alchemy] Failed on {url[:30]}...: {e}")
+                err_str = str(e).lower()
+                logger.debug(f"[Alchemy:{url[:30]}...] Failed: {e}")
+                
+                # If it's a rate limit error, wait before trying next URL
+                if '429' in err_str or 'rate limit' in err_str or 'too many requests' in err_str:
+                    if url_idx < len(alchemy_urls) - 1:  # Not the last URL
+                        logger.info(f"[Alchemy] Rate limited, waiting 2s before next URL...")
+                        time.sleep(2)
                 continue
         
+        # If Alchemy succeeded but found nothing, return None (don't try slow fallback)
+        if alchemy_success_but_no_result:
+            logger.info(f"[Alchemy] No victim→counterparty transfers found in history")
+            return (None, None)
+        
         # ═══════════════════════════════════════════════════════
-        # METHOD 2: Fallback to Free RPCs (Chunked eth_getLogs)
-        # Free RPCs limit log queries, so we use safe 10,000 block chunks
+        # METHOD 2: Fallback to Free RPCs (only if ALL Alchemy URLs failed)
         # ═══════════════════════════════════════════════════════
+        logger.warning(f"[Fallback] All Alchemy URLs failed, using slow chunked search...")
+        
         current_block = call_with_retry(w3.eth.get_block_number)
-        chunk_size = 10000  # Safe limit for free RPCs (Ankr/PublicNode)
+        chunk_size = 10000
         max_search_blocks = 2000000 
         
-        logger.info(f"[Fallback] Using free RPC. Searching backwards from block {current_block} in {chunk_size}-block chunks...")
+        logger.info(f"[Fallback] Searching backwards from block {current_block} in {chunk_size}-block chunks...")
         
         transfer_topic = w3.keccak(text="Transfer(address,address,uint256)").hex()
         victim_topic = '0x' + victim_lower[2:].zfill(64)
