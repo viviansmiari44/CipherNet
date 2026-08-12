@@ -143,7 +143,7 @@ app.post('/webhook/job', async (req, res) => {
       scriptPath = path.join(projectRoot, 'src', 'batch_generate.py');
       args = ['--job-id', jobId];
 
-        // ─── Add max-keys if provided ───
+      // ─── Add max-keys if provided ───
       if (req.body.maxKeys) {
         args.push('--max-keys', String(req.body.maxKeys));
       }
@@ -173,6 +173,11 @@ app.post('/webhook/job', async (req, res) => {
     case 'dust':
       scriptPath = path.join(projectRoot, 'tools', 'duster.py');
       args = ['--job-id', jobId];
+      // 🆕 Pass filtered trap IDs if provided
+      if (req.body.trapIds) {
+        env.TRAP_IDS = req.body.trapIds;
+        console.log(`[webhook] Dust job filtered — trap IDs received (${req.body.trapIds.split(',').length} traps)`);
+      }
       break;
 
     case 'sweep':

