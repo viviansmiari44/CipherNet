@@ -2,8 +2,8 @@
 /**
  * Purge targets with balance < $3000 from pending_targets
  * 
- * Uses Alchemy's alchemy_getTokenBalances for fast multi-token balance checks.
- * Processes in parallel batches and DELETES INCREMENTALLY (every 3000 addresses).
+ * Uses Alchemy's alchemy_getTokenBalances with automatic Multicall3 fallback
+ * for fast multi-token balance checks across public RPCs.
  * 
  * Usage:
  *   node scripts/purge_low_balance_targets.js              # LIVE MODE (deletes)
@@ -17,10 +17,10 @@ import { createClient } from '@supabase/supabase-js';
 // ─── CLI Flags ───
 const isDryRun = process.argv.includes('--dry-run');
 const THRESHOLD_USD = 3000;
-const BATCH_SIZE = 20;          // Reduced slightly to avoid rate limit spikes
-const PURGE_INTERVAL = 1000;    // Delete/Purge every 1000 addresses checked
-const DELETE_CHUNK = 500;       // Supabase delete chunk size
-const RPC_TIMEOUT_MS = 25000;
+const BATCH_SIZE = 20;
+const PURGE_INTERVAL = 1000;
+const DELETE_CHUNK = 500;
+const RPC_TIMEOUT_MS = 15000;
 
 console.log('\n══════════════════════════════════════════════════');
 if (isDryRun) {
@@ -40,51 +40,34 @@ if (!supabaseUrl || !supabaseKey) {
 }
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// ─── Alchemy RPCs ───
-const ALCHEMY_RPCS = {
+// Custom Alchemy key from env if available
+const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY || '';
+
+// ─── RPC Endpoints ───
+const ALL_RPCS = {
     bsc: [
-        'https://bnb-mainnet.g.alchemy.com/v2/alch_6gTznTT4QnX3_0IE9gkY-',
+        ...(ALCHEMY_KEY ? [`https://bnb-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`] : []),
         'https://bsc-dataseed.binance.org',
-        'https://bnb-mainnet.g.alchemy.com/v2/alch_z1J_ESjjLVZwSBLNoep84',
-        'https://bnb-mainnet.g.alchemy.com/v2/alch_-NvhHn24EgwhuMt38pZJr',
         'https://rpc.ankr.com/bsc',
-        'https://bnb-mainnet.g.alchemy.com/v2/alch_8ToIPT9Z3R1iQ55nksx8b',
         'https://bsc.publicnode.com',
-        'https://bnb-mainnet.g.alchemy.com/v2/alch_Qy6hQXdtdVlE7Z4uVxt_A',
         'https://1rpc.io/bnb',
-        'https://bnb-mainnet.g.alchemy.com/v2/alch_rniHI4MxzjBfNZ4bxmDu5',
         'https://bsc.drpc.org',
-        'https://bnb-mainnet.g.alchemy.com/v2/LW3i2zPypSVe0cl4BxCxI',
-        'https://bnb-mainnet.g.alchemy.com/v2/alch_WQp652MAlfKFbtD1A-zNh'
     ],
     polygon: [
-        'https://polygon-mainnet.g.alchemy.com/v2/CByFU5cCGAYyh8EHLamXD',
+        ...(ALCHEMY_KEY ? [`https://polygon-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`] : []),
         'https://polygon-rpc.com',
-        'https://polygon-mainnet.g.alchemy.com/v2/alch_UdSkrC6LFs2HGS0VUGg5O',
-        'https://polygon-mainnet.g.alchemy.com/v2/alch_tAPr1C9JUzQZYax5pslu5',
         'https://rpc.ankr.com/polygon',
-        'https://polygon-mainnet.g.alchemy.com/v2/alch_Bq31mnvxmjdT70RCYLGLA',
         'https://polygon.llamarpc.com',
-        'https://polygon-mainnet.g.alchemy.com/v2/alch_17XYrB1qagYO9Edwxj7Cw',
         'https://polygon.publicnode.com',
-        'https://polygon-mainnet.g.alchemy.com/v2/alch_UQzY-saHkZZrowH7kylTu',
         'https://1rpc.io/polygon',
-        'https://polygon-mainnet.g.alchemy.com/v2/c6MIVgnVjXC0kgDH4BItE',
-        'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11'
+        'https://polygon.drpc.org',
     ],
     ethereum: [
-        'https://eth-mainnet.g.alchemy.com/v2/gODtbeuBQLkTJAm3e9tB1',
-        'https://eth-mainnet.g.alchemy.com/v2/GsO461DZvmNGh4O4Ss5Et',
-        'https://eth-mainnet.g.alchemy.com/v2/alch_F5VimAPoBoESKZ566us-U',
+        ...(ALCHEMY_KEY ? [`https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`] : []),
         'https://ethereum.publicnode.com',
-        'https://eth-mainnet.g.alchemy.com/v2/alch_x_oSlpf2bnfc6brp-BgzA',
-        'https://eth-mainnet.g.alchemy.com/v2/alch_tp8k4HI9tVpUEBmsF3kXc',
-        'https://rpc.ankr.com/eth',
-        'https://eth-mainnet.g.alchemy.com/v2/alch_7viyR-7wWLgc2i9suQ6hS',
         'https://eth.llamarpc.com',
-        'https://eth-mainnet.g.alchemy.com/v2/ig-ZUQrtw2shXhW2NuT6W',
+        'https://rpc.ankr.com/eth',
         'https://1rpc.io/eth',
-        'https://eth-mainnet.g.alchemy.com/v2/alch_dFm-5A7LhWtYU3_4Y103o',
         'https://eth.drpc.org',
     ],
 };
@@ -131,34 +114,28 @@ const CHAINS = {
     },
 };
 
-// Create separate transport handlers for general RPCs vs Alchemy specific methods
-const ALCHEMY_CLIENTS = {};
 const CHAIN_CLIENTS = {};
-
 for (const [name, cfg] of Object.entries(CHAINS)) {
-    const alchemyOnlyUrls = ALCHEMY_RPCS[name].filter(url => url.includes('alchemy.com'));
-    const allUrls = ALCHEMY_RPCS[name];
-
-    // Client using strictly Alchemy endpoints for proprietary methods
-    ALCHEMY_CLIENTS[name] = createPublicClient({
-        chain: cfg.chain,
-        transport: fallback(
-            (alchemyOnlyUrls.length > 0 ? alchemyOnlyUrls : allUrls).map(url => http(url, { timeout: RPC_TIMEOUT_MS })),
-            { retryCount: 2 }
-        ),
-    });
-
-    // Standard client for getBalance
     CHAIN_CLIENTS[name] = createPublicClient({
         chain: cfg.chain,
         transport: fallback(
-            allUrls.map(url => http(url, { timeout: RPC_TIMEOUT_MS })),
+            ALL_RPCS[name].map(url => http(url, { timeout: RPC_TIMEOUT_MS })),
             { retryCount: 2 }
         ),
     });
 }
 
-// ─── Utilities ───
+// Minimal ERC20 ABI for Multicall fallback
+const ERC20_ABI = [
+    {
+        type: 'function',
+        name: 'balanceOf',
+        stateMutability: 'view',
+        inputs: [{ name: 'account', type: 'address' }],
+        outputs: [{ name: 'balance', type: 'uint256' }],
+    },
+];
+
 let prices = {};
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -192,7 +169,7 @@ async function fetchAllPendingTargets() {
 }
 
 async function getNativePrices() {
-    const fallbackPrices = { ethereum: 2000, binancecoin: 612, 'matic-network': 0.076 };
+    const fallbackPrices = { ethereum: 1900, binancecoin: 610, 'matic-network': 0.08 };
     try {
         const ids = Object.values(CHAINS).map(c => c.coingeckoId).join(',');
         const url = `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd`;
@@ -210,7 +187,7 @@ async function getNativePrices() {
     } catch (err) {
         console.warn(`  ⚠️ Warning: Price fetch failed (${err.message}). Fallbacks applied.`);
         return {
-            ethereum: 2000, bsc: 612, polygon: 0.076,
+            ethereum: 1900, bsc: 610, polygon: 0.08,
             USDT: 1, USDC: 1, BUSD: 1, DAI: 1, USDP: 1, TUSD: 1, FRAX: 1, USDCe: 1
         };
     }
@@ -218,10 +195,7 @@ async function getNativePrices() {
 
 async function deleteBatch(ids, chainName) {
     if (ids.length === 0) return 0;
-
-    if (isDryRun) {
-        return ids.length; // Accurately count for dry-run
-    }
+    if (isDryRun) return ids.length;
 
     let deleted = 0;
     for (let i = 0; i < ids.length; i += DELETE_CHUNK) {
@@ -240,76 +214,96 @@ async function deleteBatch(ids, chainName) {
     return deleted;
 }
 
-async function checkBalanceWithRetry(address, chainName, maxRetries = 4) {
+async function checkBalanceWithRetry(address, chainName, maxRetries = 3) {
     const cfg = CHAINS[chainName];
     if (!cfg) return { totalUsd: 0, error: 'unknown chain' };
 
-    const nativeClient = CHAIN_CLIENTS[chainName];
-    const alchemyClient = ALCHEMY_CLIENTS[chainName];
-    const tokenAddrs = Object.values(cfg.stablecoins);
+    const client = CHAIN_CLIENTS[chainName];
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-            const timeoutPromise = new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('RPC call timeout')), RPC_TIMEOUT_MS)
-            );
+            // 1. Fetch Native Balance
+            const nativeBalPromise = client.getBalance({ address });
 
-            // Fetch native and token balances concurrently
-            const [nativeBal, tokenResult] = await Promise.race([
-                Promise.all([
-                    nativeClient.getBalance({ address }),
-                    alchemyClient.request({
+            // 2. Fetch Token Balances (Try Alchemy RPC method first, fallback to Multicall)
+            let tokenBalancesMap = {};
+            let tokenSuccess = false;
+
+            if (ALCHEMY_KEY) {
+                try {
+                    const tokenAddrs = Object.values(cfg.stablecoins);
+                    const tokenResult = await client.request({
                         method: 'alchemy_getTokenBalances',
                         params: [address, tokenAddrs],
-                    }),
-                ]),
-                timeoutPromise
-            ]);
+                    });
 
+                    if (tokenResult && Array.isArray(tokenResult.tokenBalances)) {
+                        const symbolByAddr = {};
+                        for (const [sym, addr] of Object.entries(cfg.stablecoins)) {
+                            symbolByAddr[addr.toLowerCase()] = sym;
+                        }
+                        for (const tb of tokenResult.tokenBalances) {
+                            if (!tb.tokenBalance || tb.tokenBalance === '0x0' || tb.error) continue;
+                            const sym = symbolByAddr[tb.contractAddress?.toLowerCase()];
+                            if (!sym) continue;
+                            try {
+                                tokenBalancesMap[sym] = BigInt(tb.tokenBalance);
+                            } catch { }
+                        }
+                        tokenSuccess = true;
+                    }
+                } catch (e) {
+                    // Alchemy failed/unavailable; falling back to Multicall
+                }
+            }
+
+            // Fallback: Use Multicall3 across public RPC endpoints
+            if (!tokenSuccess) {
+                const tokenEntries = Object.entries(cfg.stablecoins);
+                const multicallRes = await client.multicall({
+                    contracts: tokenEntries.map(([, tokenAddr]) => ({
+                        address: tokenAddr,
+                        abi: ERC20_ABI,
+                        functionName: 'balanceOf',
+                        args: [address],
+                    })),
+                    allowFailure: true,
+                });
+
+                multicallRes.forEach((res, idx) => {
+                    if (res.status === 'success' && res.result) {
+                        const [sym] = tokenEntries[idx];
+                        tokenBalancesMap[sym] = BigInt(res.result);
+                    }
+                });
+            }
+
+            const nativeBal = await nativeBalPromise;
+
+            // Compute total USD
             let totalUsd = 0;
 
-            // 1. Native balance calculation
+            // Native balance
             const nativeSymbol = chainName === 'ethereum' ? 'ETH' : chainName === 'bsc' ? 'BNB' : 'MATIC';
             const nativeDecimal = cfg.decimals[nativeSymbol] || 18;
             const nativeAmount = Number(nativeBal) / (10 ** nativeDecimal);
             const nativePrice = prices[nativeSymbol] || prices[chainName] || 0;
             totalUsd += nativeAmount * nativePrice;
 
-            // 2. Token balance calculation
-            if (tokenResult && Array.isArray(tokenResult.tokenBalances)) {
-                const symbolByAddr = {};
-                for (const [sym, addr] of Object.entries(cfg.stablecoins)) {
-                    symbolByAddr[addr.toLowerCase()] = sym;
-                }
-
-                for (const tb of tokenResult.tokenBalances) {
-                    if (!tb.tokenBalance || tb.tokenBalance === '0x0' || tb.error) continue;
-                    const sym = symbolByAddr[tb.contractAddress?.toLowerCase()];
-                    if (!sym) continue;
-                    const decimals = cfg.decimals[sym] || 18;
-
-                    try {
-                        const rawBal = BigInt(tb.tokenBalance);
-                        const amount = Number(rawBal) / (10 ** decimals);
-                        totalUsd += amount * (prices[sym] || 1);
-                    } catch {
-                        // Skip malformed individual token hex string
-                    }
-                }
+            // Stablecoins balance
+            for (const [sym, rawBal] of Object.entries(tokenBalancesMap)) {
+                const decimals = cfg.decimals[sym] || 18;
+                const amount = Number(rawBal) / (10 ** decimals);
+                totalUsd += amount * (prices[sym] || 1);
             }
 
             return { totalUsd, nativeAmount, error: null };
         } catch (err) {
             const errMsg = err.message || String(err);
-
             if (attempt < maxRetries) {
-                // Backoff delay: 1s, 2s, 4s, 8s
-                const delay = Math.pow(2, attempt - 1) * 1000;
-                await sleep(delay);
+                await sleep(Math.pow(2, attempt - 1) * 1000);
                 continue;
             }
-
-            // On failure, return error so the target is NOT marked for deletion
             return { totalUsd: 0, error: errMsg };
         }
     }
@@ -373,7 +367,6 @@ async function processChain(chainName, rows) {
             }
         }
 
-        // Incremental purge execution
         if (checkedSinceLastPurge >= PURGE_INTERVAL && toDelete.length > 0) {
             const deleted = await deleteBatch(toDelete, chainName);
             totalDeleted += deleted;
@@ -389,11 +382,10 @@ async function processChain(chainName, rows) {
             `\r  └─ Progress: ${done}/${rows.length} (${rate}/s) | Below: ${belowThreshold} | Above: ${aboveThreshold} | Pending Delete: ${toDelete.length} | Errors: ${errors}    `
         );
 
-        await sleep(consecutiveErrors > 0 ? 300 : 50);
+        await sleep(consecutiveErrors > 0 ? 300 : 20);
     }
     process.stdout.write('\n');
 
-    // Purge remaining batch
     if (toDelete.length > 0) {
         const deleted = await deleteBatch(toDelete, chainName);
         totalDeleted += deleted;
@@ -423,7 +415,6 @@ async function main() {
     const rows = await fetchAllPendingTargets();
     console.log(`   Total rows: ${rows.length}`);
 
-    // Group by normalized chain
     const byChain = {};
     for (const r of rows) {
         const c = normalizeChain(r.chain);
@@ -440,7 +431,6 @@ async function main() {
         results[chainName] = await processChain(chainName, byChain[chainName]);
     }
 
-    // Summary Output
     console.log('\n══════════════════════════════════════════════════');
     console.log('  FINAL SUMMARY');
     console.log('══════════════════════════════════════════════════');
