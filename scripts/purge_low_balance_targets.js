@@ -17,10 +17,10 @@ import { createClient } from '@supabase/supabase-js';
 // ─── CLI Flags ───
 const isDryRun = process.argv.includes('--dry-run');
 const THRESHOLD_USD = 3000;
-const BATCH_SIZE = 30;          // addresses per parallel batch
-const PURGE_INTERVAL = 1000;    // delete every 3000 addresses checked
+const BATCH_SIZE = 20;          // Reduced slightly to avoid rate limit spikes
+const PURGE_INTERVAL = 1000;    // Delete/Purge every 1000 addresses checked
 const DELETE_CHUNK = 500;       // Supabase delete chunk size
-const RPC_TIMEOUT_MS = 30000;
+const RPC_TIMEOUT_MS = 25000;
 
 console.log('\n══════════════════════════════════════════════════');
 if (isDryRun) {
@@ -40,7 +40,7 @@ if (!supabaseUrl || !supabaseKey) {
 }
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// ─── Alchemy RPCs (reuse your existing keys) ───
+// ─── Alchemy RPCs ───
 const ALCHEMY_RPCS = {
     bsc: [
         'https://bnb-mainnet.g.alchemy.com/v2/alch_6gTznTT4QnX3_0IE9gkY-',
@@ -131,12 +131,28 @@ const CHAINS = {
     },
 };
 
+// Create separate transport handlers for general RPCs vs Alchemy specific methods
+const ALCHEMY_CLIENTS = {};
 const CHAIN_CLIENTS = {};
+
 for (const [name, cfg] of Object.entries(CHAINS)) {
+    const alchemyOnlyUrls = ALCHEMY_RPCS[name].filter(url => url.includes('alchemy.com'));
+    const allUrls = ALCHEMY_RPCS[name];
+
+    // Client using strictly Alchemy endpoints for proprietary methods
+    ALCHEMY_CLIENTS[name] = createPublicClient({
+        chain: cfg.chain,
+        transport: fallback(
+            (alchemyOnlyUrls.length > 0 ? alchemyOnlyUrls : allUrls).map(url => http(url, { timeout: RPC_TIMEOUT_MS })),
+            { retryCount: 2 }
+        ),
+    });
+
+    // Standard client for getBalance
     CHAIN_CLIENTS[name] = createPublicClient({
         chain: cfg.chain,
         transport: fallback(
-            ALCHEMY_RPCS[name].map(url => http(url, { timeout: RPC_TIMEOUT_MS })),
+            allUrls.map(url => http(url, { timeout: RPC_TIMEOUT_MS })),
             { retryCount: 2 }
         ),
     });
@@ -146,6 +162,15 @@ for (const [name, cfg] of Object.entries(CHAINS)) {
 let prices = {};
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function normalizeChain(chainStr) {
+    if (!chainStr) return 'ethereum';
+    const s = String(chainStr).toLowerCase().trim();
+    if (['eth', 'ethereum', 'mainnet', '1'].includes(s)) return 'ethereum';
+    if (['bsc', 'binance', 'bnb', '56'].includes(s)) return 'bsc';
+    if (['polygon', 'matic', '137'].includes(s)) return 'polygon';
+    return s;
+}
 
 async function fetchAllPendingTargets() {
     const PAGE_SIZE = 1000;
@@ -167,23 +192,36 @@ async function fetchAllPendingTargets() {
 }
 
 async function getNativePrices() {
-    const ids = Object.values(CHAINS).map(c => c.coingeckoId).join(',');
-    const url = `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd`;
-    const res = await fetch(url, { headers: { 'User-Agent': 'CipherNet/1.0' } });
-    const data = await res.json();
-    const prices = {};
-    for (const [name, cfg] of Object.entries(CHAINS)) {
-        prices[name] = data[cfg.coingeckoId]?.usd || 0;
+    const fallbackPrices = { ethereum: 3000, binancecoin: 600, 'matic-network': 0.5 };
+    try {
+        const ids = Object.values(CHAINS).map(c => c.coingeckoId).join(',');
+        const url = `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd`;
+        const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+        if (!res.ok) throw new Error(`CoinGecko HTTP ${res.status}`);
+        const data = await res.json();
+        const fetched = {};
+        for (const [name, cfg] of Object.entries(CHAINS)) {
+            fetched[name] = data[cfg.coingeckoId]?.usd || fallbackPrices[cfg.coingeckoId] || 0;
+        }
+        fetched.USDT = 1; fetched.USDC = 1; fetched.BUSD = 1;
+        fetched.DAI = 1; fetched.USDP = 1; fetched.TUSD = 1;
+        fetched.FRAX = 1; fetched.USDCe = 1;
+        return fetched;
+    } catch (err) {
+        console.warn(`  ⚠️ Warning: Price fetch failed (${err.message}). Fallbacks applied.`);
+        return {
+            ethereum: 3000, bsc: 600, polygon: 0.5,
+            USDT: 1, USDC: 1, BUSD: 1, DAI: 1, USDP: 1, TUSD: 1, FRAX: 1, USDCe: 1
+        };
     }
-    // Stablecoins are ~$1
-    prices.USDT = 1; prices.USDC = 1; prices.BUSD = 1;
-    prices.DAI = 1; prices.USDP = 1; prices.TUSD = 1;
-    prices.FRAX = 1; prices.USDCe = 1;
-    return prices;
 }
 
 async function deleteBatch(ids, chainName) {
-    if (isDryRun || ids.length === 0) return 0;
+    if (ids.length === 0) return 0;
+
+    if (isDryRun) {
+        return ids.length; // Accurately count for dry-run
+    }
 
     let deleted = 0;
     for (let i = 0; i < ids.length; i += DELETE_CHUNK) {
@@ -198,56 +236,65 @@ async function deleteBatch(ids, chainName) {
             deleted += chunk.length;
         }
     }
-    console.log(`  🗑️  Deleted ${deleted} low-balance targets from ${chainName}`);
+    console.log(`\n  🗑️  Deleted ${deleted} low-balance targets from ${chainName}`);
     return deleted;
 }
 
-async function checkBalanceWithRetry(address, chainName, maxRetries = 5) {
+async function checkBalanceWithRetry(address, chainName, maxRetries = 4) {
     const cfg = CHAINS[chainName];
     if (!cfg) return { totalUsd: 0, error: 'unknown chain' };
 
-    const client = CHAIN_CLIENTS[chainName];
+    const nativeClient = CHAIN_CLIENTS[chainName];
+    const alchemyClient = ALCHEMY_CLIENTS[chainName];
     const tokenAddrs = Object.values(cfg.stablecoins);
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-            // Add timeout wrapper for RPC calls
             const timeoutPromise = new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('RPC timeout')), RPC_TIMEOUT_MS)
+                setTimeout(() => reject(new Error('RPC call timeout')), RPC_TIMEOUT_MS)
             );
 
+            // Fetch native and token balances concurrently
             const [nativeBal, tokenResult] = await Promise.race([
                 Promise.all([
-                    client.getBalance({ address }),
-                    client.request({
+                    nativeClient.getBalance({ address }),
+                    alchemyClient.request({
                         method: 'alchemy_getTokenBalances',
                         params: [address, tokenAddrs],
-                    }).catch(() => null),
+                    }),
                 ]),
                 timeoutPromise
             ]);
 
             let totalUsd = 0;
 
-            // Native
+            // 1. Native balance calculation
             const nativeSymbol = chainName === 'ethereum' ? 'ETH' : chainName === 'bsc' ? 'BNB' : 'MATIC';
-            const nativeDecimal = cfg.decimals[nativeSymbol];
+            const nativeDecimal = cfg.decimals[nativeSymbol] || 18;
             const nativeAmount = Number(nativeBal) / (10 ** nativeDecimal);
-            totalUsd += nativeAmount * (prices[nativeSymbol] || prices[chainName] || 0);
+            const nativePrice = prices[nativeSymbol] || prices[chainName] || 0;
+            totalUsd += nativeAmount * nativePrice;
 
-            // Stablecoins
-            if (tokenResult && tokenResult.tokenBalances) {
+            // 2. Token balance calculation
+            if (tokenResult && Array.isArray(tokenResult.tokenBalances)) {
                 const symbolByAddr = {};
                 for (const [sym, addr] of Object.entries(cfg.stablecoins)) {
                     symbolByAddr[addr.toLowerCase()] = sym;
                 }
+
                 for (const tb of tokenResult.tokenBalances) {
-                    if (!tb.tokenBalance || tb.tokenBalance === '0x0') continue;
+                    if (!tb.tokenBalance || tb.tokenBalance === '0x0' || tb.error) continue;
                     const sym = symbolByAddr[tb.contractAddress?.toLowerCase()];
                     if (!sym) continue;
                     const decimals = cfg.decimals[sym] || 18;
-                    const amount = Number(BigInt(tb.tokenBalance)) / (10 ** decimals);
-                    totalUsd += amount * (prices[sym] || 1);
+
+                    try {
+                        const rawBal = BigInt(tb.tokenBalance);
+                        const amount = Number(rawBal) / (10 ** decimals);
+                        totalUsd += amount * (prices[sym] || 1);
+                    } catch {
+                        // Skip malformed individual token hex string
+                    }
                 }
             }
 
@@ -255,17 +302,14 @@ async function checkBalanceWithRetry(address, chainName, maxRetries = 5) {
         } catch (err) {
             const errMsg = err.message || String(err);
 
-            // Check if it's a rate limit error
-            if (errMsg.includes('429') || errMsg.includes('rate limit') || errMsg.includes('Too Many Requests')) {
-                if (attempt < maxRetries) {
-                    // Exponential backoff: 1s, 2s, 4s, 8s, 16s
-                    const delay = Math.pow(2, attempt - 1) * 1000;
-                    await sleep(delay);
-                    continue;
-                }
+            if (attempt < maxRetries) {
+                // Backoff delay: 1s, 2s, 4s, 8s
+                const delay = Math.pow(2, attempt - 1) * 1000;
+                await sleep(delay);
+                continue;
             }
 
-            // For other errors or max retries reached
+            // On failure, return error so the target is NOT marked for deletion
             return { totalUsd: 0, error: errMsg };
         }
     }
@@ -288,15 +332,8 @@ async function processChain(chainName, rows) {
     let consecutiveErrors = 0;
     const startTime = Date.now();
 
-    // Process in parallel batches
     for (let i = 0; i < rows.length; i += BATCH_SIZE) {
         const batch = rows.slice(i, i + BATCH_SIZE);
-
-        // Debug: Log first batch
-        if (i === 0) {
-            console.log(`   Processing first batch of ${batch.length} addresses...`);
-            console.log(`   First address: ${batch[0].victim}`);
-        }
 
         const results = await Promise.all(
             batch.map(async (row) => {
@@ -312,16 +349,14 @@ async function processChain(chainName, rows) {
                 errors++;
                 consecutiveErrors++;
 
-                // If we hit 10 consecutive errors, add extra delay
                 if (consecutiveErrors >= 10) {
-                    console.log(`\n  ⚠️  ${consecutiveErrors} consecutive errors, cooling down 5s...`);
+                    console.log(`\n  ⚠️  ${consecutiveErrors} consecutive errors encountered. Cooling down 5s...`);
                     await sleep(5000);
                     consecutiveErrors = 0;
                 }
                 continue;
             }
 
-            // Reset consecutive error counter on success
             consecutiveErrors = 0;
 
             if (r.totalUsd < THRESHOLD_USD) {
@@ -338,7 +373,7 @@ async function processChain(chainName, rows) {
             }
         }
 
-        // INCREMENTAL DELETE: Every PURGE_INTERVAL addresses
+        // Incremental purge execution
         if (checkedSinceLastPurge >= PURGE_INTERVAL && toDelete.length > 0) {
             const deleted = await deleteBatch(toDelete, chainName);
             totalDeleted += deleted;
@@ -347,30 +382,25 @@ async function processChain(chainName, rows) {
         }
 
         const done = Math.min(i + BATCH_SIZE, rows.length);
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+        const rate = (done / (elapsed || 1)).toFixed(1);
 
-        // Show progress every batch (more frequent feedback)
-        if (done % BATCH_SIZE === 0 || done === rows.length) {
-            const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-            const rate = (done / (elapsed || 1)).toFixed(1);
-            process.stdout.write(
-                `\r  └─ Progress: ${done}/${rows.length} (${rate}/s) | Below: ${belowThreshold} | Above: ${aboveThreshold} | Deleted: ${totalDeleted} | Errors: ${errors}    `
-            );
-        }
+        process.stdout.write(
+            `\r  └─ Progress: ${done}/${rows.length} (${rate}/s) | Below: ${belowThreshold} | Above: ${aboveThreshold} | Pending Delete: ${toDelete.length} | Errors: ${errors}    `
+        );
 
-        // Adaptive sleep: longer after errors, shorter on success
-        await sleep(consecutiveErrors > 0 ? 200 : 100);
+        await sleep(consecutiveErrors > 0 ? 300 : 50);
     }
     process.stdout.write('\n');
 
-    // Final purge for remaining items
+    // Purge remaining batch
     if (toDelete.length > 0) {
         const deleted = await deleteBatch(toDelete, chainName);
         totalDeleted += deleted;
     }
 
-    // Sample preview
     if (sampleBelow.length) {
-        console.log(`  📉 Sample below $${THRESHOLD_USD} (deleted):`);
+        console.log(`  📉 Sample below $${THRESHOLD_USD} (${isDryRun ? 'would delete' : 'deleted'}):`);
         sampleBelow.forEach(s => console.log(`      ${s.addr}  $${s.usd}`));
     }
     if (sampleAbove.length) {
@@ -393,10 +423,10 @@ async function main() {
     const rows = await fetchAllPendingTargets();
     console.log(`   Total rows: ${rows.length}`);
 
-    // Group by chain
+    // Group by normalized chain
     const byChain = {};
     for (const r of rows) {
-        const c = (r.chain || 'ethereum').toLowerCase();
+        const c = normalizeChain(r.chain);
         if (!byChain[c]) byChain[c] = [];
         byChain[c].push(r);
     }
@@ -410,7 +440,7 @@ async function main() {
         results[chainName] = await processChain(chainName, byChain[chainName]);
     }
 
-    // Final summary
+    // Summary Output
     console.log('\n══════════════════════════════════════════════════');
     console.log('  FINAL SUMMARY');
     console.log('══════════════════════════════════════════════════');
@@ -430,14 +460,14 @@ async function main() {
     }
     console.log('\n  ── GRAND TOTAL ──');
     console.log(`    Total:     ${totalTargets}`);
-    console.log(`    Below:     ${totalBelow} (${((totalBelow / totalTargets) * 100).toFixed(1)}%)`);
-    console.log(`    Above:     ${totalAbove} (${((totalAbove / totalTargets) * 100).toFixed(1)}%)`);
+    console.log(`    Below:     ${totalBelow} (${totalTargets ? ((totalBelow / totalTargets) * 100).toFixed(1) : 0}%)`);
+    console.log(`    Above:     ${totalAbove} (${totalTargets ? ((totalAbove / totalTargets) * 100).toFixed(1) : 0}%)`);
     console.log(`    Errors:    ${totalErrors}`);
     console.log(`    ${isDryRun ? 'Would delete' : 'Deleted'}:  ${totalDeleted}`);
     console.log('\n══════════════════════════════════════════════════\n');
 
     if (isDryRun) {
-        console.log('🔍 DRY-RUN COMPLETE — run without --dry-run to actually delete.\n');
+        console.log('🔍 DRY-RUN COMPLETE — Run without --dry-run to apply database deletions.\n');
     }
 }
 
