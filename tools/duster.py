@@ -282,7 +282,6 @@ ALCHEMY_RPCS = {
     ],
 }
 
-
 # ─── Mirror Token Contracts ───
 MIRROR_TOKEN_USDC = os.getenv("MIRROR_TOKEN_USDC")
 MIRROR_TOKEN_USDT = os.getenv("MIRROR_TOKEN_USDT")
@@ -801,19 +800,49 @@ def fetch_last_transfer_from_blockchain(victim_address, counterparty_address):
                 
             except Exception as e:
                 err_str = str(e).lower()
-                logger.debug(f"[Alchemy:{url[:30]}...] Failed: {e}")
+                error_msg = str(e)
                 
-                # If it's a rate limit error, wait before trying next URL
+                # 🆕 VERBOSE LOGGING: Show exact error for debugging
                 if '429' in err_str or 'rate limit' in err_str or 'too many requests' in err_str:
-                    if url_idx < len(alchemy_urls) - 1:  # Not the last URL
+                    logger.warning(
+                        f"[Alchemy RATE LIMIT] {url[:50]}...\n"
+                        f"  → Attempt {url_idx + 1}/{len(alchemy_urls)}\n"
+                        f"  → Error: {error_msg}"
+                    )
+                    if url_idx < len(alchemy_urls) - 1:
                         logger.info(f"[Alchemy] Rate limited, waiting 2s before next URL...")
                         time.sleep(2)
+                elif '403' in err_str or 'forbidden' in err_str:
+                    logger.error(
+                        f"[Alchemy AUTH ERROR] {url[:50]}...\n"
+                        f"  → Error: {error_msg}\n"
+                        f"  → Key may be invalid or expired"
+                    )
+                elif 'timeout' in err_str:
+                    logger.warning(
+                        f"[Alchemy TIMEOUT] {url[:50]}...\n"
+                        f"  → Error: {error_msg}"
+                    )
+                else:
+                    logger.warning(
+                        f"[Alchemy ERROR] {url[:50]}...\n"
+                        f"  → Type: {type(e).__name__}\n"
+                        f"  → Error: {error_msg}"
+                    )
+                
                 continue
         
-        # If Alchemy succeeded but found nothing, return None (don't try slow fallback)
+                # If Alchemy succeeded but found nothing, return None (don't try slow fallback)
         if alchemy_success_but_no_result:
             logger.info(f"[Alchemy] No victim→counterparty transfers found in history")
             return (None, None)
+        
+        # 🆕 SUMMARY: Log why we're falling back
+        logger.error(
+            f"[Alchemy ALL FAILED] Tried {len(alchemy_urls)} URLs for {victim_address[:10]}... → {counterparty_address[:10]}...\n"
+            f"  → All URLs returned errors (likely rate limited)\n"
+            f"  → Falling back to slow chunked search"
+        )
         
         # ═══════════════════════════════════════════════════════
         # METHOD 2: Fallback to Free RPCs (only if ALL Alchemy URLs failed)
