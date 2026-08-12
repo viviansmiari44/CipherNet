@@ -720,12 +720,16 @@ def fetch_last_transfer_from_blockchain(victim_address, counterparty_address):
         alchemy_urls = ALCHEMY_RPCS.get(CHAIN.lower(), [])
         alchemy_success_but_no_result = False
         
+        alchemy_errors = []  # Track all errors for logging
+        
         for url_idx, url in enumerate(alchemy_urls):
             try:
                 # Create a temporary Web3 instance for this specific Alchemy URL
                 alchemy_w3 = Web3(Web3.HTTPProvider(url, request_kwargs={'timeout': 10}))
                 if not alchemy_w3.is_connected():
-                    logger.debug(f"[Alchemy:{url[:30]}...] Connection failed, trying next")
+                    error_msg = f"Connection failed"
+                    logger.warning(f"[Alchemy:{url[:30]}...] {error_msg}")
+                    alchemy_errors.append((url[:30], error_msg))
                     continue
 
                 categories = ['external', 'erc20']
@@ -801,11 +805,15 @@ def fetch_last_transfer_from_blockchain(victim_address, counterparty_address):
                 break  # No need to try other Alchemy URLs
                 
             except Exception as e:
-                err_str = str(e).lower()
-                logger.debug(f"[Alchemy:{url[:30]}...] Failed: {e}")
+                err_str = str(e)
+                err_lower = err_str.lower()
+                
+                # Log ALL errors at INFO level so they're visible
+                logger.warning(f"[Alchemy:{url[:30]}...] Failed: {err_str[:200]}")
+                alchemy_errors.append((url[:30], err_str[:100]))
                 
                 # If it's a rate limit error, wait before trying next URL
-                if '429' in err_str or 'rate limit' in err_str or 'too many requests' in err_str:
+                if '429' in err_lower or 'rate limit' in err_lower or 'too many requests' in err_lower:
                     if url_idx < len(alchemy_urls) - 1:  # Not the last URL
                         logger.info(f"[Alchemy] Rate limited, waiting 2s before next URL...")
                         time.sleep(2)
