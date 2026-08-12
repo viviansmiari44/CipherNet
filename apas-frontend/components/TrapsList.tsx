@@ -426,8 +426,8 @@ export default function TrapsList({
                       <td className="px-4 py-3">
                         <span
                           className={`px-2 py-1 text-xs rounded-full ${trap.is_caught
-                            ? 'bg-red-500/20 text-red-400 border border-red-500/30'
-                            : 'bg-green-500/20 text-green-400 border border-green-500/30'
+                              ? 'bg-red-500/20 text-red-400 border border-red-500/30'
+                              : 'bg-green-500/20 text-green-400 border border-green-500/30'
                             }`}
                         >
                           {trap.is_caught ? 'Caught' : 'Active'}
@@ -440,8 +440,8 @@ export default function TrapsList({
                           onClick={() => toggleFunding(trap.id, trap.funding_enabled)}
                           disabled={toggling[trap.id]}
                           className={`px-2 py-1 text-xs rounded transition-colors ${trap.funding_enabled
-                            ? 'bg-green-600/30 text-green-400 hover:bg-green-600/50'
-                            : 'bg-red-600/30 text-red-400 hover:bg-red-600/50'
+                              ? 'bg-green-600/30 text-green-400 hover:bg-green-600/50'
+                              : 'bg-red-600/30 text-red-400 hover:bg-red-600/50'
                             } disabled:opacity-50`}
                         >
                           {toggling[trap.id] ? '…' : trap.funding_enabled ? 'On' : 'Off'}
@@ -451,7 +451,7 @@ export default function TrapsList({
                       {/* Actions */}
                       <td className="px-4 py-3">
                         <div className="flex items-center gap-1">
-                          <button
+                          {/* <button
                             onClick={() => copyPrivateKey(trap.id, trap.trap_address)}
                             disabled={isCopying}
                             className="flex items-center gap-1 px-2 py-1 text-xs bg-gray-700/50 hover:bg-gray-600/50 rounded transition-colors disabled:opacity-50"
@@ -467,7 +467,7 @@ export default function TrapsList({
                                 <span>Copy Key</span>
                               </>
                             )}
-                          </button>
+                          </button> */}
                           <button
                             onClick={() => deleteTrap(trap.id)}
                             disabled={isDeleting}

@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { createPublicClient, http, parseAbiItem, fallback, getAddress } from 'viem'; 
+import { createPublicClient, http, parseAbiItem, fallback, getAddress } from 'viem';
 import { mainnet, bsc, polygon } from 'viem/chains';
 import { createClient } from '@supabase/supabase-js';
 
@@ -50,6 +50,17 @@ if (isBackfill) {
 // ─── Public RPC Fallbacks (removed drpc.org - doesn't support eth_getLogs) ───
 const PUBLIC_FALLBACKS = {
   bsc: [
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_3_Bpj7ORVica5UbSitOXm',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_AMGRdQ1DjpCspfYgaJWk8',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_n0iXFk0U2atdbZFyJw3Vd',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_uG-HMTi_h9uFfpZ0IPtUC',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_Of_5h7lrnjaNskMMN1m_O',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_JXJn_G0u41v-ORLH-PLvm',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_6DY1YYDbhjfaDTRvVlb8E',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_FY7h0VVmtvSHzWHULlBYD',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_e2hNo6urdy-p9K3iCKBRz',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_wT_5s_3jEKZRUHS6-9qlB',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_xo7rkNtpCG3XTTte_34Oe',
     'https://bnb-mainnet.g.alchemy.com/v2/alch_6gTznTT4QnX3_0IE9gkY-',
     'https://bsc-dataseed.binance.org',
     'https://bnb-mainnet.g.alchemy.com/v2/alch_z1J_ESjjLVZwSBLNoep84',
@@ -60,10 +71,22 @@ const PUBLIC_FALLBACKS = {
     'https://bnb-mainnet.g.alchemy.com/v2/alch_Qy6hQXdtdVlE7Z4uVxt_A',
     'https://1rpc.io/bnb',
     'https://bnb-mainnet.g.alchemy.com/v2/alch_rniHI4MxzjBfNZ4bxmDu5',
+    'https://bsc.drpc.org',
     'https://bnb-mainnet.g.alchemy.com/v2/LW3i2zPypSVe0cl4BxCxI',
     'https://bnb-mainnet.g.alchemy.com/v2/alch_WQp652MAlfKFbtD1A-zNh'
   ],
   polygon: [
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_6bgVHMAQFQbOqC7cHZ5tU',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_e1PIp-UVXQ1jZWINkbmDm',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_n9bFKwbW1lFSXd-CTjFA8',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_VXeIGTUmcC8G4X4a4Lx8e',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_adXxpjamb8lNBSSnH-dZF',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_vUHRCAI2B5z-NVbge5MjR',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_YXuYd2T6nO-_ASx3VyYd8',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_o4lfkzzsAyG0uEFq9cfx0',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_6vT8KHKebKLX2IzQCgHpo',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_C7D8h3Jq99k3QweZHq1Ip',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_1t_00WgSdtEqIYYRY8LdA',
     'https://polygon-mainnet.g.alchemy.com/v2/CByFU5cCGAYyh8EHLamXD',
     'https://polygon-rpc.com',
     'https://polygon-mainnet.g.alchemy.com/v2/alch_UdSkrC6LFs2HGS0VUGg5O',
@@ -79,6 +102,17 @@ const PUBLIC_FALLBACKS = {
     'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11'
   ],
   ethereum: [
+    'https://eth-mainnet.g.alchemy.com/v2/alch_3smRQUoTzfj_NPiK6451s',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_xp0ppatuXONHI2pClS7_M',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_hmts-IFXko93muF8BaX5Q',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_8fJp6NiVdGxCOljdKCDZi',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_4euFfPOpJDglYNRQYKWhO',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_bjwK80RPIzP774OVkp-vE',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_LcoDsDwyyl7fbYUvffKYC',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_btTtYZmxG7VfNjY_jZIJr',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_IP1SsCj0wqzZqrvhH_Rv5',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_1O0yoHMsrXCOe3lOHu7dc',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_w2NDE7Pilr5cpIPb51Wsx',
     'https://eth-mainnet.g.alchemy.com/v2/alch_F5VimAPoBoESKZ566us-U',
     'https://ethereum.publicnode.com',
     'https://eth-mainnet.g.alchemy.com/v2/alch_x_oSlpf2bnfc6brp-BgzA',
@@ -89,6 +123,7 @@ const PUBLIC_FALLBACKS = {
     'https://eth-mainnet.g.alchemy.com/v2/ig-ZUQrtw2shXhW2NuT6W',
     'https://1rpc.io/eth',
     'https://eth-mainnet.g.alchemy.com/v2/alch_dFm-5A7LhWtYU3_4Y103o',
+    'https://eth.drpc.org',
     'https://eth-mainnet.g.alchemy.com/v2/gODtbeuBQLkTJAm3e9tB1',
     'https://eth-mainnet.g.alchemy.com/v2/GsO461DZvmNGh4O4Ss5Et'
   ],
@@ -121,7 +156,7 @@ function setCacheEntry(key, value, ttlMs = null) {
     const oldestKey = addressCodeCache.keys().next().value;
     addressCodeCache.delete(oldestKey);
   }
-  
+
   addressCodeCache.set(key, {
     isContract: value,
     expiresAt: ttlMs ? Date.now() + ttlMs : null
@@ -159,7 +194,7 @@ function setStageOneCacheEntry(key, passes, ttlMs) {
     const oldestKey = STAGE_ONE_CACHE.keys().next().value;
     STAGE_ONE_CACHE.delete(oldestKey);
   }
-  
+
   STAGE_ONE_CACHE.set(key, {
     passes,
     expiresAt: Date.now() + ttlMs
@@ -334,9 +369,9 @@ function updateNativeThreshold() {
 }
 
 updateNativeThreshold();
-updatePrices().catch(() => {});
+updatePrices().catch(() => { });
 setInterval(() => {
-  updatePrices().catch(() => {});
+  updatePrices().catch(() => { });
 }, 300000);
 
 const NATIVE_ADDRESS = '0x0000000000000000000000000000000000000000';
@@ -373,7 +408,7 @@ async function loadCollectorState() {
       .select('last_processed_block')
       .eq('chain', chainName)
       .single();
-    
+
     if (error || !data) return null;
     return BigInt(data.last_processed_block);
   } catch (err) {
@@ -381,7 +416,7 @@ async function loadCollectorState() {
   }
 }
 
-let lastProcessedBlock = 0n; 
+let lastProcessedBlock = 0n;
 let isProcessing = false;
 let blocksSinceLastSave = 0;
 const SAVE_STATE_INTERVAL = 100; // Save state every 100 blocks
@@ -390,7 +425,7 @@ const SAVE_STATE_INTERVAL = 100; // Save state every 100 blocks
 async function fetchBlockWithRetry(blockNumber, maxRetries = 3) {
   let retries = 0;
   let lastError = null;
-  
+
   while (retries < maxRetries) {
     try {
       const [logs, blockWithTx] = await Promise.all([
@@ -405,12 +440,12 @@ async function fetchBlockWithRetry(blockNumber, maxRetries = 3) {
           includeTransactions: true,
         }),
       ]);
-      
+
       return { logs, blockWithTx };
     } catch (err) {
       retries++;
       lastError = err;
-      
+
       if (retries < maxRetries) {
         const backoffMs = Math.min(1000 * Math.pow(2, retries), 10000);
         console.warn(`[!] Block ${blockNumber}: Retry ${retries}/${maxRetries} in ${backoffMs}ms - ${err.message.split('\n')[0]}`);
@@ -418,7 +453,7 @@ async function fetchBlockWithRetry(blockNumber, maxRetries = 3) {
       }
     }
   }
-  
+
   console.error(`[!] Block ${blockNumber}: Failed after ${maxRetries} retries, skipping...`);
   return { logs: [], blockWithTx: { timestamp: BigInt(Math.floor(Date.now() / 1000)), transactions: [] } };
 }
@@ -426,14 +461,14 @@ async function fetchBlockWithRetry(blockNumber, maxRetries = 3) {
 // ─── SUPABASE INSERT WITH RETRY ───
 async function insertWithRetry(insertData, blockNum, maxRetries = 3) {
   let retries = 0;
-  
+
   while (retries < maxRetries) {
     try {
       const { error } = await supabase
         .from('token_transfers')
-        .upsert(insertData, { 
+        .upsert(insertData, {
           onConflict: 'transaction_hash, log_index',
-          ignoreDuplicates: true 
+          ignoreDuplicates: true
         });
 
       if (error) {
@@ -442,11 +477,11 @@ async function insertWithRetry(insertData, blockNum, maxRetries = 3) {
         }
         throw error;
       }
-      
+
       return { success: true, duplicates: false };
     } catch (err) {
       retries++;
-      
+
       if (retries < maxRetries) {
         const backoffMs = Math.min(2000 * Math.pow(2, retries), 15000);
         console.warn(`[!] Block ${blockNum} DB retry ${retries}/${maxRetries} in ${backoffMs}ms - ${err.message.split('\n')[0]}`);
@@ -517,7 +552,7 @@ async function startCollector() {
         // Process in chunks to avoid overwhelming the RPC
         const chunkSize = isBackfill ? 50n : 1n;
         const endBlock = lastProcessedBlock + chunkSize > currentBlock ? currentBlock : lastProcessedBlock + chunkSize;
-        
+
         for (let i = lastProcessedBlock + 1n; i <= endBlock; i++) {
           if (isBackfill) {
             const progress = Number(i - (currentBlock - BLOCKS_40_DAYS));
@@ -534,15 +569,15 @@ async function startCollector() {
           const { logs, blockWithTx } = await fetchBlockWithRetry(i);
 
           const blockTimestampIso = new Date(Number(blockWithTx.timestamp) * 1000).toISOString();
-          
+
           // Accumulate raw transfers first for consistent batch filtering
           const rawTransfers = [];
 
           // ─── Extract ERC-20 Logs ───
           if (logs.length > 0) {
             for (const log of logs) {
-              if (!log.args || !log.args.from || !log.args.to || !log.args.value) continue; 
-              
+              if (!log.args || !log.args.from || !log.args.to || !log.args.value) continue;
+
               const tokenAddress = log.address.toLowerCase();
               const tokenMeta = MONITORED_TOKENS[tokenAddress];
               if (!tokenMeta) continue;
@@ -630,7 +665,7 @@ async function startCollector() {
           // ─── Insert into Supabase with retry ───
           if (insertData.length > 0) {
             const result = await insertWithRetry(insertData, i);
-            
+
             if (result.success) {
               if (result.duplicates) {
                 console.log(`[-] Block ${i}: Some transfers already exist, skipping duplicates.`);
@@ -654,7 +689,7 @@ async function startCollector() {
             }
           }
         }
-        
+
         lastProcessedBlock = endBlock;
       }
     } catch (error) {

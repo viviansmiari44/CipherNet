@@ -16,9 +16,9 @@ import { createClient } from '@supabase/supabase-js';
 
 // ─── CLI Flags ───
 const isDryRun = process.argv.includes('--dry-run');
-const THRESHOLD_USD = 2500;
-const BATCH_SIZE = 15;          // addresses per parallel batch
-const PURGE_INTERVAL = 500;    // delete every 3000 addresses checked
+const THRESHOLD_USD = 3000;
+const BATCH_SIZE = 30;          // addresses per parallel batch
+const PURGE_INTERVAL = 1000;    // delete every 3000 addresses checked
 const DELETE_CHUNK = 500;       // Supabase delete chunk size
 const RPC_TIMEOUT_MS = 30000;
 
