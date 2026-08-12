@@ -31,6 +31,8 @@ export async function POST(
     }
 
     // Build query based on filter
+    console.log(`[dust-filter] Building query for campaign ${id}, filter: ${filter}, batchId: ${batchId}`);
+
     let query = supabase
         .from('traps')
         .select('id')
@@ -41,7 +43,7 @@ export async function POST(
     } else if (filter === 'batch' && batchId) {
         query = query.eq('generation_batch_id', batchId);
     }
-    // 'all' = no additional filter (dust everything)
+    // 'all' = no additional filter
 
     const { data: traps, error: trapsError } = await query;
 
@@ -49,6 +51,8 @@ export async function POST(
         console.error('[dust-filter] Traps query error:', trapsError);
         return NextResponse.json({ error: trapsError.message }, { status: 500 });
     }
+
+    console.log(`[dust-filter] Found ${traps?.length || 0} traps matching filter`);
 
     if (!traps || traps.length === 0) {
         return NextResponse.json(
