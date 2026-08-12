@@ -1,0 +1,14 @@
+{
+    "builds": [
+        {
+            "src": "apas-frontend/package.json",
+            "use": "@vercel/next"
+        }
+    ],
+    "routes": [
+        {
+            "src": "/(.*)",
+            "dest": "apas-frontend/$1"
+        }
+    ]
+}
