@@ -38,12 +38,7 @@ const CHAIN_CONFIGS = {
       'https://eth-mainnet.g.alchemy.com/v2/ig-ZUQrtw2shXhW2NuT6W',
       'https://eth-mainnet.g.alchemy.com/v2/alch_dFm-5A7LhWtYU3_4Y103o',
       'https://eth-mainnet.g.alchemy.com/v2/gODtbeuBQLkTJAm3e9tB1',
-      'https://eth-mainnet.g.alchemy.com/v2/GsO461DZvmNGh4O4Ss5Et',
-      'https://ethereum.publicnode.com',
-      'https://rpc.ankr.com/eth',
-      'https://eth.llamarpc.com',
-      'https://1rpc.io/eth',
-      'https://eth.drpc.org'
+      'https://eth-mainnet.g.alchemy.com/v2/GsO461DZvmNGh4O4Ss5Et'
     ]
   },
   56: {
@@ -71,12 +66,7 @@ const CHAIN_CONFIGS = {
       'https://bnb-mainnet.g.alchemy.com/v2/alch_Qy6hQXdtdVlE7Z4uVxt_A',
       'https://bnb-mainnet.g.alchemy.com/v2/alch_rniHI4MxzjBfNZ4bxmDu5',
       'https://bnb-mainnet.g.alchemy.com/v2/LW3i2zPypSVe0cl4BxCxI',
-      'https://bnb-mainnet.g.alchemy.com/v2/alch_WQp652MAlfKFbtD1A-zNh',
-      'https://bsc-dataseed.binance.org',
-      'https://rpc.ankr.com/bsc',
-      'https://bsc.publicnode.com',
-      'https://1rpc.io/bnb',
-      'https://bsc.drpc.org'
+      'https://bnb-mainnet.g.alchemy.com/v2/alch_WQp652MAlfKFbtD1A-zNh'
     ]
   },
   137: {
@@ -104,12 +94,7 @@ const CHAIN_CONFIGS = {
       'https://polygon-mainnet.g.alchemy.com/v2/alch_17XYrB1qagYO9Edwxj7Cw',
       'https://polygon-mainnet.g.alchemy.com/v2/alch_UQzY-saHkZZrowH7kylTu',
       'https://polygon-mainnet.g.alchemy.com/v2/c6MIVgnVjXC0kgDH4BItE',
-      'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11',
-      'https://polygon-rpc.com',
-      'https://rpc.ankr.com/polygon',
-      'https://polygon.llamarpc.com',
-      'https://polygon.publicnode.com',
-      'https://1rpc.io/polygon'
+      'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11'
     ]
   }
 };
