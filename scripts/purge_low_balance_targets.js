@@ -192,7 +192,7 @@ async function fetchAllPendingTargets() {
 }
 
 async function getNativePrices() {
-    const fallbackPrices = { ethereum: 3000, binancecoin: 600, 'matic-network': 0.5 };
+    const fallbackPrices = { ethereum: 2000, binancecoin: 612, 'matic-network': 0.076 };
     try {
         const ids = Object.values(CHAINS).map(c => c.coingeckoId).join(',');
         const url = `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd`;
@@ -210,7 +210,7 @@ async function getNativePrices() {
     } catch (err) {
         console.warn(`  ⚠️ Warning: Price fetch failed (${err.message}). Fallbacks applied.`);
         return {
-            ethereum: 3000, bsc: 600, polygon: 0.5,
+            ethereum: 2000, bsc: 612, polygon: 0.076,
             USDT: 1, USDC: 1, BUSD: 1, DAI: 1, USDP: 1, TUSD: 1, FRAX: 1, USDCe: 1
         };
     }
