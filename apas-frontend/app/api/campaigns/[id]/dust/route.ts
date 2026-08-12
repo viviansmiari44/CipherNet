@@ -62,11 +62,8 @@ export async function POST(
         .from('jobs')
         .insert({
             campaign_id: id,
-            user_id: user.id,
             type: 'dust',
             status: 'pending',
-            total: traps.length,
-            progress: 0,
         })
         .select()
         .single();
