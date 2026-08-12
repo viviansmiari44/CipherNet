@@ -102,7 +102,7 @@ const CHAIN_CONFIGS = {
 // ─── Performance Settings ───
 const PAGE_SIZE = 100;              // Records fetched per page
 const RPC_CONCURRENCY = 5;          // Parallel Alchemy queries
-const RATE_LIMIT_DELAY = 1000;      // Delay between batches (ms)
+const RATE_LIMIT_DELAY = 3000;      // Delay between batches (ms)
 
 let rateLimitCount = 0;
 let lastRateLimitTime = 0;
