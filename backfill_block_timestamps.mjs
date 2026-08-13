@@ -243,17 +243,38 @@ async function processTable(tableName, chainId, chainName, client) {
   const fromCol = tableName === 'pending_targets' ? 'victim' : 'victim_address';
   const toCol = tableName === 'pending_targets' ? 'counterparty' : 'counterparty_address';
 
-  // 🆕 FIX: Both tables use 'chain' (text name like 'ethereum'), not chain_id
-  const chainCol = 'chain';
-  const chainValue = chainName;  // 'ethereum', 'bsc', 'polygon'
+  // 🆕 For traps table, we need to first get campaign_ids for this chain
+  let campaignIds = null;
+  if (tableName === 'traps') {
+    const { data: campaigns, error: campError } = await supabaseAdmin
+      .from('campaigns')
+      .select('id')
+      .eq('chain', chainName);
+
+    if (campError || !campaigns || campaigns.length === 0) {
+      console.log(`[Done] No campaigns found for chain ${chainName}, skipping traps.`);
+      return;
+    }
+    campaignIds = campaigns.map(c => c.id);
+    console.log(`[Info] Found ${campaignIds.length} campaigns for ${chainName}`);
+  }
 
   while (true) {
-    const { data: records, error } = await supabaseAdmin
+    let query = supabaseAdmin
       .from(tableName)
       .select(`id, ${fromCol}, ${toCol}`)
-      .eq(chainCol, chainValue)
       .is('last_transfer_date', null)
       .limit(PAGE_SIZE);
+
+    // Apply correct filter based on table
+    if (tableName === 'pending_targets') {
+      query = query.eq('chain', chainName);
+    } else {
+      // traps table: filter by campaign_ids
+      query = query.in('campaign_id', campaignIds);
+    }
+
+    const { data: records, error } = await query;
 
     if (error) {
       console.error(`[Error] Failed to fetch ${tableName}: ${error.message}`);
@@ -312,7 +333,6 @@ async function processTable(tableName, chainId, chainName, client) {
           }
         } else {
           totalErrors++;
-          // Only log first 5 errors per page to reduce noise
           if (totalErrors <= 5) {
             console.warn(`[Error] Failed for ${record.id}: ${result.error}`);
           }
