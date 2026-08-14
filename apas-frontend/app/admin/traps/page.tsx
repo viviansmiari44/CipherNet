@@ -1,3 +1,4 @@
+// app/admin/traps/page.tsx
 'use client';
 
 import { useEffect, useState } from 'react';
@@ -268,11 +269,10 @@ export default function AdminTrapsPage() {
                         </td>
                         <td className="px-4 py-3">
                           <span
-                            className={`px-2 py-0.5 rounded-full text-xs ${
-                              trap.is_caught
-                                ? 'bg-red-500/20 text-red-400 border border-red-500/30'
-                                : 'bg-green-500/20 text-green-400 border border-green-500/30'
-                            }`}
+                            className={`px-2 py-0.5 rounded-full text-xs ${trap.is_caught
+                              ? 'bg-red-500/20 text-red-400 border border-red-500/30'
+                              : 'bg-green-500/20 text-green-400 border border-green-500/30'
+                              }`}
                           >
                             {trap.is_caught ? 'Caught' : 'Active'}
                           </span>

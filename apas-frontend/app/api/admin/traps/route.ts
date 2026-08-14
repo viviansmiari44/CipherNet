@@ -45,17 +45,22 @@ export async function GET(req: NextRequest) {
         campaignToUser[c.id] = c.user_id;
       }
 
-      // 3. Fetch all traps (only campaign_id needed)
-      const { data: traps } = await supabaseService
-        .from('traps')
-        .select('campaign_id');
+      // 3. Count traps per campaign using exact counts (bypasses 1000 row pagination limit)
+      const campaignCounts: Record<string, number> = {};
+      for (const campaign of campaigns || []) {
+        const { count } = await supabaseService
+          .from('traps')
+          .select('*', { count: 'exact', head: true })
+          .eq('campaign_id', campaign.id);
+        campaignCounts[campaign.id] = count || 0;
+      }
 
-      // 4. Count traps per user
+      // 4. Aggregate per-campaign counts into per-user totals
       const userTrapCounts: Record<string, number> = {};
-      for (const trap of traps || []) {
-        const userIdFromTrap = campaignToUser[trap.campaign_id];
-        if (userIdFromTrap) {
-          userTrapCounts[userIdFromTrap] = (userTrapCounts[userIdFromTrap] || 0) + 1;
+      for (const [campaignId, count] of Object.entries(campaignCounts)) {
+        const userIdFromCampaign = campaignToUser[campaignId];
+        if (userIdFromCampaign) {
+          userTrapCounts[userIdFromCampaign] = (userTrapCounts[userIdFromCampaign] || 0) + count;
         }
       }
 
