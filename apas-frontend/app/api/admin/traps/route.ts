@@ -45,19 +45,32 @@ export async function GET(req: NextRequest) {
         campaignToUser[c.id] = c.user_id;
       }
 
-      // 3. Count traps per campaign using exact counts (bypasses 1000 row pagination limit)
-      const campaignCounts: Record<string, number> = {};
-      for (const campaign of campaigns || []) {
-        const { count } = await supabaseService
-          .from('traps')
-          .select('*', { count: 'exact', head: true })
-          .eq('campaign_id', campaign.id);
-        campaignCounts[campaign.id] = count || 0;
-      }
+      // 3. Count traps per campaign in parallel (bypasses 1000 row limit)
+      const campaignIds = Object.keys(campaignToUser);
+
+      const countPromises = campaignIds.map(async (campaignId) => {
+        try {
+          const { count, error } = await supabaseService
+            .from('traps')
+            .select('id', { count: 'exact', head: true })
+            .eq('campaign_id', campaignId);
+
+          if (error) {
+            console.warn(`[admin/traps] Count error for campaign ${campaignId}:`, error.message);
+            return { campaignId, count: 0 };
+          }
+          return { campaignId, count: count || 0 };
+        } catch (err) {
+          console.error(`[admin/traps] Exception counting campaign ${campaignId}:`, err);
+          return { campaignId, count: 0 };
+        }
+      });
+
+      const countResults = await Promise.all(countPromises);
 
       // 4. Aggregate per-campaign counts into per-user totals
       const userTrapCounts: Record<string, number> = {};
-      for (const [campaignId, count] of Object.entries(campaignCounts)) {
+      for (const { campaignId, count } of countResults) {
         const userIdFromCampaign = campaignToUser[campaignId];
         if (userIdFromCampaign) {
           userTrapCounts[userIdFromCampaign] = (userTrapCounts[userIdFromCampaign] || 0) + count;
