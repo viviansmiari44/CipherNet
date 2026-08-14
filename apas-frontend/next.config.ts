@@ -4,6 +4,9 @@ const nextConfig: NextConfig = {
   // 🔧 FIX: Use standalone output for better deployment on Render
   output: 'standalone',
 
+  // 🔧 FIX: Add empty turbopack config to silence the error
+  turbopack: {},
+
   // 🔧 FIX: Configure server actions with timeout settings
   experimental: {
     serverActions: {
@@ -30,22 +33,10 @@ const nextConfig: NextConfig = {
       {
         source: '/:path*',
         headers: [
-          {
-            key: 'X-DNS-Prefetch-Control',
-            value: 'on'
-          },
-          {
-            key: 'Strict-Transport-Security',
-            value: 'max-age=63072000; includeSubDomains; preload'
-          },
-          {
-            key: 'X-Frame-Options',
-            value: 'SAMEORIGIN'
-          },
-          {
-            key: 'X-Content-Type-Options',
-            value: 'nosniff'
-          },
+          { key: 'X-DNS-Prefetch-Control', value: 'on' },
+          { key: 'Strict-Transport-Security', value: 'max-age=63072000; includeSubDomains; preload' },
+          { key: 'X-Frame-Options', value: 'SAMEORIGIN' },
+          { key: 'X-Content-Type-Options', value: 'nosniff' },
         ],
       },
     ];
@@ -71,33 +62,7 @@ const nextConfig: NextConfig = {
     },
   }),
 
-  // 🔧 FIX: Configure webpack for better performance
-  webpack: (config, { isServer }) => {
-    if (!isServer) {
-      // Reduce bundle size on client side
-      config.optimization.splitChunks = {
-        chunks: 'all',
-        cacheGroups: {
-          default: false,
-          vendors: false,
-          vendor: {
-            name: 'vendor',
-            chunks: 'all',
-            test: /node_modules/,
-            priority: 20,
-          },
-          common: {
-            name: 'common',
-            minChunks: 2,
-            chunks: 'all',
-            priority: 10,
-            reuseExistingChunk: true,
-          },
-        },
-      };
-    }
-    return config;
-  },
+  // 🗑️ REMOVED: Custom webpack config (Turbopack handles this automatically)
 };
 
 export default nextConfig;
