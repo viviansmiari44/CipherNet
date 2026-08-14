@@ -1,3 +1,5 @@
+// app/dashboard/[id]/page.tsx
+
 import { createServerSupabaseClient } from '@app-lib/supabaseServer';
 import TrapsList from '@/components/TrapsList';
 import JobButtons from '@/components/JobButtons';

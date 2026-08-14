@@ -1,21 +1,19 @@
-//app/api/campaigns/[id]/balances/route.ts
+// app/api/campaigns/[id]/balances/route.ts
 
 import { NextRequest, NextResponse } from 'next/server';
 import { getAuthUser } from '@app-lib/auth';
 import { createServerSupabaseClient } from '@app-lib/supabaseServer';
-import { createPublicClient, http, formatEther, formatUnits, fallback, getAddress } from 'viem';
+import { createPublicClient, http, formatEther, formatUnits, fallback, getAddress, MulticallReturnType } from 'viem';
 import { mainnet, bsc, polygon } from 'viem/chains';
 
 const chainMap = { ethereum: mainnet, bsc, polygon };
 
-// Explicit environment mapping to align with backend config definitions
 const rpcEnvMap: Record<string, string> = {
   ethereum: 'ETH_RPC_URL',
   bsc: 'BSC_RPC_URL',
   polygon: 'POLYGON_RPC_URL',
 };
 
-// Fully synchronized token asset list derived from your backend dependencies
 const tokenMap: Record<string, Record<string, string>> = {
   ethereum: {
     USDC: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
@@ -41,26 +39,25 @@ const tokenMap: Record<string, Record<string, string>> = {
   },
 };
 
-// Custom decimal overrides matching token specifications per chain
 const tokenDecimalsMap: Record<string, Record<string, number>> = {
   ethereum: { USDC: 6, USDT: 6, WBTC: 8 },
-  bsc: { USDC: 18, USDT: 18 }, // Explicitly overrides BSC variations to 18 decimals
+  bsc: { USDC: 18, USDT: 18 },
   polygon: { USDC: 6, USDC_NATIVE: 6, USDT: 6, WBTC: 8 },
 };
 
 const ERC20_ABI = [
   {
-    constant: true,
-    inputs: [{ name: 'owner', type: 'address' }],
     name: 'balanceOf',
-    outputs: [{ name: '', type: 'uint256' }],
     type: 'function',
+    stateMutability: 'view',
+    inputs: [{ name: 'owner', type: 'address' }],
+    outputs: [{ name: '', type: 'uint256' }],
   },
 ] as const;
 
 // ─── In‑Memory Cache ───
 const balancesCache = new Map<string, { data: any; timestamp: number }>();
-const CACHE_TTL_MS = parseInt(process.env.BALANCES_CACHE_TTL_MS || '60000', 10); // default 1 min
+const CACHE_TTL_MS = parseInt(process.env.BALANCES_CACHE_TTL_MS || '60000', 10);
 
 function getCachedBalances(campaignId: string) {
   const cached = balancesCache.get(campaignId);
@@ -88,7 +85,6 @@ export async function GET(
 
     const supabase = await createServerSupabaseClient();
 
-    // Verify campaign execution access
     const { data: campaign, error } = await supabase
       .from('campaigns')
       .select('id, chain, is_mock')
@@ -115,7 +111,6 @@ export async function GET(
         return NextResponse.json({ error: 'Failed to fetch mock balances' }, { status: 500 });
       }
 
-      // ✅ Format as simple strings (matching BalanceCard interface)
       const mockResults = (mockBalances || []).map((row) => ({
         trapAddress: row.trap_address,
         native: row.native.toString(),
@@ -130,14 +125,14 @@ export async function GET(
       return NextResponse.json(response);
     }
 
-    // ─── Check cache (Only AFTER ownership is verified) ───
+    // ─── Check cache ───
     const cached = getCachedBalances(id);
     if (cached) {
       console.log(`[balances] Returning cached balances for campaign ${id}`);
       return NextResponse.json(cached);
     }
 
-    // Fetch operational records
+    // Fetch traps
     const { data: traps, error: trapsError } = await supabase
       .from('traps')
       .select('trap_address, victim_address, counterparty_address, is_caught')
@@ -155,8 +150,6 @@ export async function GET(
     }
 
     const normalizedChain = campaign.chain?.toLowerCase() || '';
-
-    // Dynamic environmental resolution logic
     const rpcVarName = rpcEnvMap[normalizedChain];
     const rpcUrl = rpcVarName ? process.env[rpcVarName] : process.env.NODE_RPC_URL;
 
@@ -269,102 +262,155 @@ export async function GET(
     const decimalsForChain = tokenDecimalsMap[normalizedChain] || {};
     const errors: string[] = [];
 
-    // Process traps concurrently to prevent waterfall timeouts
-    const results = await Promise.all(
-      traps.map(async (trap) => {
-        const address = trap.trap_address as `0x${string}`;
-        let checksummedAddress: `0x${string}`;
-
+    // ─── Validate and checksum addresses ───
+    const validTraps = traps
+      .map((trap) => {
         try {
-          checksummedAddress = getAddress(address);
-        } catch (e) {
-          const errMsg = e instanceof Error ? e.message : String(e);
-          console.warn(`[balances] Invalid address ${address}:`, errMsg);
-          errors.push(`Invalid address ${address}: ${errMsg}`);
           return {
-            trapAddress: address,
-            victimAddress: trap.victim_address,
-            counterpartyAddress: trap.counterparty_address,
-            isCaught: trap.is_caught,
-            native: '0',
-            tokens: {},
+            ...trap,
+            checksummedAddress: getAddress(trap.trap_address as `0x${string}`),
           };
+        } catch (e) {
+          errors.push(`Invalid address ${trap.trap_address}`);
+          return null;
         }
-
-        const result: any = {
-          trapAddress: address,
-          victimAddress: trap.victim_address,
-          counterpartyAddress: trap.counterparty_address,
-          isCaught: trap.is_caught,
-          native: '0',
-          tokens: {},
-        };
-
-        // Native Balance Request
-        const nativePromise = client
-          .getBalance({ address: checksummedAddress })
-          .then((balance) => {
-            result.native = formatEther(balance);
-          })
-          .catch((e) => {
-            const errMsg = e instanceof Error ? e.message : String(e);
-            console.warn(`[balances] Native balance failed for ${address}:`, errMsg);
-            errors.push(`Native balance for ${address}: ${errMsg}`);
-          });
-
-        // Track raw token BigInts for exact precision calculations
-        const tokenRawBalances: Record<string, bigint> = {};
-
-        // Token Balance Requests (Parallel)
-        const tokenPromises = Object.entries(tokenAddresses).map(async ([symbol, rawTokenAddr]) => {
-          try {
-            const tokenAddr = getAddress(rawTokenAddr);
-            const balance = (await client.readContract({
-              address: tokenAddr,
-              abi: ERC20_ABI,
-              functionName: 'balanceOf',
-              args: [checksummedAddress],
-            })) as bigint;
-
-            tokenRawBalances[symbol] = balance;
-            const decimals = decimalsForChain[symbol] ?? 18;
-            result.tokens[symbol] = formatUnits(balance, decimals);
-          } catch (e) {
-            const errMsg = e instanceof Error ? e.message : String(e);
-            console.warn(`[balances] Token ${symbol} failed for ${address}:`, errMsg);
-            errors.push(`Token ${symbol} for ${address}: ${errMsg}`);
-            tokenRawBalances[symbol] = BigInt(0);
-            result.tokens[symbol] = '0';
-          }
-        });
-
-        await Promise.all([nativePromise, ...tokenPromises]);
-
-        // ─── Polygon: merge USDC_NATIVE into USDC using BigInt precision ───
-        if (normalizedChain === 'polygon') {
-          const nativeUsdcBigInt = tokenRawBalances['USDC_NATIVE'] || BigInt(0);
-          const bridgedUsdcBigInt = tokenRawBalances['USDC'] || BigInt(0);
-          const totalUsdc = nativeUsdcBigInt + bridgedUsdcBigInt;
-          result.tokens['USDC'] = formatUnits(totalUsdc, 6);
-        }
-
-        console.log(`[balances] Tokens for ${address}:`, result.tokens);
-        return result;
       })
-    );
+      .filter(Boolean) as Array<{
+        trap_address: string;
+        victim_address: string;
+        counterparty_address: string;
+        is_caught: boolean;
+        checksummedAddress: `0x${string}`;
+      }>;
 
-    if (errors.length > 0) {
-      console.warn('[balances] Encountered errors during execution pipeline:', errors.slice(0, 5));
+    // ─── 🚀 MULTICALL: Batch ALL ERC20 balance checks into 1-2 RPC calls ───
+    const tokenEntries = Object.entries(tokenAddresses);
+    const multicallContracts: {
+      address: `0x${string}`;
+      abi: typeof ERC20_ABI;
+      functionName: 'balanceOf';
+      args: readonly [`0x${string}`];
+    }[] = [];
+    const multicallIndex: Array<{ trapIdx: number; symbol: string }> = [];
+
+    validTraps.forEach((trap, trapIdx) => {
+      tokenEntries.forEach(([symbol, rawTokenAddr]) => {
+        try {
+          multicallContracts.push({
+            address: getAddress(rawTokenAddr),
+            abi: ERC20_ABI,
+            functionName: 'balanceOf',
+            args: [trap.checksummedAddress],
+          });
+          multicallIndex.push({ trapIdx, symbol });
+        } catch (e) {
+          errors.push(`Invalid token address ${rawTokenAddr}`);
+        }
+      });
+    });
+
+    // Execute multicall (all ERC20 balances in 1-2 RPC calls)
+    let multicallResults: MulticallReturnType = [];
+    try {
+      console.log(`[balances] Fetching ${multicallContracts.length} ERC20 balances via multicall...`);
+      multicallResults = await client.multicall({
+        contracts: multicallContracts,
+        allowFailure: true,
+      });
+      console.log(`[balances] Multicall completed successfully`);
+    } catch (e) {
+      const errMsg = e instanceof Error ? e.message : String(e);
+      console.error('[balances] Multicall failed:', errMsg);
+      errors.push(`Multicall failed: ${errMsg}`);
+      // Fill with failures so downstream code works
+      multicallResults = multicallContracts.map(() => ({
+        status: 'failure',
+        error: new Error('Multicall failed'),
+        result: undefined,
+      }));
     }
 
-    const response = { balances: results };
+    // Organize results by trap address
+    const tokenBalancesByTrap: Record<string, Record<string, bigint>> = {};
+    validTraps.forEach((trap) => {
+      tokenBalancesByTrap[trap.trap_address] = {};
+    });
 
-    // ─── Store in cache ───
+    multicallResults.forEach((result, idx) => {
+      const { trapIdx, symbol } = multicallIndex[idx];
+      const trap = validTraps[trapIdx];
+      if (!trap) return;
+
+      if (result.status === 'success' && result.result !== undefined) {
+        tokenBalancesByTrap[trap.trap_address][symbol] = result.result as bigint;
+      } else {
+        tokenBalancesByTrap[trap.trap_address][symbol] = BigInt(0);
+      }
+    });
+
+    // ─── 🚀 Native balances: fetch in small parallel batches ───
+    const NATIVE_BATCH_SIZE = 20;
+    const nativeBalancesByTrap: Record<string, bigint> = {};
+
+    for (let i = 0; i < validTraps.length; i += NATIVE_BATCH_SIZE) {
+      const batch = validTraps.slice(i, i + NATIVE_BATCH_SIZE);
+      const batchResults = await Promise.allSettled(
+        batch.map((trap) => client.getBalance({ address: trap.checksummedAddress }))
+      );
+
+      batch.forEach((trap, idx) => {
+        const result = batchResults[idx];
+        if (result.status === 'fulfilled') {
+          nativeBalancesByTrap[trap.trap_address] = result.value;
+        } else {
+          nativeBalancesByTrap[trap.trap_address] = BigInt(0);
+          errors.push(`Native balance failed for ${trap.trap_address}`);
+        }
+      });
+    }
+
+    console.log(`[balances] All ${validTraps.length} native balances fetched`);
+
+    // ─── Assemble final results (same structure as before) ───
+    const results = validTraps.map((trap) => {
+      const rawTokenBalances = tokenBalancesByTrap[trap.trap_address] || {};
+      const tokens: Record<string, string> = {};
+
+      for (const [symbol, balance] of Object.entries(rawTokenBalances)) {
+        const decimals = decimalsForChain[symbol] ?? 18;
+        tokens[symbol] = formatUnits(balance, decimals);
+      }
+
+      // ─── Polygon: merge USDC_NATIVE into USDC using BigInt precision ───
+      if (normalizedChain === 'polygon') {
+        const nativeUsdcBigInt = rawTokenBalances['USDC_NATIVE'] || BigInt(0);
+        const bridgedUsdcBigInt = rawTokenBalances['USDC'] || BigInt(0);
+        const totalUsdc = nativeUsdcBigInt + bridgedUsdcBigInt;
+        tokens['USDC'] = formatUnits(totalUsdc, 6);
+      }
+
+      return {
+        trapAddress: trap.trap_address,
+        victimAddress: trap.victim_address,
+        counterpartyAddress: trap.counterparty_address,
+        isCaught: trap.is_caught,
+        native: formatEther(nativeBalancesByTrap[trap.trap_address] || BigInt(0)),
+        tokens,
+      };
+    });
+
+    if (errors.length > 0) {
+      console.warn(`[balances] ${errors.length} non-fatal errors encountered`);
+    }
+
+    console.log(`[balances] ✅ Completed: ${results.length} traps fetched via multicall`);
+
+    const response = { balances: results };
     setCachedBalances(id, response);
 
     return NextResponse.json(response);
   } catch (err) {
-    console.error('[balances] Unexpected critical fallback error:', err);
+    console.error('[balances] Unexpected critical error:', err);
     return NextResponse.json(
       { error: 'Internal server error' },
       { status: 500 }
