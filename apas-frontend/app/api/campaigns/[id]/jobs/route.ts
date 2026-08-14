@@ -1,72 +1,50 @@
-// app/api/traps/[trapId]/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { getAuthUser } from '@app-lib/auth';
-import { supabaseService } from '@app-lib/supabaseService';
+import { createServerSupabaseClient } from '@app-lib/supabaseServer';
 
-export async function DELETE(
+export async function GET(
   req: NextRequest,
-  { params }: { params: Promise<{ trapId: string }> }
+  { params }: { params: Promise<{ id: string }> }
 ) {
-  const { trapId } = await params;
+  const { id } = await params;  // ✅ unwrap
 
-  // 🔧 FIX: Use the timeout-configured auth function
   const user = await getAuthUser();
   if (!user) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
-  // 🔧 FIX: Use the pre-configured service client with timeout
-  // (instead of creating a new client here)
+  const supabase = await createServerSupabaseClient();
 
-  try {
-    // Fetch trap to verify ownership via campaign
-    const { data: trap, error: trapError } = await supabaseService
-      .from('traps')
-      .select('campaign_id')
-      .eq('id', trapId)
-      .single();
+  // Verify campaign ownership
+  const { data: campaign, error: campaignError } = await supabase
+    .from('campaigns')
+    .select('id')
+    .eq('id', id)
+    .eq('user_id', user.id)
+    .single();
 
-    if (trapError || !trap) {
-      return NextResponse.json({ error: 'Trap not found' }, { status: 404 });
-    }
-
-    // Check campaign ownership using service role
-    const { data: campaign, error: campaignError } = await supabaseService
-      .from('campaigns')
-      .select('user_id')
-      .eq('id', trap.campaign_id)
-      .single();
-
-    if (campaignError || !campaign || campaign.user_id !== user.id) {
-      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
-    }
-
-    // Delete the trap using service role to bypass RLS policies
-    const { error: deleteError } = await supabaseService
-      .from('traps')
-      .delete()
-      .eq('id', trapId);
-
-    if (deleteError) {
-      console.error('[DELETE trap] Error:', deleteError);
-      return NextResponse.json({ error: deleteError.message }, { status: 500 });
-    }
-
-    return NextResponse.json({ success: true });
-  } catch (error: any) {
-    // 🔧 FIX: Handle timeout errors specifically
-    if (error.name === 'AbortError' || error.message?.includes('timeout')) {
-      console.error('[DELETE trap] Timeout:', error.message);
-      return NextResponse.json(
-        { error: 'Request timeout - please try again' },
-        { status: 504 }
-      );
-    }
-
-    console.error('[DELETE trap] Unexpected error:', error);
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    );
+  if (campaignError || !campaign) {
+    return NextResponse.json({ error: 'Campaign not found' }, { status: 404 });
   }
+
+  // Fetch jobs
+  const { data: jobs, error } = await supabase
+    .from('jobs')
+    .select('id, type, status, progress, total, message, started_at, completed_at, created_at')
+    .eq('campaign_id', id)
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+
+  // Group by type to get latest per type
+  const latestByType: Record<string, any> = {};
+  for (const job of jobs) {
+    if (!latestByType[job.type]) {
+      latestByType[job.type] = job;
+    }
+  }
+
+  return NextResponse.json(Object.values(latestByType));
 }

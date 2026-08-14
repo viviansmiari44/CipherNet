@@ -1,3 +1,5 @@
+//app/api/campaigns/[id]/balances/route.ts
+
 import { NextRequest, NextResponse } from 'next/server';
 import { getAuthUser } from '@app-lib/auth';
 import { createServerSupabaseClient } from '@app-lib/supabaseServer';
