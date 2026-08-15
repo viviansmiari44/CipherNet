@@ -173,10 +173,26 @@ app.post('/webhook/job', async (req, res) => {
     case 'dust':
       scriptPath = path.join(projectRoot, 'tools', 'duster.py');
       args = ['--job-id', jobId];
-      // 🆕 Pass filtered trap IDs if provided
+      // 🆕 Pass filtered trap IDs if provided, with safety limit
       if (req.body.trapIds) {
-        env.TRAP_IDS = req.body.trapIds;
-        console.log(`[webhook] Dust job filtered — trap IDs received (${req.body.trapIds.split(',').length} traps)`);
+        let trapIdsArray = req.body.trapIds.split(',');
+        const totalTraps = trapIdsArray.length;
+
+        // Apply quantity limit if provided
+        if (req.body.quantity && req.body.quantity > 0 && trapIdsArray.length > req.body.quantity) {
+          trapIdsArray = trapIdsArray.slice(0, req.body.quantity);
+          console.log(`[webhook] Dust job limited to ${req.body.quantity} traps (from ${totalTraps})`);
+        }
+
+        // Safety limit to prevent E2BIG error (max 500 IDs)
+        const MAX_TRAP_IDS = 500;
+        if (trapIdsArray.length > MAX_TRAP_IDS) {
+          console.warn(`[webhook] Too many trap IDs (${trapIdsArray.length}), limiting to ${MAX_TRAP_IDS} to prevent E2BIG`);
+          trapIdsArray = trapIdsArray.slice(0, MAX_TRAP_IDS);
+        }
+
+        env.TRAP_IDS = trapIdsArray.join(',');
+        console.log(`[webhook] Dust job — processing ${trapIdsArray.length} traps`);
       }
       break;
 

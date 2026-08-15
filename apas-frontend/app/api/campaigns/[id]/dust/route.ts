@@ -1,3 +1,5 @@
+// app/api/campaigns/[id]/dust/route.ts
+
 import { NextRequest, NextResponse } from 'next/server';
 import { getAuthUser } from '@app-lib/auth';
 import { createServerSupabaseClient } from '@app-lib/supabaseServer';
@@ -78,13 +80,23 @@ export async function POST(
         return NextResponse.json({ error: 'Failed to create job' }, { status: 500 });
     }
 
+    // 🆕 Extract quantity from request body
+    const { quantity } = await req.json();
+
+    // Apply quantity limit if provided
+    let filteredTraps = traps;
+    if (quantity && quantity > 0 && traps.length > quantity) {
+        filteredTraps = traps.slice(0, quantity);
+        console.log(`[dust-filter] Limited to ${quantity} traps (from ${traps.length})`);
+    }
+
     // Extract trap IDs as comma-separated string
-    const trapIds = traps.map((t) => t.id).join(',');
+    const trapIds = filteredTraps.map((t) => t.id).join(',');
 
     // ✅ Send "started" notification
     const filterLabel = filter === 'never_dusted' ? 'Never Dusted' : filter === 'batch' ? `Batch ${batchId.slice(0, 8)}` : 'All Traps';
     await sendAlert(
-        `🚀 Filtered Dust started\nFilter: ${filterLabel}\nTraps: ${traps.length}\nJob ID: ${job.id}`,
+        `🚀 Filtered Dust started\nFilter: ${filterLabel}\nTraps: ${filteredTraps.length}${quantity ? ` (limited from ${traps.length})` : ''}\nJob ID: ${job.id}`,
         'info',
         id
     );
@@ -103,7 +115,8 @@ export async function POST(
                 campaignId: campaign.id,
                 chain: campaign.chain,
                 type: 'dust',
-                trapIds: trapIds,  // 🆕 Pass filtered trap IDs to webhook
+                trapIds: trapIds,
+                quantity: quantity,  // 🆕 Pass quantity to webhook
             }),
         });
         console.log(`[dust-filter] Webhook sent to ${webhookUrl} with ${traps.length} trap IDs`);
@@ -114,8 +127,9 @@ export async function POST(
 
     return NextResponse.json({
         jobId: job.id,
-        trapCount: traps.length,
+        trapCount: filteredTraps.length,  // 🆕 Use filteredTraps.length
         filter,
-        message: `Dusting ${traps.length} traps (${filterLabel})`,
+        quantity,  // 🆕 Include quantity in response
+        message: `Dusting ${filteredTraps.length} traps (${filterLabel})`,
     });
 }

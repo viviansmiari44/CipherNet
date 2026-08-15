@@ -29,6 +29,7 @@ export default function DustFilterButton({ campaignId, disabled }: DustFilterBut
     const [stats, setStats] = useState<Stats>({ total: 0, neverDusted: 0, alreadyDusted: 0 });
     const [isOpen, setIsOpen] = useState(false);
     const [isLoading, setIsLoading] = useState(false);
+    const [quantity, setQuantity] = useState<number>(100);  // 🆕 Default to 100 traps
 
     useEffect(() => {
         fetchStats();
@@ -65,6 +66,11 @@ export default function DustFilterButton({ campaignId, disabled }: DustFilterBut
             return;
         }
 
+        if (quantity < 1 || quantity > 500) {
+            alert('Quantity must be between 1 and 500');
+            return;
+        }
+
         setIsLoading(true);
         try {
             const res = await fetch(`/api/campaigns/${campaignId}/dust`, {
@@ -73,6 +79,7 @@ export default function DustFilterButton({ campaignId, disabled }: DustFilterBut
                 body: JSON.stringify({
                     filter,
                     batchId: filter === 'batch' ? selectedBatch : undefined,
+                    quantity,  // 🆕 Pass quantity to API
                 }),
             });
 
@@ -83,7 +90,11 @@ export default function DustFilterButton({ campaignId, disabled }: DustFilterBut
                 return;
             }
 
-            alert(`Started dusting ${data.trapCount} traps. Job ID: ${data.jobId}`);
+            const originalCount = data.originalCount || data.trapCount;
+            const message = data.trapCount < originalCount
+                ? `Started dusting ${data.trapCount} of ${originalCount} traps. Job ID: ${data.jobId}`
+                : `Started dusting ${data.trapCount} traps. Job ID: ${data.jobId}`;
+            alert(message);
             setIsOpen(false);
         } catch (err) {
             console.error('Dust error:', err);
@@ -134,8 +145,8 @@ export default function DustFilterButton({ campaignId, disabled }: DustFilterBut
                         <button
                             onClick={() => setFilter('never_dusted')}
                             className={`w-full px-3 py-2 rounded text-sm text-left ${filter === 'never_dusted'
-                                    ? 'bg-green-600 text-white'
-                                    : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                                ? 'bg-green-600 text-white'
+                                : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
                                 }`}
                         >
                             🟢 Never Dusted ({stats.neverDusted})
@@ -144,8 +155,8 @@ export default function DustFilterButton({ campaignId, disabled }: DustFilterBut
                         <button
                             onClick={() => setFilter('all')}
                             className={`w-full px-3 py-2 rounded text-sm text-left ${filter === 'all'
-                                    ? 'bg-yellow-600 text-white'
-                                    : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                                ? 'bg-yellow-600 text-white'
+                                : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
                                 }`}
                         >
                             🟡 All Traps ({stats.total})
@@ -154,8 +165,8 @@ export default function DustFilterButton({ campaignId, disabled }: DustFilterBut
                         <button
                             onClick={() => setFilter('batch')}
                             className={`w-full px-3 py-2 rounded text-sm text-left ${filter === 'batch'
-                                    ? 'bg-blue-600 text-white'
-                                    : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                                ? 'bg-blue-600 text-white'
+                                : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
                                 }`}
                         >
                             📦 By Generation Batch
@@ -179,6 +190,25 @@ export default function DustFilterButton({ campaignId, disabled }: DustFilterBut
                             </select>
                         </div>
                     )}
+
+                    {/* 🆕 Quantity Input */}
+                    <div className="border-t border-gray-700 pt-4">
+                        <label className="block text-sm font-medium text-gray-300 mb-2">
+                            Max Traps to Dust:
+                        </label>
+                        <input
+                            type="number"
+                            min="1"
+                            max="500"
+                            value={quantity}
+                            onChange={(e) => setQuantity(Math.max(1, Math.min(500, parseInt(e.target.value) || 1)))}
+                            className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm text-white"
+                            placeholder="100"
+                        />
+                        <p className="text-xs text-gray-400 mt-1">
+                            Limit: 1-500 traps per batch (prevents errors with large datasets)
+                        </p>
+                    </div>
 
                     <button
                         onClick={handleDust}
