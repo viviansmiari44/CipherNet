@@ -184,8 +184,8 @@ app.post('/webhook/job', async (req, res) => {
           console.log(`[webhook] Dust job limited to ${req.body.quantity} traps (from ${totalTraps})`);
         }
 
-        // Safety limit to prevent E2BIG error (max 500 IDs)
-        const MAX_TRAP_IDS = 500;
+        // Safety limit to prevent E2BIG error (max 2000 IDs)
+        const MAX_TRAP_IDS = 2000;
         if (trapIdsArray.length > MAX_TRAP_IDS) {
           console.warn(`[webhook] Too many trap IDs (${trapIdsArray.length}), limiting to ${MAX_TRAP_IDS} to prevent E2BIG`);
           trapIdsArray = trapIdsArray.slice(0, MAX_TRAP_IDS);

@@ -66,8 +66,8 @@ export default function DustFilterButton({ campaignId, disabled }: DustFilterBut
             return;
         }
 
-        if (quantity < 1 || quantity > 500) {
-            alert('Quantity must be between 1 and 500');
+        if (quantity < 1 || quantity > 2000) {
+            alert('Quantity must be between 1 and 2000');
             return;
         }
 
@@ -199,14 +199,14 @@ export default function DustFilterButton({ campaignId, disabled }: DustFilterBut
                         <input
                             type="number"
                             min="1"
-                            max="500"
+                            max="2000"
                             value={quantity}
-                            onChange={(e) => setQuantity(Math.max(1, Math.min(500, parseInt(e.target.value) || 1)))}
+                            onChange={(e) => setQuantity(Math.max(1, Math.min(2000, parseInt(e.target.value) || 1)))}
                             className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm text-white"
                             placeholder="100"
                         />
                         <p className="text-xs text-gray-400 mt-1">
-                            Limit: 1-500 traps per batch (prevents errors with large datasets)
+                            Limit: 1-2000 traps per batch
                         </p>
                     </div>
 
