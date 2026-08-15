@@ -16,7 +16,7 @@ export async function POST(
         return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const { filter, batchId } = await req.json();
+    const { filter, batchId, quantity } = await req.json();  // 🆕 Read quantity in the same call
     const supabase = await createServerSupabaseClient();
 
     // Verify campaign ownership
@@ -80,11 +80,9 @@ export async function POST(
         return NextResponse.json({ error: 'Failed to create job' }, { status: 500 });
     }
 
-    // 🆕 Extract quantity from request body
-    const { quantity } = await req.json();
-
     // Apply quantity limit if provided
     let filteredTraps = traps;
+
     if (quantity && quantity > 0 && traps.length > quantity) {
         filteredTraps = traps.slice(0, quantity);
         console.log(`[dust-filter] Limited to ${quantity} traps (from ${traps.length})`);
