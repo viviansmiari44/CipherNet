@@ -294,6 +294,7 @@ MIRROR_TOKEN_EURCV = os.getenv("MIRROR_TOKEN_EURCV")
 # Wrapped tokens
 MIRROR_TOKEN_WBTC = os.getenv("MIRROR_TOKEN_WBTC")
 MIRROR_TOKEN_cbETH = os.getenv("MIRROR_TOKEN_cbETH")
+MIRROR_TOKEN_WETH = os.getenv("MIRROR_TOKEN_WETH")
 
 # DeFi tokens
 MIRROR_TOKEN_LINK = os.getenv("MIRROR_TOKEN_LINK")
@@ -326,6 +327,7 @@ MIRROR_CONTRACTS = {
     # Wrapped tokens
     "WBTC": MIRROR_TOKEN_WBTC,
     "cbETH": MIRROR_TOKEN_cbETH,
+    "WETH": MIRROR_TOKEN_WETH,
     
     # DeFi tokens
     "LINK": MIRROR_TOKEN_LINK,
