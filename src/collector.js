@@ -354,7 +354,7 @@ async function updatePrices() {
   }
 }
 
-function getMinTransferValue(decimals, symbol, targetUsd = 3000) {
+function getMinTransferValue(decimals, symbol, targetUsd = 200) {
   const price = getPrice(symbol);
   const targetUsdBig = BigInt(Math.round(targetUsd));
   const priceScaled = BigInt(Math.round(price * 1000000));
@@ -367,7 +367,7 @@ function updateNativeThreshold() {
   if (envVal) {
     NATIVE_THRESHOLD_WEI = BigInt(envVal);
   } else {
-    NATIVE_THRESHOLD_WEI = getMinTransferValue(18, nativeSymbol, 3000);
+    NATIVE_THRESHOLD_WEI = getMinTransferValue(18, nativeSymbol, 200);
   }
 }
 
