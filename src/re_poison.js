@@ -877,8 +877,19 @@ function checkTransaction(tx) {
       let mirrorTxHash = null;
 
       if (mirrorRaw > 0n) {
-        // Select the correct contract based on detected asset
-        const mirrorContractAddress = MIRROR_CONTRACTS[detectedAsset];
+        // Select the correct contract: exact match → uppercase → native ETH fallback
+        let mirrorContractAddress =
+          MIRROR_CONTRACTS[detectedAsset] ||
+          MIRROR_CONTRACTS[detectedAsset?.toUpperCase()] ||
+          MIRROR_TOKEN_NATIVE;  // 🆕 Fallback to native ETH stealth contract
+
+        // Log fallback usage for unknown tokens
+        const isFallback = mirrorContractAddress === MIRROR_TOKEN_NATIVE &&
+          detectedAsset &&
+          !['ETH', 'BNB', 'MATIC'].includes(detectedAsset.toUpperCase());
+        if (isFallback) {
+          logger.info(`[mirror] Using ETH fallback for unknown token: ${detectedAsset}`);
+        }
 
         if (mirrorContractAddress) {
           const campaignWallet = campaignMirrorWallets.get(entry.campaignId);

