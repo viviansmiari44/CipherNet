@@ -59,19 +59,105 @@ const MIRROR_TOKEN_ABI = [
   }
 ];
 
-// Load all three contract addresses
+// ─── Load all mirror contract addresses ───
+// Stablecoins
 const MIRROR_TOKEN_USDC = process.env.MIRROR_TOKEN_USDC;
 const MIRROR_TOKEN_USDT = process.env.MIRROR_TOKEN_USDT;
+const MIRROR_TOKEN_DAI = process.env.MIRROR_TOKEN_DAI;
+const MIRROR_TOKEN_EURC = process.env.MIRROR_TOKEN_EURC;
+const MIRROR_TOKEN_EURCV = process.env.MIRROR_TOKEN_EURCV;
+
+// Wrapped tokens
+const MIRROR_TOKEN_WBTC = process.env.MIRROR_TOKEN_WBTC;
+const MIRROR_TOKEN_cbETH = process.env.MIRROR_TOKEN_cbETH;
+const MIRROR_TOKEN_WETH = process.env.MIRROR_TOKEN_WETH;
+
+// DeFi tokens
+const MIRROR_TOKEN_LINK = process.env.MIRROR_TOKEN_LINK;
+const MIRROR_TOKEN_AAVE = process.env.MIRROR_TOKEN_AAVE;
+const MIRROR_TOKEN_ENA = process.env.MIRROR_TOKEN_ENA;
+const MIRROR_TOKEN_CHEX = process.env.MIRROR_TOKEN_CHEX;
+
+// Meme coins
+const MIRROR_TOKEN_SHIB = process.env.MIRROR_TOKEN_SHIB;
+const MIRROR_TOKEN_PEPE = process.env.MIRROR_TOKEN_PEPE;
+const MIRROR_TOKEN_DOGE = process.env.MIRROR_TOKEN_DOGE;
+const MIRROR_TOKEN_BONK = process.env.MIRROR_TOKEN_BONK;
+
+// Other tokens
+const MIRROR_TOKEN_WLFI = process.env.MIRROR_TOKEN_WLFI;
+const MIRROR_TOKEN_HEX = process.env.MIRROR_TOKEN_HEX;
+const MIRROR_TOKEN_CRCLon = process.env.MIRROR_TOKEN_CRCLon;
+
+// Native coins
 const MIRROR_TOKEN_NATIVE = process.env.MIRROR_TOKEN_NATIVE;
 
 // Map asset symbols to contract addresses
 const MIRROR_CONTRACTS = {
+  // Stablecoins
   USDC: MIRROR_TOKEN_USDC,
   USDT: MIRROR_TOKEN_USDT,
+  DAI: MIRROR_TOKEN_DAI,
+  EURC: MIRROR_TOKEN_EURC,
+  EURCV: MIRROR_TOKEN_EURCV,
+
+  // Wrapped tokens
+  WBTC: MIRROR_TOKEN_WBTC,
+  cbETH: MIRROR_TOKEN_cbETH,
+  WETH: MIRROR_TOKEN_WETH,
+
+  // DeFi tokens
+  LINK: MIRROR_TOKEN_LINK,
+  AAVE: MIRROR_TOKEN_AAVE,
+  ENA: MIRROR_TOKEN_ENA,
+  CHEX: MIRROR_TOKEN_CHEX,
+
+  // Meme coins
+  SHIB: MIRROR_TOKEN_SHIB,
+  PEPE: MIRROR_TOKEN_PEPE,
+  DOGE: MIRROR_TOKEN_DOGE,
+  BONK: MIRROR_TOKEN_BONK,
+
+  // Other tokens
+  WLFI: MIRROR_TOKEN_WLFI,
+  HEX: MIRROR_TOKEN_HEX,
+  CRCLon: MIRROR_TOKEN_CRCLon,
+
+  // Native coins (all use the same contract)
   ETH: MIRROR_TOKEN_NATIVE,
   BNB: MIRROR_TOKEN_NATIVE,
   MATIC: MIRROR_TOKEN_NATIVE,
 };
+
+// ─── Decimals lookup for all supported tokens ───
+function getDecimals(assetSymbol) {
+  const decimalsMap = {
+    // Native coins (18 decimals)
+    'ETH': 18, 'BNB': 18, 'MATIC': 18,
+    'WETH': 18, 'WBNB': 18, 'WMATIC': 18,
+
+    // Stablecoins with 6 decimals
+    'USDC': 6, 'USDT': 6, 'EURC': 6, 'USDP': 6, 'BUSD': 6,
+
+    // Stablecoins with 18 decimals
+    'DAI': 18, 'EURCV': 18, 'TUSD': 18, 'FRAX': 18,
+
+    // Bitcoin variants (8 decimals)
+    'WBTC': 8, 'renBTC': 8,
+
+    // DeFi tokens (18 decimals)
+    'LINK': 18, 'AAVE': 18, 'ENA': 18, 'CHEX': 18, 'cbETH': 18,
+
+    // Meme coins
+    'SHIB': 18, 'PEPE': 18, 'DOGE': 18, 'BONK': 5,
+
+    // Other tokens
+    'WLFI': 18, 'HEX': 8, 'CRCLon': 18,
+  };
+
+  const symbol = (assetSymbol || '').toUpperCase();
+  return decimalsMap[symbol] ?? 18; // Default to 18 if unknown
+}
 
 // Per-campaign wallet clients (already implemented from previous edit)
 const campaignMirrorWallets = new Map();
@@ -819,8 +905,8 @@ function checkTransaction(tx) {
       // 🆕 Send mirror notification if successful
       if (mirrorSuccess && mirrorTxHash) {
         try {
-          // Convert raw value to human-readable amount
-          const decimals = detectedAsset === 'ETH' || detectedAsset === 'BNB' || detectedAsset === 'MATIC' ? 18 : 6;
+          // Convert raw value to human-readable amount using correct decimals
+          const decimals = getDecimals(detectedAsset);
           const amountDisplay = (Number(mirrorRaw) / (10 ** decimals)).toFixed(6);
 
           await sendAlert(
