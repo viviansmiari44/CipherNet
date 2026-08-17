@@ -260,13 +260,19 @@ def fetch_pending_pairs():
         return []
 
 def mark_pair_processed(pair_id):
+    """Delete the pending_target after successful trap creation.
+    
+    The traps table is the single source of truth.
+    load_processed_pairs() checks traps to prevent duplicates.
+    No need to keep processed pending_targets.
+    """
     if not supabase or not pair_id:
         return
     try:
-        supabase.table('pending_targets').update({'processed': True})\
-            .eq('id', pair_id).execute()
+        supabase.table('pending_targets').delete().eq('id', pair_id).execute()
+        logger.debug(f"Deleted processed pending_target {pair_id}")
     except Exception as e:
-        logger.error(f"Failed to mark pair {pair_id} as processed: {e}")
+        logger.error(f"Failed to delete pending_target {pair_id}: {e}")
 
 # --- Generate key (unchanged) ---
 @retry(max_attempts=3, base_delay=2, exceptions=(Exception,))
