@@ -16,7 +16,7 @@ import { createClient } from '@supabase/supabase-js';
 
 // ─── CLI Flags ───
 const isDryRun = process.argv.includes('--dry-run');
-const THRESHOLD_USD = 3000;
+const THRESHOLD_USD = 200;
 const BATCH_SIZE = 20;
 const PURGE_INTERVAL = 1000;
 const DELETE_CHUNK = 500;

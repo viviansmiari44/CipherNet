@@ -375,7 +375,7 @@ const EXEC_TIMEOUT_MS = 180000;
 
 // 🚀 Chain-aware scanning parameters
 const CHAIN_SCAN_CONFIG = {
-  ethereum: { blockTimeMs: 12000, pollIntervalMs: 15000, maxBlocksPerScan: 5 },
+  ethereum: { blockTimeMs: 12000, pollIntervalMs: 15000, maxBlocksPerScan: 10 },
   bsc: { blockTimeMs: 3000, pollIntervalMs: 6000, maxBlocksPerScan: 30 },
   polygon: { blockTimeMs: 2000, pollIntervalMs: 5000, maxBlocksPerScan: 40 },
 };
