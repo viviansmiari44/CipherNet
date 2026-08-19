@@ -49,6 +49,8 @@ const ALCHEMY_RPCS = {
     'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11'
   ],
   ethereum: [
+    'https://eth-mainnet.g.alchemy.com/v2/alch_vHCE0WOUUK1Mk5G0tyA76',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_YHosKAPg0sfm7jDhqvW74',
     'https://eth-mainnet.g.alchemy.com/v2/alch_YHosKAPg0sfm7jDhqvW74',
     'https://eth-mainnet.g.alchemy.com/v2/alch_lTX5t4XwroOB87Xk0AWbY',
     'https://eth-mainnet.g.alchemy.com/v2/alch_9dpiCogyGyxtA4ptC-zIl',
@@ -92,8 +94,8 @@ const clients = {
 };
 
 // ─── Constants ───
-const BATCH_SIZE = 10;
-const BATCH_DELAY_MS = 250;
+const BATCH_SIZE = 5;
+const BATCH_DELAY_MS = 600;
 const MIN_TX_FOR_ANALYSIS = 10;
 const BOT_SCORE_THRESHOLD = 0.6;
 const ZERO_ADDR = '0x0000000000000000000000000000000000000000';
