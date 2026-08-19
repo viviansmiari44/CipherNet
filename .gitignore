@@ -17,5 +17,4 @@ scripts/cleanup_traps_stage2.js
 scripts/diagnose_stage2.js
 scripts/identify-contracts.js
 scripts/cleanup_pending_stage2.js
-test-mirror
-.jslogs/*.log
+test-mirror.jslogs/*.log
