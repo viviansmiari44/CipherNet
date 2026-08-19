@@ -3,9 +3,16 @@ import { createPublicClient, http, fallback, getAddress } from 'viem';
 import { mainnet, bsc, polygon } from 'viem/chains';
 import { createClient } from '@supabase/supabase-js';
 
-// ─── CLI Flags ───
+// ─── CLI Flags & Configuration ───
 const isDryRun = process.argv.includes('--dry-run');
 const TX_LIMIT_HEX = '0x64';
+const THRESHOLD_USD = 200; // Minimum required USD balance to pass Stage 1
+const BATCH_SIZE = 5;
+const BATCH_DELAY_MS = 600;
+const MIN_TX_FOR_ANALYSIS = 10;
+const BOT_SCORE_THRESHOLD = 0.6;
+const ZERO_ADDR = '0x0000000000000000000000000000000000000000';
+const MAX_NONCE_LIMIT = 1000;
 
 console.log('\n==================================================');
 if (isDryRun) {
@@ -15,6 +22,7 @@ if (isDryRun) {
   console.log('[⚠️  LIVE EXECUTION MODE]');
   console.log('Failing records WILL be permanently purged from pending_targets.');
 }
+console.log(`[💰 BALANCE THRESHOLD]: $${THRESHOLD_USD} USD`);
 console.log('==================================================\n');
 
 // ─── Supabase Setup ───
@@ -26,7 +34,32 @@ if (!supabaseUrl || !supabaseKey) {
 }
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// ─── Alchemy-Only RPC URLs ───
+// ─── Generic Public RPC URLs (Stage 1) ───
+const GENERIC_RPCS = {
+  ethereum: [
+    'https://white-sparkling-season.ethereum-mainnet.quiknode.pro/c96fe9f061e74418f432d2e2df614c83a3bbd239/',
+    'https://eth.llamarpc.com',
+    'https://rpc.ankr.com/eth',
+    'https://cloudflare-eth.com',
+    'https://1rpc.io/eth',
+    'https://ethereum-rpc.publicnode.com'
+  ],
+  bsc: [
+    'https://binance.llamarpc.com',
+    'https://rpc.ankr.com/bsc',
+    'https://bsc-dataseed.binance.org',
+    'https://1rpc.io/bnb',
+    'https://bsc-rpc.publicnode.com'
+  ],
+  polygon: [
+    'https://polygon.llamarpc.com',
+    'https://rpc.ankr.com/polygon',
+    'https://1rpc.io/matic',
+    'https://polygon-bor-rpc.publicnode.com'
+  ],
+};
+
+// ─── Alchemy-Only RPC URLs (Stage 2) ───
 const ALCHEMY_RPCS = {
   bsc: [
     'https://bnb-mainnet.g.alchemy.com/v2/alch_6gTznTT4QnX3_0IE9gkY-',
@@ -51,7 +84,6 @@ const ALCHEMY_RPCS = {
   ethereum: [
     'https://eth-mainnet.g.alchemy.com/v2/alch_vHCE0WOUUK1Mk5G0tyA76',
     'https://eth-mainnet.g.alchemy.com/v2/alch_YHosKAPg0sfm7jDhqvW74',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_YHosKAPg0sfm7jDhqvW74',
     'https://eth-mainnet.g.alchemy.com/v2/alch_lTX5t4XwroOB87Xk0AWbY',
     'https://eth-mainnet.g.alchemy.com/v2/alch_9dpiCogyGyxtA4ptC-zIl',
     'https://eth-mainnet.g.alchemy.com/v2/alch_Y8rCHyOCRzZAW_2xLVM5r',
@@ -68,8 +100,33 @@ const ALCHEMY_RPCS = {
   ],
 };
 
-// ─── Alchemy-Only Viem Clients ───
-const clients = {
+// ─── Stage 1 Public Clients (Generic RPCs) ───
+const stage1Clients = {
+  1: createPublicClient({
+    chain: mainnet,
+    transport: fallback(
+      GENERIC_RPCS.ethereum.map(url => http(url, { timeout: 15000 })),
+      { retryCount: 3 }
+    ),
+  }),
+  56: createPublicClient({
+    chain: bsc,
+    transport: fallback(
+      GENERIC_RPCS.bsc.map(url => http(url, { timeout: 15000 })),
+      { retryCount: 3 }
+    ),
+  }),
+  137: createPublicClient({
+    chain: polygon,
+    transport: fallback(
+      GENERIC_RPCS.polygon.map(url => http(url, { timeout: 15000 })),
+      { retryCount: 3 }
+    ),
+  }),
+};
+
+// ─── Stage 2 Public Clients (Alchemy-Only) ───
+const stage2Clients = {
   1: createPublicClient({
     chain: mainnet,
     transport: fallback(
@@ -93,15 +150,7 @@ const clients = {
   }),
 };
 
-// ─── Constants ───
-const BATCH_SIZE = 5;
-const BATCH_DELAY_MS = 600;
-const MIN_TX_FOR_ANALYSIS = 10;
-const BOT_SCORE_THRESHOLD = 0.6;
-const ZERO_ADDR = '0x0000000000000000000000000000000000000000';
-const MIN_GAS_RESERVE_WEI = 2000000000000000n;
-const MAX_NONCE_LIMIT = 1000;
-
+// ─── Chain & Stablecoin Configuration ───
 const CHAIN_NAME_MAP = { 1: 'ethereum', 56: 'bsc', 137: 'polygon' };
 const CHAIN_ID_MAP = { ethereum: 1, bsc: 56, polygon: 137 };
 
@@ -111,9 +160,83 @@ const ALCHEMY_CATEGORIES = {
   137: ['external', 'internal', 'erc20', 'erc721', 'erc1155'],
 };
 
+const STABLECOIN_CONFIG = {
+  1: {
+    coingeckoId: 'ethereum',
+    nativeSymbol: 'ETH',
+    stablecoins: {
+      USDT: '0xdAC17F958D2ee523a2206206994597C13D831ec7',
+      USDC: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
+      DAI: '0x6B175474E89094C44Da98b954EedeAC495271d0F',
+      USDP: '0x8E870D67F660D95d5be530380D0eC0bd388289E1',
+      TUSD: '0x0000000000085d4780B73119b644AE5ecd22b376',
+      FRAX: '0x853d955aCEf822Db058eb8505911ED77F175b99e',
+    },
+    decimals: { USDT: 6, USDC: 6, DAI: 18, USDP: 18, TUSD: 18, FRAX: 18, ETH: 18 },
+  },
+  56: {
+    coingeckoId: 'binancecoin',
+    nativeSymbol: 'BNB',
+    stablecoins: {
+      USDT: '0x55d398326f99059fF775485246999027B3197955',
+      USDC: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d',
+      BUSD: '0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56',
+      DAI: '0x1AF3F329e8BE154074D8769D1FFa4f058117F6b8',
+    },
+    decimals: { USDT: 18, USDC: 18, BUSD: 18, DAI: 18, BNB: 18 },
+  },
+  137: {
+    coingeckoId: 'matic-network',
+    nativeSymbol: 'MATIC',
+    stablecoins: {
+      USDT: '0xc2132D05D31c914a87C6611C10748AEb04B58e8F',
+      USDC: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359',
+      USDCe: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174',
+      DAI: '0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063',
+      USDP: '0x2aBE941127B1C078d5e75E7C68A0e3ae3B0b8f1D',
+    },
+    decimals: { USDT: 6, USDC: 6, USDCe: 6, DAI: 18, USDP: 18, MATIC: 18 },
+  },
+};
+
+const ERC20_ABI = [
+  {
+    type: 'function',
+    name: 'balanceOf',
+    stateMutability: 'view',
+    inputs: [{ name: 'account', type: 'address' }],
+    outputs: [{ name: 'balance', type: 'uint256' }],
+  },
+];
+
+let prices = {};
+
 // ─── Utilities ───
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function getNativePrices() {
+  const fallbackPrices = { ethereum: 1900, binancecoin: 610, 'matic-network': 0.08 };
+  try {
+    const ids = 'ethereum,binancecoin,matic-network';
+    const url = `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd`;
+    const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    if (!res.ok) throw new Error(`CoinGecko HTTP ${res.status}`);
+    const data = await res.json();
+    return {
+      ethereum: data.ethereum?.usd || fallbackPrices.ethereum,
+      binancecoin: data.binancecoin?.usd || fallbackPrices.binancecoin,
+      'matic-network': data['matic-network']?.usd || fallbackPrices['matic-network'],
+      USDT: 1, USDC: 1, BUSD: 1, DAI: 1, USDP: 1, TUSD: 1, FRAX: 1, USDCe: 1,
+    };
+  } catch (err) {
+    console.warn(`  ⚠️ Price fetch failed (${err.message}). Using default fallbacks.`);
+    return {
+      ethereum: 1900, binancecoin: 610, 'matic-network': 0.08,
+      USDT: 1, USDC: 1, BUSD: 1, DAI: 1, USDP: 1, TUSD: 1, FRAX: 1, USDCe: 1,
+    };
+  }
 }
 
 async function fetchAllRows(table, selectColumns) {
@@ -143,22 +266,107 @@ async function fetchAllRows(table, selectColumns) {
   return allRows;
 }
 
-// ─── STAGE 1: On-chain state checks (HUMAN-ONLY GATE — unchanged) ───
+// ─── USD Balance Evaluation Helper (Stage 1) ───
+async function calculateAddressUsdBalance(checksumAddr, chainId) {
+  const client = stage1Clients[chainId];
+  const cfg = STABLECOIN_CONFIG[chainId];
+  if (!client || !cfg) return 0;
+
+  try {
+    const nativeBalPromise = client.getBalance({ address: checksumAddr });
+
+    let tokenBalancesMap = {};
+    let tokenSuccess = false;
+
+    // 1. Try Alchemy API token balance request (will fail gracefully on generic RPCs)
+    try {
+      const tokenAddrs = Object.values(cfg.stablecoins);
+      const tokenResult = await client.request({
+        method: 'alchemy_getTokenBalances',
+        params: [checksumAddr, tokenAddrs],
+      });
+
+      if (tokenResult && Array.isArray(tokenResult.tokenBalances)) {
+        const symbolByAddr = {};
+        for (const [sym, addr] of Object.entries(cfg.stablecoins)) {
+          symbolByAddr[addr.toLowerCase()] = sym;
+        }
+        for (const tb of tokenResult.tokenBalances) {
+          if (!tb.tokenBalance || tb.tokenBalance === '0x0' || tb.error) continue;
+          const sym = symbolByAddr[tb.contractAddress?.toLowerCase()];
+          if (!sym) continue;
+          try {
+            tokenBalancesMap[sym] = BigInt(tb.tokenBalance);
+          } catch { }
+        }
+        tokenSuccess = true;
+      }
+    } catch (e) {
+      // Fall through to Multicall fallback
+    }
+
+    // 2. Multicall fallback on generic RPCs
+    if (!tokenSuccess) {
+      const tokenEntries = Object.entries(cfg.stablecoins);
+      const multicallRes = await client.multicall({
+        contracts: tokenEntries.map(([, tokenAddr]) => ({
+          address: tokenAddr,
+          abi: ERC20_ABI,
+          functionName: 'balanceOf',
+          args: [checksumAddr],
+        })),
+        allowFailure: true,
+      });
+
+      multicallRes.forEach((res, idx) => {
+        if (res.status === 'success' && res.result) {
+          const [sym] = tokenEntries[idx];
+          tokenBalancesMap[sym] = BigInt(res.result);
+        }
+      });
+    }
+
+    const nativeBal = await nativeBalPromise;
+
+    let totalUsd = 0;
+    const nativeDecimal = cfg.decimals[cfg.nativeSymbol] || 18;
+    const nativeAmount = Number(nativeBal) / (10 ** nativeDecimal);
+    const nativePrice = prices[cfg.coingeckoId] || 0;
+    totalUsd += nativeAmount * nativePrice;
+
+    for (const [sym, rawBal] of Object.entries(tokenBalancesMap)) {
+      const decimals = cfg.decimals[sym] || 18;
+      const amount = Number(rawBal) / (10 ** decimals);
+      totalUsd += amount * (prices[sym] || 1);
+    }
+
+    return totalUsd;
+  } catch (err) {
+    return 0;
+  }
+}
+
+// ─── STAGE 1: On-chain State & USD Balance Checks ───
 async function passesStageOne(address, chainId) {
-  const client = clients[chainId];
+  const client = stage1Clients[chainId];
   if (!client) return { pass: true, reason: 'no_client' };
 
   try {
     const checksumAddr = getAddress(address);
-    const [code, nonce, balance] = await Promise.all([
+    const [code, nonce] = await Promise.all([
       client.getBytecode({ address: checksumAddr }),
       client.getTransactionCount({ address: checksumAddr }),
-      client.getBalance({ address: checksumAddr }),
     ]);
 
     if (code && code !== '0x') return { pass: false, reason: 'is_contract' };
+    if (nonce === 0) return { pass: false, reason: 'zero_nonce' };
     if (nonce >= MAX_NONCE_LIMIT) return { pass: false, reason: `high_nonce(${nonce})` };
-    if (balance < MIN_GAS_RESERVE_WEI) return { pass: false, reason: 'low_balance' };
+
+    // Check Native + Stablecoin total USD valuation
+    const totalUsd = await calculateAddressUsdBalance(checksumAddr, chainId);
+    if (totalUsd < THRESHOLD_USD) {
+      return { pass: false, reason: `low_usd_balance($${totalUsd.toFixed(2)})` };
+    }
 
     return { pass: true, reason: 'eoa_ok' };
   } catch (err) {
@@ -166,16 +374,15 @@ async function passesStageOne(address, chainId) {
   }
 }
 
-// ─── STAGE 2: Behavioral analysis ───
+// ─── STAGE 2: Behavioral Analysis (Alchemy Dedicated) ───
 async function fetchTransactionHistory(address, chainId) {
-  const client = clients[chainId];
+  const client = stage2Clients[chainId];
   if (!client) return null;
 
   try {
     const checksumAddr = getAddress(address);
     const category = ALCHEMY_CATEGORIES[chainId] || ALCHEMY_CATEGORIES[1];
 
-    // Fetch OUTGOING and INCOMING concurrently
     const [outRes, inRes] = await Promise.all([
       client.request({
         method: 'alchemy_getAssetTransfers',
@@ -203,12 +410,10 @@ async function fetchTransactionHistory(address, chainId) {
       }).catch(() => null)
     ]);
 
-    // If both calls fail, treat as an RPC error rather than standard empty history
     if (!outRes && !inRes) return null;
 
     const transfers = [];
 
-    // Tag the directions so the analyzer knows what kind of gap it is
     if (outRes?.transfers) {
       transfers.push(...outRes.transfers.map(t => ({ ...t, direction: 'out' })));
     }
@@ -218,7 +423,6 @@ async function fetchTransactionHistory(address, chainId) {
 
     if (transfers.length === 0) return [];
 
-    // Deduplicate (in case of self-transfers appearing in both)
     const unique = [];
     const seen = new Set();
     for (const t of transfers) {
@@ -229,23 +433,18 @@ async function fetchTransactionHistory(address, chainId) {
       }
     }
 
-    // Sort descending by block number (newest first, mimicking original Alchemy response)
     unique.sort((a, b) => {
       const blockA = parseInt(a.blockNum, 16);
       const blockB = parseInt(b.blockNum, 16);
       return blockB - blockA;
     });
 
-    // Enforce the max count
     return unique.slice(0, parseInt(TX_LIMIT_HEX, 16));
   } catch (err) {
     return null;
   }
 }
 
-/**
- * Behavioral analysis — bot probability score (capped at 1.0, threshold >= 0.6).
- */
 function analyzeTransactionPatterns(transfers) {
   if (!transfers || transfers.length < MIN_TX_FOR_ANALYSIS) {
     return { score: 0, reason: 'insufficient_data', txCount: transfers ? transfers.length : 0 };
@@ -306,7 +505,6 @@ function analyzeTransactionPatterns(transfers) {
       const gapSeconds = (tsMs - prevTimestamp) / 1000;
       totalIntervals++;
 
-      // Catch an IN immediately followed by an OUT
       if (prevDirection === 'in' && tx.direction === 'out') {
         if (gapSeconds >= 0 && gapSeconds < 180) {
           sweepCount++;
@@ -316,16 +514,13 @@ function analyzeTransactionPatterns(transfers) {
         }
       }
 
-      // Check >= 0 so same-block transactions don't bypass the 3-min rule
       if (gapSeconds >= 0 && gapSeconds < minInterval) {
         minInterval = gapSeconds;
       }
-      // REDUCED TO 180 SECONDS (3 MINUTES)
       if (gapSeconds >= 0 && gapSeconds < 180) {
         microGapCount++;
       }
 
-      // Keep intervals > 0 for standard deviation math so it doesn't skew
       if (gapSeconds > 0) {
         intervals.push(gapSeconds);
       } else {
@@ -426,7 +621,7 @@ function analyzeTransactionPatterns(transfers) {
   };
 }
 
-// ─── Combined analysis: Stage 1 + Stage 2 ───
+// ─── Combined Analysis Pipeline ───
 async function analyzeAddress(address, chainId) {
   const stage1 = await passesStageOne(address, chainId);
   if (!stage1.pass) {
@@ -446,7 +641,7 @@ async function analyzeAddress(address, chainId) {
   return { valid: true, stage: 'pass', reason: 'human', analysis };
 }
 
-// ─── Helper for purges ───
+// ─── Batch Deletion Helper ───
 async function purgePendingTargets(purgeMap) {
   let countToPurge = 0;
   for (const set of purgeMap.values()) countToPurge += set.size;
@@ -484,9 +679,15 @@ async function purgePendingTargets(purgeMap) {
   console.log('[+] Batch purge complete. Resuming filtering...\n');
 }
 
-// ─── Main Cleanup ───
+// ─── Main Execution Pipeline ───
 async function runCleanup() {
-  console.log('[+] Phase 1: Fetching ALL addresses from pending_targets...\n');
+  console.log('[+] Fetching native asset prices...');
+  prices = await getNativePrices();
+  console.log('    Prices:', Object.entries(prices)
+    .filter(([k]) => ['ethereum', 'binancecoin', 'matic-network'].includes(k))
+    .map(([k, v]) => `${k}=$${v}`).join(', '));
+
+  console.log('\n[+] Phase 1: Fetching ALL addresses from pending_targets...\n');
 
   let targetsList = [];
 
@@ -517,16 +718,14 @@ async function runCleanup() {
 
   targetsList = null;
 
-  console.log('[+] Phase 2: Running Stage 1 (on-chain) + Stage 2 (behavioral) analysis...\n');
+  console.log('[+] Phase 2: Running Stage 1 (on-chain state & $ threshold) + Stage 2 (behavioral) analysis...\n');
 
-  // Accumulates ALL invalid addresses for final summary reporting
   const invalidByChain = new Map([
     [1, new Set()],
     [56, new Set()],
     [137, new Set()],
   ]);
 
-  // Holds invalid addresses waiting to be purged during active execution
   const pendingPurgeByChain = new Map([
     [1, new Set()],
     [56, new Set()],
@@ -591,7 +790,6 @@ async function runCleanup() {
       );
     }
 
-    // Purge every 1,000 address filters
     if (analyzedCount - lastPurgeAt >= 1000) {
       await purgePendingTargets(pendingPurgeByChain);
       lastPurgeAt = analyzedCount;
@@ -678,7 +876,7 @@ async function runCleanup() {
   console.log('==================================================');
   console.log(`  ├─ Total addresses analyzed:    ${analyzedCount}`);
   console.log(`  ├─ Confirmed humans:            ${humanCount}`);
-  console.log(`  ├─ Stage 1 rejects:             ${stage1Rejects} (contract/nonce/balance)`);
+  console.log(`  ├─ Stage 1 rejects:             ${stage1Rejects} (contract/zero_nonce/low_balance)`);
   console.log(`  ├─ Stage 2 rejects:             ${stage2Rejects} (behavioral)`);
   console.log(`  ├─ RPC failures (preserved):    ${rpcFailCount}`);
   console.log(`  └─ Unique addresses purged:     ${totalInvalid}`);
@@ -699,7 +897,6 @@ async function runCleanup() {
     }
   }
 
-  // ─── DRY-RUN EXIT ───
   if (isDryRun) {
     console.log('\n[🔍 DRY-RUN COMPLETE]');
     console.log(`  ├─ ${totalInvalid} addresses WOULD be purged from pending_targets.`);
@@ -708,7 +905,7 @@ async function runCleanup() {
   }
 
   // ═══════════════════════════════════════════════════════════
-  // PHASE 4: Final Purge (purges remaining addresses < 4000)
+  // PHASE 4: Final Purge
   // ═══════════════════════════════════════════════════════════
 
   let remainingCount = 0;
