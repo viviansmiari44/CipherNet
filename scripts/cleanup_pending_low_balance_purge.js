@@ -800,6 +800,7 @@ async function runCleanup() {
   let stage2Rejects = 0;
   let rpcFailCount = 0;
   let lastPurgeAt = 0;
+  let totalPromoted = 0;
 
   for (let i = 0; i < uniqueAddresses.length; i += BATCH_SIZE) {
     const batch = uniqueAddresses.slice(i, i + BATCH_SIZE);
@@ -856,6 +857,13 @@ async function runCleanup() {
     }
 
     if (analyzedCount - lastPurgeAt >= 1000) {
+      // 🆕 Promote valid targets to pending_targets every 1000 analyzed
+      if (validTargetsToPromote.length > 0) {
+        const batchPromoted = await promoteToPending(validTargetsToPromote);
+        totalPromoted += batchPromoted;
+        validTargetsToPromote.length = 0; // Clear array for next batch
+      }
+
       await purgeRawTargets(pendingRawIdsToDelete);
       lastPurgeAt = analyzedCount;
     }
@@ -945,7 +953,8 @@ async function runCleanup() {
   console.log(`  ├─ Stage 2 rejects:             ${stage2Rejects} (behavioral bots)`);
   console.log(`  ├─ RPC failures (promoted):     ${rpcFailCount}`);
   console.log(`  ├─ Invalid targets discarded:   ${totalInvalid}`);
-  console.log(`  └─ Valid targets to promote:    ${validTargetsToPromote.length}`);
+  console.log(`  ├─ Valid targets in queue:      ${validTargetsToPromote.length}`);
+  console.log(`  └─ Total promoted so far:       ${totalPromoted}`);
 
   if (reasonCounts.size > 0) {
     console.log('\n  📋 Outcome breakdown:');
@@ -967,7 +976,7 @@ async function runCleanup() {
 
   if (isDryRun) {
     console.log('\n[🔍 DRY-RUN COMPLETE]');
-    console.log(`  ├─ ${validTargetsToPromote.length} targets WOULD be promoted to pending_targets.`);
+    console.log(`  ├─ ${totalPromoted + validTargetsToPromote.length} total targets WOULD be promoted to pending_targets.`);
     console.log(`  ├─ ${totalInvalid} invalid targets WOULD be discarded (not promoted).`);
     console.log(`  └─ ${pendingRawIdsToDelete.size} rows WOULD be removed from raw_targets.`);
     console.log('\n[i] No database changes were executed. Run without --dry-run to apply.\n');
@@ -975,20 +984,22 @@ async function runCleanup() {
   }
 
   // ═══════════════════════════════════════════════════════════
-  // PHASE 4: Promote Valid + Remove Processed
+  // PHASE 4: Final Flush (Promote remaining + Remove remaining)
   // ═══════════════════════════════════════════════════════════
 
-  console.log('\n[!] Phase 4a: Promoting validated human targets to pending_targets...\n');
-  await promoteToPending(validTargetsToPromote);
-
-  if (pendingRawIdsToDelete.size > 0) {
-    console.log('\n[!] Phase 4b: Removing all processed rows from raw_targets...\n');
-    await purgeRawTargets(pendingRawIdsToDelete);
-  } else {
-    console.log('\n[+] No remaining raw_target rows to remove.\n');
+  if (validTargetsToPromote.length > 0) {
+    console.log(`\n[!] Phase 4a: Promoting remaining ${validTargetsToPromote.length} validated human targets to pending_targets...\n`);
+    const finalPromoted = await promoteToPending(validTargetsToPromote);
+    totalPromoted += finalPromoted;
+    validTargetsToPromote.length = 0;
   }
 
-  console.log('\n[🎉] raw_targets → pending_targets pipeline complete across all chains!\n');
+  if (pendingRawIdsToDelete.size > 0) {
+    console.log(`\n[!] Phase 4b: Removing remaining ${pendingRawIdsToDelete.size} processed rows from raw_targets...\n`);
+    await purgeRawTargets(pendingRawIdsToDelete);
+  }
+
+  console.log(`\n[🎉] Pipeline complete! Total promoted to pending_targets: ${totalPromoted}\n`);
 }
 
 runCleanup();
