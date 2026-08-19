@@ -1301,27 +1301,69 @@ async function scanNewBlocks() {
 
         let highestSuccessfulBlock = lastBlockProcessed;
 
-        // 🆕 Fetch Transfer logs for this batch of blocks (needed for forged/mirror detection)
+        // 🚀 OPTIMIZED: Fetch Transfer logs ONLY involving our victims
         let batchLogs = [];
-        try {
-          const fromBlock = batch[0];
-          const toBlock = batch[batch.length - 1];
-          const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
-          batchLogs = await client.getLogs({
-            fromBlock,
-            toBlock,
-            event: {
-              type: 'event',
-              name: 'Transfer',
-              inputs: [
-                { type: 'address', indexed: true, name: 'from' },
-                { type: 'address', indexed: true, name: 'to' },
-                { type: 'uint256', indexed: false, name: 'value' },
-              ],
-            },
-          }).catch(() => []);
-        } catch (logErr) {
-          logger.warn(`Failed to fetch logs for batch: ${logErr.message}`);
+        if (victims.size > 0) {
+          try {
+            const fromBlock = batch[0];
+            const toBlock = batch[batch.length - 1];
+
+            // Pad victim addresses to 32 bytes for topic matching
+            const victimTopics = Array.from(victims.keys()).map(addr =>
+              '0x' + addr.slice(2).toLowerCase().padStart(64, '0')
+            );
+
+            // Chunk to avoid RPC payload limits (max ~100 topics per query)
+            const CHUNK_SIZE = 100;
+            const allLogs = [];
+
+            for (let i = 0; i < victimTopics.length; i += CHUNK_SIZE) {
+              const topicChunk = victimTopics.slice(i, i + CHUNK_SIZE);
+
+              // Fetch logs where victim is the SENDER (topics[1])
+              const senderLogs = await client.request({
+                method: 'eth_getLogs',
+                params: [{
+                  fromBlock: `0x${fromBlock.toString(16)}`,
+                  toBlock: `0x${toBlock.toString(16)}`,
+                  topics: [
+                    '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef', // Transfer signature
+                    topicChunk // topics[1] = from
+                  ]
+                }]
+              }).catch(() => []);
+
+              // Fetch logs where victim is the RECEIVER (topics[2])
+              const receiverLogs = await client.request({
+                method: 'eth_getLogs',
+                params: [{
+                  fromBlock: `0x${fromBlock.toString(16)}`,
+                  toBlock: `0x${toBlock.toString(16)}`,
+                  topics: [
+                    '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef', // Transfer signature
+                    null, // topics[1] = any
+                    topicChunk // topics[2] = to
+                  ]
+                }]
+              }).catch(() => []);
+
+              allLogs.push(...senderLogs, ...receiverLogs);
+            }
+
+            // Format raw RPC logs to match viem's expected structure for checkTransaction
+            batchLogs = allLogs.map(log => ({
+              address: log.address,
+              blockNumber: BigInt(log.blockNumber),
+              transactionHash: log.transactionHash,
+              args: {
+                from: '0x' + log.topics[1].slice(26),
+                to: '0x' + log.topics[2].slice(26),
+              }
+            }));
+
+          } catch (logErr) {
+            logger.warn(`Failed to fetch logs for batch: ${logErr.message}`);
+          }
         }
 
         for (let i = 0; i < blocks.length; i++) {
