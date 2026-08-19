@@ -30,46 +30,37 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 const ALCHEMY_RPCS = {
   bsc: [
     'https://bnb-mainnet.g.alchemy.com/v2/alch_6gTznTT4QnX3_0IE9gkY-',
-    'https://bsc-dataseed.binance.org',
     'https://bnb-mainnet.g.alchemy.com/v2/alch_z1J_ESjjLVZwSBLNoep84',
     'https://bnb-mainnet.g.alchemy.com/v2/alch_-NvhHn24EgwhuMt38pZJr',
-    'https://rpc.ankr.com/bsc',
     'https://bnb-mainnet.g.alchemy.com/v2/alch_8ToIPT9Z3R1iQ55nksx8b',
-    'https://bsc.publicnode.com',
     'https://bnb-mainnet.g.alchemy.com/v2/alch_Qy6hQXdtdVlE7Z4uVxt_A',
-    'https://1rpc.io/bnb',
     'https://bnb-mainnet.g.alchemy.com/v2/alch_rniHI4MxzjBfNZ4bxmDu5',
-    'https://bsc.drpc.org',
     'https://bnb-mainnet.g.alchemy.com/v2/LW3i2zPypSVe0cl4BxCxI',
     'https://bnb-mainnet.g.alchemy.com/v2/alch_WQp652MAlfKFbtD1A-zNh'
   ],
   polygon: [
     'https://polygon-mainnet.g.alchemy.com/v2/CByFU5cCGAYyh8EHLamXD',
-    'https://polygon-rpc.com',
     'https://polygon-mainnet.g.alchemy.com/v2/alch_UdSkrC6LFs2HGS0VUGg5O',
     'https://polygon-mainnet.g.alchemy.com/v2/alch_tAPr1C9JUzQZYax5pslu5',
-    'https://rpc.ankr.com/polygon',
     'https://polygon-mainnet.g.alchemy.com/v2/alch_Bq31mnvxmjdT70RCYLGLA',
-    'https://polygon.llamarpc.com',
     'https://polygon-mainnet.g.alchemy.com/v2/alch_17XYrB1qagYO9Edwxj7Cw',
-    'https://polygon.publicnode.com',
     'https://polygon-mainnet.g.alchemy.com/v2/alch_UQzY-saHkZZrowH7kylTu',
-    'https://1rpc.io/polygon',
     'https://polygon-mainnet.g.alchemy.com/v2/c6MIVgnVjXC0kgDH4BItE',
     'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11'
   ],
   ethereum: [
+    'https://eth-mainnet.g.alchemy.com/v2/alch_YHosKAPg0sfm7jDhqvW74',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_lTX5t4XwroOB87Xk0AWbY',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_9dpiCogyGyxtA4ptC-zIl',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_Y8rCHyOCRzZAW_2xLVM5r',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_gx9srjXabB0OocIDNitUd',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_9P2EBVaMvYP0SPn4zjBUB',
     'https://eth-mainnet.g.alchemy.com/v2/alch_F5VimAPoBoESKZ566us-U',
-    'https://ethereum.publicnode.com',
     'https://eth-mainnet.g.alchemy.com/v2/alch_x_oSlpf2bnfc6brp-BgzA',
     'https://eth-mainnet.g.alchemy.com/v2/alch_tp8k4HI9tVpUEBmsF3kXc',
-    'https://rpc.ankr.com/eth',
     'https://eth-mainnet.g.alchemy.com/v2/alch_7viyR-7wWLgc2i9suQ6hS',
-    'https://eth.llamarpc.com',
     'https://eth-mainnet.g.alchemy.com/v2/ig-ZUQrtw2shXhW2NuT6W',
-    'https://1rpc.io/eth',
     'https://eth-mainnet.g.alchemy.com/v2/alch_dFm-5A7LhWtYU3_4Y103o',
-    'https://eth.drpc.org',
     'https://eth-mainnet.g.alchemy.com/v2/gODtbeuBQLkTJAm3e9tB1',
     'https://eth-mainnet.g.alchemy.com/v2/GsO461DZvmNGh4O4Ss5Et'
   ],
@@ -210,6 +201,9 @@ async function fetchTransactionHistory(address, chainId) {
       }).catch(() => null)
     ]);
 
+    // If both calls fail, treat as an RPC error rather than standard empty history
+    if (!outRes && !inRes) return null;
+
     const transfers = [];
 
     // Tag the directions so the analyzer knows what kind of gap it is
@@ -275,6 +269,7 @@ function analyzeTransactionPatterns(transfers) {
   let minInterval = Infinity;
   let minInOutInterval = Infinity;
   let microGapCount = 0;
+  let sweepCount = 0;
 
   for (const tx of chronological) {
     const tsStr = tx.metadata?.blockTimestamp;
@@ -311,6 +306,9 @@ function analyzeTransactionPatterns(transfers) {
 
       // Catch an IN immediately followed by an OUT
       if (prevDirection === 'in' && tx.direction === 'out') {
+        if (gapSeconds >= 0 && gapSeconds < 180) {
+          sweepCount++;
+        }
         if (gapSeconds >= 0 && gapSeconds < minInOutInterval) {
           minInOutInterval = gapSeconds;
         }
@@ -396,8 +394,6 @@ function analyzeTransactionPatterns(transfers) {
     score += 0.50;
     signals.push(`mostly_rapid(${(rapidRatio * 100).toFixed(0)}%)`);
   }
-
-  let sweepCount = 0;
 
   if (sweepCount >= 3) {
     score += 0.80;

