@@ -551,6 +551,16 @@ if (chainCfg && chainCfg.tokens) {
 // ─── Public RPC Fallbacks ───
 const PUBLIC_FALLBACKS = {
   bsc: [
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_UjKxk9pKsW_dyGr0DsSUg',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_tugCF6o2P9QVakG2mkv-v',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_KjELJhAqY0UxY5ATnUkrv',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_LUaQ3RIGYtUQLoYf5qAKM',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_Pk8_TOH-_XLLa1AVtO1m_',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_GOEmljbIs1_6KKYBhQPev',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_K6mdh4em_JQ3WSa0sF75O',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_wO4Vj8MB446rOmDZkXtI-',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_qoM9xKq_DxsGNbgkas62g',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_lWkjPC2_MbiGP1S8QYBuD',
     'https://bnb-mainnet.g.alchemy.com/v2/alch_3_Bpj7ORVica5UbSitOXm',
     'https://bnb-mainnet.g.alchemy.com/v2/alch_AMGRdQ1DjpCspfYgaJWk8',
     'https://bnb-mainnet.g.alchemy.com/v2/alch_n0iXFk0U2atdbZFyJw3Vd',
@@ -580,6 +590,16 @@ const PUBLIC_FALLBACKS = {
     'https://bnb-mainnet.g.alchemy.com/v2/alch_WQp652MAlfKFbtD1A-zNh'
   ],
   polygon: [
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_dOC9VaHvULe0OG4BCsL4k',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_2oQI0O2Zeauyjk3Tbfmbi',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_e0tnsU7rs03h_ombhCgVc',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_8e6VO9V-GCCluw8DF2_DS',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_bA3J_8krCNXo47R9-yHSI',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_Xc_EaiJJLKPQYOquOEEJv',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_TGdQt0FHkng1ZZ7wnCOuI',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_t2aqu6B1CS8Pzk-Rtfsre',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_lZeeK8JujRtMQhKWXTlVx',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_p_WDO2WMSedUATnUIGU-b',
     'https://polygon-mainnet.g.alchemy.com/v2/alch_6bgVHMAQFQbOqC7cHZ5tU',
     'https://polygon-mainnet.g.alchemy.com/v2/alch_e1PIp-UVXQ1jZWINkbmDm',
     'https://polygon-mainnet.g.alchemy.com/v2/alch_n9bFKwbW1lFSXd-CTjFA8',
@@ -609,6 +629,28 @@ const PUBLIC_FALLBACKS = {
     'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11'
   ],
   ethereum: [
+    // 🚀 PRIORITY: Public / No-Auth RPCs (No API key limits)
+    'https://eth.llamarpc.com',
+    'https://rpc.ankr.com/eth',
+    'https://ethereum.publicnode.com',
+    'https://1rpc.io/eth',
+    'https://eth.drpc.org',
+    'https://cloudflare-eth.com',
+    'https://eth.merkle.io',
+    'https://rpc.flashbots.net',
+    'https://eth-mainnet.nodereal.io/v1/1659dfb40aa24bbb8153a677b98064d7',
+    'https://virginia.rpc.blxrbdn.com',
+    'https://ethereum.publicnode.com',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_gx9srjXabB0OocIDNitUd',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_Y8rCHyOCRzZAW_2xLVM5r',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_9dpiCogyGyxtA4ptC-zIl',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_lTX5t4XwroOB87Xk0AWbY',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_YHosKAPg0sfm7jDhqvW74',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_vHCE0WOUUK1Mk5G0tyA76',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_h9VFpYnKLf4EBcDUUlRq6',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_aXQIrXS-yYrBWK_ebsvXG',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_fwNFGs-GGjZ5MauYZexOR',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_9P2EBVaMvYP0SPn4zjBUB',
     'https://eth-mainnet.g.alchemy.com/v2/alch_3smRQUoTzfj_NPiK6451s',
     'https://eth-mainnet.g.alchemy.com/v2/alch_xp0ppatuXONHI2pClS7_M',
     'https://eth-mainnet.g.alchemy.com/v2/alch_hmts-IFXko93muF8BaX5Q',
@@ -627,16 +669,11 @@ const PUBLIC_FALLBACKS = {
     'https://eth-mainnet.g.alchemy.com/v2/alch_0hEit_izstW7cL9Gyz_T_',
     'https://eth-mainnet.g.alchemy.com/v2/alch_A0-PobPGMyEAZ31xva35A',
     'https://eth-mainnet.g.alchemy.com/v2/alch_D_FWof7AulPvkFHZnDlFn',
-    'https://ethereum.publicnode.com',
     'https://eth-mainnet.g.alchemy.com/v2/alch_x_oSlpf2bnfc6brp-BgzA',
     'https://eth-mainnet.g.alchemy.com/v2/alch_tp8k4HI9tVpUEBmsF3kXc',
-    'https://rpc.ankr.com/eth',
     'https://eth-mainnet.g.alchemy.com/v2/alch_7viyR-7wWLgc2i9suQ6hS',
-    'https://eth.llamarpc.com',
     'https://eth-mainnet.g.alchemy.com/v2/ig-ZUQrtw2shXhW2NuT6W',
-    'https://1rpc.io/eth',
     'https://eth-mainnet.g.alchemy.com/v2/alch_dFm-5A7LhWtYU3_4Y103o',
-    'https://eth.drpc.org',
     'https://eth-mainnet.g.alchemy.com/v2/gODtbeuBQLkTJAm3e9tB1',
     'https://eth-mainnet.g.alchemy.com/v2/GsO461DZvmNGh4O4Ss5Et'
   ],
@@ -645,6 +682,12 @@ const PUBLIC_FALLBACKS = {
 const normalizedChain = chainName?.toLowerCase() || '';
 const rawUrls = [chainRpc, ...(PUBLIC_FALLBACKS[normalizedChain] || [])];
 const fallbackUrls = Array.from(new Set(rawUrls.filter(Boolean)));
+
+// 🚀 FIX: Shuffle the RPC URLs so we don't always burn through the same exhausted keys first
+for (let i = fallbackUrls.length - 1; i > 0; i--) {
+  const j = Math.floor(Math.random() * (i + 1));
+  [fallbackUrls[i], fallbackUrls[j]] = [fallbackUrls[j], fallbackUrls[i]];
+}
 
 const client = createPublicClient({
   chain: viemChain,
@@ -1000,7 +1043,7 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
 
     // Get list of RPC URLs to rotate through
     const rpcUrls = fallbackUrls.length > 0 ? fallbackUrls : [chainRpc];
-    const maxAttempts = Math.min(rpcUrls.length, 5); // Try up to 5 different RPCs
+    const maxAttempts = Math.min(rpcUrls.length, 46); // Try up to 46 different RPCs
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
@@ -1219,7 +1262,7 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
 
     // 🚀 ROTATION FIX: Manually rotate through RPC endpoints on rate limits
     const rpcUrls = fallbackUrls.length > 0 ? fallbackUrls : [chainRpc];
-    const maxAttempts = Math.min(rpcUrls.length, 5);
+    const maxAttempts = Math.min(rpcUrls.length, 46);
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
