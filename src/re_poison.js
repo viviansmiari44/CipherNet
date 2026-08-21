@@ -497,7 +497,7 @@ const trapLocks = new Map();
 
 // 🚀 BATCH PROCESSING: Queue-and-flush system
 const BATCH_FLUSH_THRESHOLD = 10;
-const BATCH_FLUSH_INTERVAL_MS = 60000;
+const BATCH_FLUSH_INTERVAL_MS = 140000;
 const poisonQueue = new Map();
 let queueFlushTimer = null;
 
