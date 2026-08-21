@@ -1,5 +1,3 @@
-
-
 // backfill_last_transfers.mjs
 // Usage: node backfill_last_transfers.mjs
 // Backfills last_transfer_date, last_transfer_amount, last_transfer_asset for pending_targets and traps
@@ -19,6 +17,15 @@ const CHAIN_CONFIGS = {
     name: 'ethereum',
     chain: mainnet,
     urls: [
+      // 🚀 PUBLIC RPCs (Rotated with Alchemy)
+      'https://eth.llamarpc.com',
+      'https://rpc.ankr.com/eth',
+      'https://ethereum.publicnode.com',
+      'https://1rpc.io/eth',
+      'https://eth.drpc.org',
+      'https://cloudflare-eth.com',
+      'https://eth.merkle.io',
+      // 🧪 ALCHEMY RPCs
       'https://eth-mainnet.g.alchemy.com/v2/alch_0hEit_izstW7cL9Gyz_T_',
       'https://eth-mainnet.g.alchemy.com/v2/alch_A0-PobPGMyEAZ31xva35A',
       'https://eth-mainnet.g.alchemy.com/v2/alch_D_FWof7AulPvkFHZnDlFn',
@@ -47,6 +54,14 @@ const CHAIN_CONFIGS = {
     name: 'bsc',
     chain: bsc,
     urls: [
+      // 🚀 PUBLIC RPCs (Rotated with Alchemy)
+      'https://bsc-dataseed.binance.org',
+      'https://rpc.ankr.com/bsc',
+      'https://bsc.publicnode.com',
+      'https://1rpc.io/bnb',
+      'https://bsc.drpc.org',
+      'https://bsc.llamarpc.com',
+      // 🧪 ALCHEMY RPCs
       'https://bnb-mainnet.g.alchemy.com/v2/alch_DMA2jJjcrOWJ9R10_Fx5k',
       'https://bnb-mainnet.g.alchemy.com/v2/alch_bBpETSAAmA8VjshNMBkLn',
       'https://bnb-mainnet.g.alchemy.com/v2/alch_VJ0_4LOGnzlbo7NPkqhg-',
@@ -75,6 +90,14 @@ const CHAIN_CONFIGS = {
     name: 'polygon',
     chain: polygon,
     urls: [
+      // 🚀 PUBLIC RPCs (Rotated with Alchemy)
+      'https://polygon-rpc.com',
+      'https://rpc.ankr.com/polygon',
+      'https://polygon.llamarpc.com',
+      'https://polygon.publicnode.com',
+      'https://1rpc.io/polygon',
+      'https://polygon.drpc.org',
+      // 🧪 ALCHEMY RPCs
       'https://polygon-mainnet.g.alchemy.com/v2/alch_qfGoxus-szPvLI44z9YWw',
       'https://polygon-mainnet.g.alchemy.com/v2/alch_fcNea90VExKd5DNvSguRa',
       'https://polygon-mainnet.g.alchemy.com/v2/alch_sr3YXfVMNVZJ5qSCU0kyD',
@@ -113,41 +136,40 @@ let lastRateLimitTime = 0;
 async function showPreFlightSummary() {
   console.log('\n📊 [Pre-flight] Analyzing database state before starting...\n');
 
-  // Fetch ALL active traps globally (bypasses any chain/campaign filter issues)
-  const { count: totalActive } = await supabaseAdmin
-    .from('traps')
-    .select('*', { count: 'exact', head: true })
-    .eq('is_caught', false);
+  // --- TRAPS TABLE ---
+  const { count: totalActiveTraps } = await supabaseAdmin
+    .from('traps').select('*', { count: 'exact', head: true }).eq('is_caught', false);
+  const { count: pendingTraps } = await supabaseAdmin
+    .from('traps').select('*', { count: 'exact', head: true }).eq('is_caught', false).is('last_transfer_date', null);
+  const { count: processedTraps } = await supabaseAdmin
+    .from('traps').select('*', { count: 'exact', head: true }).eq('is_caught', false).not('last_transfer_date', 'is', null);
+  const { count: noTransferTraps } = await supabaseAdmin
+    .from('traps').select('*', { count: 'exact', head: true }).eq('is_caught', false).eq('last_transfer_date', '1970-01-01T00:00:00.000Z');
+  const realCompletedTraps = Math.max(0, (processedTraps || 0) - (noTransferTraps || 0));
 
-  // Pending = last_transfer_date is null (never processed by backfill)
-  const { count: pendingCount } = await supabaseAdmin
-    .from('traps')
-    .select('*', { count: 'exact', head: true })
-    .eq('is_caught', false)
-    .is('last_transfer_date', null);
+  console.log(`🪤 [TRAPS] Active Traps Overview:`);
+  console.log(`   ⏳ Pending backfill (null data):        ${pendingTraps || 0}`);
+  console.log(`   ✅ Have REAL transfer data:             ${realCompletedTraps}`);
+  console.log(`   ⚠️  Processed but NO transfer found:     ${noTransferTraps || 0}`);
+  console.log(`   📊 Total active traps:                  ${totalActiveTraps || 0}`);
+  console.log('');
 
-  // Processed = last_transfer_date is NOT null
-  const { count: processedCount } = await supabaseAdmin
-    .from('traps')
-    .select('*', { count: 'exact', head: true })
-    .eq('is_caught', false)
-    .not('last_transfer_date', 'is', null);
+  // --- PENDING_TARGETS TABLE ---
+  const { count: totalTargets } = await supabaseAdmin
+    .from('pending_targets').select('*', { count: 'exact', head: true });
+  const { count: pendingTargets } = await supabaseAdmin
+    .from('pending_targets').select('*', { count: 'exact', head: true }).is('last_transfer_date', null);
+  const { count: processedTargets } = await supabaseAdmin
+    .from('pending_targets').select('*', { count: 'exact', head: true }).not('last_transfer_date', 'is', null);
+  const { count: noTransferTargets } = await supabaseAdmin
+    .from('pending_targets').select('*', { count: 'exact', head: true }).eq('last_transfer_date', '1970-01-01T00:00:00.000Z');
+  const realCompletedTargets = Math.max(0, (processedTargets || 0) - (noTransferTargets || 0));
 
-  // Count how many have the 1970 fallback (meaning backfill ran, but found NO real transfer)
-  const { count: noTransferCount } = await supabaseAdmin
-    .from('traps')
-    .select('*', { count: 'exact', head: true })
-    .eq('is_caught', false)
-    .eq('last_transfer_date', '1970-01-01T00:00:00.000Z');
-
-  // Real completed = Processed minus those that fell back to 1970
-  const realCompletedCount = Math.max(0, (processedCount || 0) - (noTransferCount || 0));
-
-  console.log(`🌍 [GLOBAL] Active Traps Overview:`);
-  console.log(`   ⏳ Pending backfill (never processed):  ${pendingCount || 0}`);
-  console.log(`   ✅ Have REAL transfer data:             ${realCompletedCount}`);
-  console.log(`   ⚠️  Processed but NO transfer found:     ${noTransferCount || 0}`);
-  console.log(`   📊 Total active traps:                  ${totalActive || 0}`);
+  console.log(`🎯 [PENDING_TARGETS] Overview:`);
+  console.log(`   ⏳ Pending backfill (null data):        ${pendingTargets || 0}`);
+  console.log(`   ✅ Have REAL transfer data:             ${realCompletedTargets}`);
+  console.log(`   ⚠️  Processed but NO transfer found:     ${noTransferTargets || 0}`);
+  console.log(`   📊 Total targets:                       ${totalTargets || 0}`);
   console.log('');
 
   console.log('🚀 Starting backfill process...\n');
@@ -316,8 +338,8 @@ async function processTable(tableName, chainId, chainName, client) {
     if (tableName === 'pending_targets') {
       query = query.eq('chain', chainName);
     } else {
-      // 🚀 FIX: traps table - filter by campaign_ids AND only active (uncaught) traps
-      query = query.in('campaign_id', campaignIds).eq('is_caught', false);
+      // traps table: filter by campaign_ids
+      query = query.in('campaign_id', campaignIds);
     }
 
     const { data: records, error } = await query;
@@ -403,17 +425,14 @@ async function processTable(tableName, chainId, chainName, client) {
 }
 
 async function main() {
-  console.log('[Backfill] Starting last transfer backfill for NEW TRAPS ONLY...');
+  console.log('[Backfill] Starting last transfer backfill process...');
+  console.log('[Info] This will populate last_transfer_date, last_transfer_amount, last_transfer_asset for pending_targets and traps');
 
   // 🆕 Show summary before running
   await showPreFlightSummary();
 
   for (const [chainIdStr, config] of Object.entries(CHAIN_CONFIGS)) {
     const chainId = parseInt(chainIdStr);
-
-    // 🚀 OPTIONAL: If you only want to run this for Ethereum right now, uncomment the next line:
-    // if (config.name !== 'ethereum') continue;
-
     console.log(`\n==========================================`);
     console.log(`[Backfill] Processing chain ${config.name.toUpperCase()} (ID ${chainId})`);
     console.log(`==========================================`);
@@ -426,10 +445,10 @@ async function main() {
       ),
     });
 
-    // 🚀 SKIP pending_targets to save massive amounts of time and API calls
-    // await processTable('pending_targets', chainId, config.name, client);
+    // Process pending_targets
+    await processTable('pending_targets', chainId, config.name, client);
 
-    // Process ONLY active traps
+    // Process traps
     await processTable('traps', chainId, config.name, client);
   }
 
