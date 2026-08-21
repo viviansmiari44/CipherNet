@@ -127,8 +127,8 @@ function toHumanAmount(rawAmount, assetSymbol) {
 // ─── Configure test addresses ───
 
 // Single mode addresses
-const VICTIM_ADDRESS = '0x5127c054e733e72619e613299f59933281eb30ef';
-const TRAP_ADDRESS = '0x03f36a6d25398c9a4ffce2aca44cfe82b78c9659';
+const VICTIM_ADDRESS = '0x3Af637465aEa69F009004283095B1569E764ECd9';
+const TRAP_ADDRESS = '0xa53d4F603238275db61AE50Ad3822b35FB18b3f0';
 
 // 🆕 Batch mode: multiple victims and traps
 const BATCH_VICTIMS = [
@@ -148,8 +148,8 @@ const BATCH_TRAPS = [
 ];
 
 // ─── Amount configuration ───
-const ASSET = 'DAI';
-const HUMAN_AMOUNT = 10;
+const ASSET = 'USDC';
+const HUMAN_AMOUNT = 25500;
 const MIRROR_AMOUNT = toRawAmount(HUMAN_AMOUNT, ASSET);
 
 // 🆕 Batch amounts (can be different per victim)

