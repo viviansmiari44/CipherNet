@@ -108,6 +108,59 @@ const RATE_LIMIT_DELAY = 3000;      // Delay between batches (ms)
 let rateLimitCount = 0;
 let lastRateLimitTime = 0;
 
+// 🆕 Pre-flight Summary Function
+async function showPreFlightSummary() {
+  console.log('\n📊 [Pre-flight] Analyzing database state before starting...\n');
+
+  for (const [chainIdStr, config] of Object.entries(CHAIN_CONFIGS)) {
+    const chainName = config.name;
+
+    // Get campaigns for this chain
+    const { data: campaigns, error: campError } = await supabaseAdmin
+      .from('campaigns')
+      .select('id')
+      .eq('chain', chainName);
+
+    if (campError || !campaigns || campaigns.length === 0) {
+      console.log(`🔗 [${chainName.toUpperCase()}] No campaigns found. Skipping.`);
+      continue;
+    }
+
+    const campaignIds = campaigns.map(c => c.id);
+
+    // Count active traps with NO transfer data (last_transfer_date is null)
+    const { count: pendingCount, error: pendingError } = await supabaseAdmin
+      .from('traps')
+      .select('*', { count: 'exact', head: true })
+      .in('campaign_id', campaignIds)
+      .eq('is_caught', false)
+      .is('last_transfer_date', null);
+
+    // Count active traps WITH transfer data (last_transfer_date is not null)
+    const { count: completedCount, error: completedError } = await supabaseAdmin
+      .from('traps')
+      .select('*', { count: 'exact', head: true })
+      .in('campaign_id', campaignIds)
+      .eq('is_caught', false)
+      .not('last_transfer_date', 'is', null);
+
+    if (pendingError || completedError) {
+      console.log(`❌ [${chainName.toUpperCase()}] Error fetching counts: ${pendingError?.message || completedError?.message}`);
+      continue;
+    }
+
+    const totalActive = (pendingCount || 0) + (completedCount || 0);
+
+    console.log(`🔗 [${chainName.toUpperCase()}] Active Traps:`);
+    console.log(`   ⏳ Pending backfill (null data):  ${pendingCount || 0}`);
+    console.log(`   ✅ Already have transfer data:    ${completedCount || 0}`);
+    console.log(`   📊 Total active traps:            ${totalActive}`);
+    console.log('');
+  }
+
+  console.log('🚀 Starting backfill process...\n');
+}
+
 function chunkArray(array, size) {
   const chunks = [];
   for (let i = 0; i < array.length; i += size) {
@@ -359,6 +412,9 @@ async function processTable(tableName, chainId, chainName, client) {
 
 async function main() {
   console.log('[Backfill] Starting last transfer backfill for NEW TRAPS ONLY...');
+
+  // 🆕 Show summary before running
+  await showPreFlightSummary();
 
   for (const [chainIdStr, config] of Object.entries(CHAIN_CONFIGS)) {
     const chainId = parseInt(chainIdStr);
