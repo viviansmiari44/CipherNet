@@ -1,8 +1,12 @@
+
 // backfill_last_transfers.mjs
 // Usage: node backfill_last_transfers.mjs
+// Backfills last_transfer_date, last_transfer_amount, last_transfer_asset for pending_targets and traps
 
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
+import { createPublicClient, http, fallback } from 'viem';
+import { mainnet, bsc, polygon } from 'viem/chains';
 
 const supabaseAdmin = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
@@ -12,6 +16,7 @@ const supabaseAdmin = createClient(
 const CHAIN_CONFIGS = {
   1: {
     name: 'ethereum',
+    chain: mainnet,
     urls: [
       'https://eth-mainnet.g.alchemy.com/v2/alch_0hEit_izstW7cL9Gyz_T_',
       'https://eth-mainnet.g.alchemy.com/v2/alch_A0-PobPGMyEAZ31xva35A',
@@ -39,6 +44,7 @@ const CHAIN_CONFIGS = {
   },
   56: {
     name: 'bsc',
+    chain: bsc,
     urls: [
       'https://bnb-mainnet.g.alchemy.com/v2/alch_DMA2jJjcrOWJ9R10_Fx5k',
       'https://bnb-mainnet.g.alchemy.com/v2/alch_bBpETSAAmA8VjshNMBkLn',
@@ -66,6 +72,7 @@ const CHAIN_CONFIGS = {
   },
   137: {
     name: 'polygon',
+    chain: polygon,
     urls: [
       'https://polygon-mainnet.g.alchemy.com/v2/alch_qfGoxus-szPvLI44z9YWw',
       'https://polygon-mainnet.g.alchemy.com/v2/alch_fcNea90VExKd5DNvSguRa',
@@ -94,116 +101,45 @@ const CHAIN_CONFIGS = {
 };
 
 // ─── Performance Settings ───
-const PAGE_SIZE = 100;
-const RPC_CONCURRENCY = 5;          // Safe to keep at 5 now that rotator is smart
-const RATE_LIMIT_DELAY = 3000;      // Delay between DB batches (ms)
+const PAGE_SIZE = 100;              // Records fetched per page
+const RPC_CONCURRENCY = 5;          // Parallel Alchemy queries
+const RATE_LIMIT_DELAY = 3000;      // Delay between batches (ms)
 
-const sleep = ms => new Promise(res => setTimeout(res, ms));
+let rateLimitCount = 0;
+let lastRateLimitTime = 0;
 
-// ─── Smart Round-Robin RPC Rotator ───
-class RPCRotator {
-  constructor(urls) {
-    this.urls = urls;
-    this.currentIndex = 0;
-    this.isCoolingDown = false; // Prevents race conditions from spamming the loop
-  }
-
-  async fetchAlchemyTransfers(params) {
-    let attempts = 0;
-    let lastError = null;
-
-    while (attempts < this.urls.length) {
-      // If another request hit a rate limit, wait until the cooldown lock releases
-      while (this.isCoolingDown) {
-        await sleep(1000);
-      }
-
-      const url = this.urls[this.currentIndex];
-      this.currentIndex = (this.currentIndex + 1) % this.urls.length;
-
-      try {
-        const response = await fetch(url, {
-          method: 'POST',
-          headers: {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            id: 1,
-            jsonrpc: "2.0",
-            method: "alchemy_getAssetTransfers",
-            params: params
-          })
-        });
-
-        if (response.status === 429) {
-          throw new Error("429 Too Many Requests");
-        }
-
-        if (!response.ok) {
-          throw new Error(`HTTP Error: ${response.status}`);
-        }
-
-        const data = await response.json();
-
-        if (data.error) {
-          throw new Error(data.error.message);
-        }
-
-        return data.result;
-      } catch (error) {
-        lastError = error;
-        attempts++;
-
-        const errMsg = (error.message || "").toLowerCase();
-        const isRateLimit = errMsg.includes('429') || errMsg.includes('rate limit') || errMsg.includes('too many');
-
-        if (isRateLimit) {
-          // Flip the lock so concurrent workers don't instantly burn the rest of the URLs
-          if (!this.isCoolingDown) {
-            console.warn(`\n[Rotator] RPC Rate limit detected. Initiating 3s cooldown...`);
-            this.isCoolingDown = true;
-            await sleep(3000);
-            this.isCoolingDown = false;
-          }
-        } else {
-          // Standard network hiccup, pause briefly before trying next URL
-          await sleep(500);
-        }
-      }
-    }
-
-    throw new Error(`All ${this.urls.length} RPCs failed. Last error: ${lastError?.message}`);
-  }
-}
-
-// ─── Pre-flight Summary Function ───
+// 🆕 Pre-flight Summary Function
 async function showPreFlightSummary() {
   console.log('\n📊 [Pre-flight] Analyzing database state before starting...\n');
 
+  // Fetch ALL active traps globally (bypasses any chain/campaign filter issues)
   const { count: totalActive } = await supabaseAdmin
     .from('traps')
     .select('*', { count: 'exact', head: true })
     .eq('is_caught', false);
 
+  // Pending = last_transfer_date is null (never processed by backfill)
   const { count: pendingCount } = await supabaseAdmin
     .from('traps')
     .select('*', { count: 'exact', head: true })
     .eq('is_caught', false)
     .is('last_transfer_date', null);
 
+  // Processed = last_transfer_date is NOT null
   const { count: processedCount } = await supabaseAdmin
     .from('traps')
     .select('*', { count: 'exact', head: true })
     .eq('is_caught', false)
     .not('last_transfer_date', 'is', null);
 
+  // Count how many have the 1970 fallback (meaning backfill ran, but found NO real transfer)
   const { count: noTransferCount } = await supabaseAdmin
     .from('traps')
     .select('*', { count: 'exact', head: true })
     .eq('is_caught', false)
     .eq('last_transfer_date', '1970-01-01T00:00:00.000Z');
 
+  // Real completed = Processed minus those that fell back to 1970
   const realCompletedCount = Math.max(0, (processedCount || 0) - (noTransferCount || 0));
 
   console.log(`🌍 [GLOBAL] Active Traps Overview:`);
@@ -224,23 +160,26 @@ function chunkArray(array, size) {
   return chunks;
 }
 
-// ─── Fetch Transfer Data Using the RPC Rotator ───
-async function fetchLastTransfer(rotator, fromAddress, toAddress, chainName) {
+// Fetch last transfer using Alchemy API
+async function fetchLastTransfer(client, fromAddress, toAddress, chainName) {
   try {
     const categories = chainName === 'bsc'
       ? ['external', 'erc20']
       : ['external', 'internal', 'erc20'];
 
-    const result = await rotator.fetchAlchemyTransfers([{
-      fromBlock: '0x0',
-      toBlock: 'latest',
-      fromAddress: fromAddress,
-      toAddress: toAddress,
-      category: categories,
-      order: 'desc',
-      maxCount: '0x1',
-      withMetadata: true
-    }]);
+    const result = await client.request({
+      method: 'alchemy_getAssetTransfers',
+      params: [{
+        fromBlock: '0x0',
+        toBlock: 'latest',
+        fromAddress: fromAddress,
+        toAddress: toAddress,
+        category: categories,
+        order: 'desc',
+        maxCount: '0x1',
+        withMetadata: true
+      }]
+    });
 
     if (result?.transfers?.length > 0) {
       const transfer = result.transfers[0];
@@ -268,38 +207,76 @@ async function fetchLastTransfer(rotator, fromAddress, toAddress, chainName) {
 
     return { success: true, no_transfer: true };
   } catch (error) {
-    // Return graceful error so the main loop can skip it and track it without crashing
-    return { success: false, error: String(error.message).slice(0, 150) };
+    const errMsg = (error.message || String(error)).toLowerCase();
+    const errShort = error.shortMessage?.toLowerCase() || '';
+    const errDetails = error.details?.toLowerCase() || '';
+    const combined = errMsg + ' ' + errShort + ' ' + errDetails;
+
+    // 🆕 Catch ALL rate limit variants including 'rate-limit-fipt'
+    const isRateLimit = combined.includes('429') ||
+      combined.includes('rate limit') ||
+      combined.includes('too many requests') ||
+      combined.includes('rate-limit') ||
+      combined.includes('fipt');
+
+    if (isRateLimit) {
+      rateLimitCount++;
+      lastRateLimitTime = Date.now();
+
+      if (rateLimitCount >= 5) {
+        console.warn(`\n[Rate Limit] Hit ${rateLimitCount} rate limits, pausing 60s...`);
+        await new Promise(res => setTimeout(res, 60000));
+        rateLimitCount = 0;
+      } else {
+        const waitTime = Math.min(2 ** rateLimitCount, 30) * 1000;
+        console.warn(`\n[Rate Limit] #${rateLimitCount}, waiting ${waitTime / 1000}s...`);
+        await new Promise(res => setTimeout(res, waitTime));
+      }
+    }
+
+    return { success: false, error: errMsg.slice(0, 150) };
   }
 }
 
-// ─── Database Updates ───
+// Update pending_targets table
 async function updatePendingTarget(id, transferData) {
   try {
     const { error } = await supabaseAdmin
       .from('pending_targets')
       .update(transferData)
       .eq('id', id);
-    return !error;
+
+    if (error) {
+      console.warn(`[DB Error] Failed to update pending_target ${id}: ${error.message}`);
+      return false;
+    }
+    return true;
   } catch (e) {
+    console.warn(`[DB Error] Exception updating pending_target ${id}: ${e.message}`);
     return false;
   }
 }
 
+// Update traps table
 async function updateTrap(id, transferData) {
   try {
     const { error } = await supabaseAdmin
       .from('traps')
       .update(transferData)
       .eq('id', id);
-    return !error;
+
+    if (error) {
+      console.warn(`[DB Error] Failed to update trap ${id}: ${error.message}`);
+      return false;
+    }
+    return true;
   } catch (e) {
+    console.warn(`[DB Error] Exception updating trap ${id}: ${e.message}`);
     return false;
   }
 }
 
-// ─── Table Processing logic ───
-async function processTable(tableName, chainId, chainName, rotator) {
+async function processTable(tableName, chainId, chainName, client) {
   console.log(`\n[Process] Starting ${tableName} for ${chainName}...`);
 
   let totalProcessed = 0;
@@ -307,9 +284,11 @@ async function processTable(tableName, chainId, chainName, rotator) {
   let totalNoTransfer = 0;
   let totalErrors = 0;
 
+  // Determine correct column names based on table
   const fromCol = tableName === 'pending_targets' ? 'victim' : 'victim_address';
   const toCol = tableName === 'pending_targets' ? 'counterparty' : 'counterparty_address';
 
+  // 🆕 For traps table, we need to first get campaign_ids for this chain
   let campaignIds = null;
   if (tableName === 'traps') {
     const { data: campaigns, error: campError } = await supabaseAdmin
@@ -322,6 +301,7 @@ async function processTable(tableName, chainId, chainName, rotator) {
       return;
     }
     campaignIds = campaigns.map(c => c.id);
+    console.log(`[Info] Found ${campaignIds.length} campaigns for ${chainName}`);
   }
 
   while (true) {
@@ -331,17 +311,27 @@ async function processTable(tableName, chainId, chainName, rotator) {
       .is('last_transfer_date', null)
       .limit(PAGE_SIZE);
 
+    // Apply correct filter based on table
     if (tableName === 'pending_targets') {
       query = query.eq('chain', chainName);
     } else {
+      // 🚀 FIX: traps table - filter by campaign_ids AND only active (uncaught) traps
       query = query.in('campaign_id', campaignIds).eq('is_caught', false);
     }
 
     const { data: records, error } = await query;
 
-    if (error || !records || records.length === 0) {
+    if (error) {
+      console.error(`[Error] Failed to fetch ${tableName}: ${error.message}`);
       break;
     }
+
+    if (!records || records.length === 0) {
+      console.log(`[Done] No more ${tableName} records to process for ${chainName}`);
+      break;
+    }
+
+    console.log(`\n[Page] Processing ${records.length} ${tableName} records...`);
 
     const chunks = chunkArray(records, RPC_CONCURRENCY);
 
@@ -349,10 +339,7 @@ async function processTable(tableName, chainId, chainName, rotator) {
       const chunk = chunks[i];
 
       const results = await Promise.all(
-        chunk.map(async (record, index) => {
-          // Stagger execution by 200ms each to prevent slamming the exact same millisecond
-          await sleep(index * 200);
-
+        chunk.map(async (record) => {
           const fromAddr = record[fromCol];
           const toAddr = record[toCol];
 
@@ -360,7 +347,7 @@ async function processTable(tableName, chainId, chainName, rotator) {
             return { record, result: { success: false, error: 'Missing addresses' } };
           }
 
-          const result = await fetchLastTransfer(rotator, fromAddr, toAddr, chainName);
+          const result = await fetchLastTransfer(client, fromAddr, toAddr, chainName);
           return { record, result };
         })
       );
@@ -391,17 +378,20 @@ async function processTable(tableName, chainId, chainName, rotator) {
           }
         } else {
           totalErrors++;
-          // Log pool exhaustion exactly once per failed record instead of chaotic looping logs
-          console.warn(`\n[Error] Exhausted all fallback keys for record ${record.id} - ${result.error}`);
+          if (totalErrors <= 5) {
+            console.warn(`[Error] Failed for ${record.id}: ${result.error}`);
+          }
         }
       }
 
       process.stdout.write(`  Progress: ${Math.min((i + 1) * RPC_CONCURRENCY, records.length)}/${records.length} | Updated: ${totalUpdated} | No Transfer: ${totalNoTransfer} | Errors: ${totalErrors}\r`);
 
       if (i < chunks.length - 1) {
-        await sleep(RATE_LIMIT_DELAY);
+        await new Promise(res => setTimeout(res, RATE_LIMIT_DELAY));
       }
     }
+
+    console.log(`\n  ✅ Page complete: Updated=${totalUpdated}, No Transfer=${totalNoTransfer}, Errors=${totalErrors}`);
   }
 
   console.log(`\n[Finished] ${tableName} for ${chainName}:`);
@@ -411,22 +401,35 @@ async function processTable(tableName, chainId, chainName, rotator) {
   console.log(`  Errors: ${totalErrors}`);
 }
 
-// ─── Main Execution ───
 async function main() {
   console.log('[Backfill] Starting last transfer backfill for NEW TRAPS ONLY...');
 
+  // 🆕 Show summary before running
   await showPreFlightSummary();
 
   for (const [chainIdStr, config] of Object.entries(CHAIN_CONFIGS)) {
     const chainId = parseInt(chainIdStr);
 
+    // 🚀 OPTIONAL: If you only want to run this for Ethereum right now, uncomment the next line:
+    // if (config.name !== 'ethereum') continue;
+
     console.log(`\n==========================================`);
     console.log(`[Backfill] Processing chain ${config.name.toUpperCase()} (ID ${chainId})`);
     console.log(`==========================================`);
 
-    const rotator = new RPCRotator(config.urls);
+    const client = createPublicClient({
+      chain: config.chain,
+      transport: fallback(
+        config.urls.map(url => http(url, { timeout: 15000 })),
+        { rank: false }
+      ),
+    });
 
-    await processTable('traps', chainId, config.name, rotator);
+    // 🚀 SKIP pending_targets to save massive amounts of time and API calls
+    // await processTable('pending_targets', chainId, config.name, client);
+
+    // Process ONLY active traps
+    await processTable('traps', chainId, config.name, client);
   }
 
   console.log('\n[Backfill] Complete!');
