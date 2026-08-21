@@ -644,15 +644,7 @@ const PUBLIC_FALLBACKS = {
   ],
   ethereum: [
     // 🚀 PRIORITY: Public / No-Auth RPCs (No API key limits)
-    'https://eth.llamarpc.com',
-    'https://rpc.ankr.com/eth',
-    'https://ethereum.publicnode.com',
-    'https://1rpc.io/eth',
-    'https://eth.drpc.org',
-    'https://cloudflare-eth.com',
-    'https://eth.merkle.io',
-    'https://eth-mainnet.nodereal.io/v1/1659dfb40aa24bbb8153a677b98064d7',
-    'https://ethereum.publicnode.com',
+
     'https://eth-mainnet.g.alchemy.com/v2/alch_gx9srjXabB0OocIDNitUd',
     'https://eth-mainnet.g.alchemy.com/v2/alch_Y8rCHyOCRzZAW_2xLVM5r',
     'https://eth-mainnet.g.alchemy.com/v2/alch_9dpiCogyGyxtA4ptC-zIl',
