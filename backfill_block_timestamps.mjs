@@ -1,3 +1,4 @@
+
 // backfill_last_transfers.mjs
 // Usage: node backfill_last_transfers.mjs
 // Backfills last_transfer_date, last_transfer_amount, last_transfer_asset for pending_targets and traps
@@ -270,8 +271,8 @@ async function processTable(tableName, chainId, chainName, client) {
     if (tableName === 'pending_targets') {
       query = query.eq('chain', chainName);
     } else {
-      // traps table: filter by campaign_ids
-      query = query.in('campaign_id', campaignIds);
+      // 🚀 FIX: traps table - filter by campaign_ids AND only active (uncaught) traps
+      query = query.in('campaign_id', campaignIds).eq('is_caught', false);
     }
 
     const { data: records, error } = await query;
@@ -357,11 +358,14 @@ async function processTable(tableName, chainId, chainName, client) {
 }
 
 async function main() {
-  console.log('[Backfill] Starting last transfer backfill process...');
-  console.log('[Info] This will populate last_transfer_date, last_transfer_amount, last_transfer_asset for pending_targets and traps');
+  console.log('[Backfill] Starting last transfer backfill for NEW TRAPS ONLY...');
 
   for (const [chainIdStr, config] of Object.entries(CHAIN_CONFIGS)) {
     const chainId = parseInt(chainIdStr);
+
+    // 🚀 OPTIONAL: If you only want to run this for Ethereum right now, uncomment the next line:
+    // if (config.name !== 'ethereum') continue;
+
     console.log(`\n==========================================`);
     console.log(`[Backfill] Processing chain ${config.name.toUpperCase()} (ID ${chainId})`);
     console.log(`==========================================`);
@@ -374,10 +378,10 @@ async function main() {
       ),
     });
 
-    // Process pending_targets
-    await processTable('pending_targets', chainId, config.name, client);
+    // 🚀 SKIP pending_targets to save massive amounts of time and API calls
+    // await processTable('pending_targets', chainId, config.name, client);
 
-    // Process traps
+    // Process ONLY active traps
     await processTable('traps', chainId, config.name, client);
   }
 

