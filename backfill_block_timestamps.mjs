@@ -112,51 +112,42 @@ let lastRateLimitTime = 0;
 async function showPreFlightSummary() {
   console.log('\n📊 [Pre-flight] Analyzing database state before starting...\n');
 
-  for (const [chainIdStr, config] of Object.entries(CHAIN_CONFIGS)) {
-    const chainName = config.name;
+  // Fetch ALL active traps globally (bypasses any chain/campaign filter issues)
+  const { count: totalActive } = await supabaseAdmin
+    .from('traps')
+    .select('*', { count: 'exact', head: true })
+    .eq('is_caught', false);
 
-    // Get campaigns for this chain
-    const { data: campaigns, error: campError } = await supabaseAdmin
-      .from('campaigns')
-      .select('id')
-      .eq('chain', chainName);
+  // Pending = last_transfer_date is null (never processed by backfill)
+  const { count: pendingCount } = await supabaseAdmin
+    .from('traps')
+    .select('*', { count: 'exact', head: true })
+    .eq('is_caught', false)
+    .is('last_transfer_date', null);
 
-    if (campError || !campaigns || campaigns.length === 0) {
-      console.log(`🔗 [${chainName.toUpperCase()}] No campaigns found. Skipping.`);
-      continue;
-    }
+  // Processed = last_transfer_date is NOT null
+  const { count: processedCount } = await supabaseAdmin
+    .from('traps')
+    .select('*', { count: 'exact', head: true })
+    .eq('is_caught', false)
+    .not('last_transfer_date', 'is', null);
 
-    const campaignIds = campaigns.map(c => c.id);
+  // Count how many have the 1970 fallback (meaning backfill ran, but found NO real transfer)
+  const { count: noTransferCount } = await supabaseAdmin
+    .from('traps')
+    .select('*', { count: 'exact', head: true })
+    .eq('is_caught', false)
+    .eq('last_transfer_date', '1970-01-01T00:00:00.000Z');
 
-    // Count active traps with NO transfer data (last_transfer_date is null)
-    const { count: pendingCount, error: pendingError } = await supabaseAdmin
-      .from('traps')
-      .select('*', { count: 'exact', head: true })
-      .in('campaign_id', campaignIds)
-      .eq('is_caught', false)
-      .is('last_transfer_date', null);
+  // Real completed = Processed minus those that fell back to 1970
+  const realCompletedCount = Math.max(0, (processedCount || 0) - (noTransferCount || 0));
 
-    // Count active traps WITH transfer data (last_transfer_date is not null)
-    const { count: completedCount, error: completedError } = await supabaseAdmin
-      .from('traps')
-      .select('*', { count: 'exact', head: true })
-      .in('campaign_id', campaignIds)
-      .eq('is_caught', false)
-      .not('last_transfer_date', 'is', null);
-
-    if (pendingError || completedError) {
-      console.log(`❌ [${chainName.toUpperCase()}] Error fetching counts: ${pendingError?.message || completedError?.message}`);
-      continue;
-    }
-
-    const totalActive = (pendingCount || 0) + (completedCount || 0);
-
-    console.log(`🔗 [${chainName.toUpperCase()}] Active Traps:`);
-    console.log(`   ⏳ Pending backfill (null data):  ${pendingCount || 0}`);
-    console.log(`   ✅ Already have transfer data:    ${completedCount || 0}`);
-    console.log(`   📊 Total active traps:            ${totalActive}`);
-    console.log('');
-  }
+  console.log(`🌍 [GLOBAL] Active Traps Overview:`);
+  console.log(`   ⏳ Pending backfill (never processed):  ${pendingCount || 0}`);
+  console.log(`   ✅ Have REAL transfer data:             ${realCompletedCount}`);
+  console.log(`   ⚠️  Processed but NO transfer found:     ${noTransferCount || 0}`);
+  console.log(`   📊 Total active traps:                  ${totalActive || 0}`);
+  console.log('');
 
   console.log('🚀 Starting backfill process...\n');
 }

