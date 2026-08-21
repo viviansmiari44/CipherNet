@@ -1,6 +1,5 @@
 // backfill_last_transfers.mjs
 // Usage: node backfill_last_transfers.mjs
-// Backfills last_transfer_date, last_transfer_amount, last_transfer_asset for pending_targets and traps
 
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
@@ -95,18 +94,18 @@ const CHAIN_CONFIGS = {
 };
 
 // ─── Performance Settings ───
-const PAGE_SIZE = 100;              // Records fetched per page
-const RPC_CONCURRENCY = 5;          // Parallel Alchemy queries
-const RATE_LIMIT_DELAY = 3000;      // Delay between batches (ms)
+const PAGE_SIZE = 100;
+const RPC_CONCURRENCY = 5;          // Safe to keep at 5 now that rotator is smart
+const RATE_LIMIT_DELAY = 3000;      // Delay between DB batches (ms)
 
-let rateLimitCount = 0;
-let lastRateLimitTime = 0;
+const sleep = ms => new Promise(res => setTimeout(res, ms));
 
-// ─── Custom Round-Robin RPC Rotator ───
+// ─── Smart Round-Robin RPC Rotator ───
 class RPCRotator {
   constructor(urls) {
     this.urls = urls;
     this.currentIndex = 0;
+    this.isCoolingDown = false; // Prevents race conditions from spamming the loop
   }
 
   async fetchAlchemyTransfers(params) {
@@ -114,7 +113,11 @@ class RPCRotator {
     let lastError = null;
 
     while (attempts < this.urls.length) {
-      // Grab current URL and immediately cycle to the next to naturally balance load
+      // If another request hit a rate limit, wait until the cooldown lock releases
+      while (this.isCoolingDown) {
+        await sleep(1000);
+      }
+
       const url = this.urls[this.currentIndex];
       this.currentIndex = (this.currentIndex + 1) % this.urls.length;
 
@@ -133,6 +136,10 @@ class RPCRotator {
           })
         });
 
+        if (response.status === 429) {
+          throw new Error("429 Too Many Requests");
+        }
+
         if (!response.ok) {
           throw new Error(`HTTP Error: ${response.status}`);
         }
@@ -147,12 +154,26 @@ class RPCRotator {
       } catch (error) {
         lastError = error;
         attempts++;
-        // Caught an error (rate limit or network), loop restarts and hits the next URL instantly.
+
+        const errMsg = (error.message || "").toLowerCase();
+        const isRateLimit = errMsg.includes('429') || errMsg.includes('rate limit') || errMsg.includes('too many');
+
+        if (isRateLimit) {
+          // Flip the lock so concurrent workers don't instantly burn the rest of the URLs
+          if (!this.isCoolingDown) {
+            console.warn(`\n[Rotator] RPC Rate limit detected. Initiating 3s cooldown...`);
+            this.isCoolingDown = true;
+            await sleep(3000);
+            this.isCoolingDown = false;
+          }
+        } else {
+          // Standard network hiccup, pause briefly before trying next URL
+          await sleep(500);
+        }
       }
     }
 
-    // Only throw to the main script if we've exhausted all URLs in the pool without success
-    throw new Error(`All ${this.urls.length} RPCs rate-limited or failed. Last error: ${lastError?.message}`);
+    throw new Error(`All ${this.urls.length} RPCs failed. Last error: ${lastError?.message}`);
   }
 }
 
@@ -247,34 +268,8 @@ async function fetchLastTransfer(rotator, fromAddress, toAddress, chainName) {
 
     return { success: true, no_transfer: true };
   } catch (error) {
-    // This catch block only triggers if the RPCRotator has failed across EVERY URL.
-    const errMsg = (error.message || String(error)).toLowerCase();
-    const errShort = error.shortMessage?.toLowerCase() || '';
-    const errDetails = error.details?.toLowerCase() || '';
-    const combined = errMsg + ' ' + errShort + ' ' + errDetails;
-
-    const isRateLimit = combined.includes('429') ||
-      combined.includes('rate limit') ||
-      combined.includes('too many requests') ||
-      combined.includes('rate-limit') ||
-      combined.includes('fipt');
-
-    if (isRateLimit) {
-      rateLimitCount++;
-      lastRateLimitTime = Date.now();
-
-      if (rateLimitCount >= 5) {
-        console.warn(`\n[Rate Limit] Pool exhausted 5 times, pausing 60s...`);
-        await new Promise(res => setTimeout(res, 60000));
-        rateLimitCount = 0;
-      } else {
-        const waitTime = Math.min(2 ** rateLimitCount, 30) * 1000;
-        console.warn(`\n[Rate Limit] Pool exhausted #${rateLimitCount}, waiting ${waitTime / 1000}s...`);
-        await new Promise(res => setTimeout(res, waitTime));
-      }
-    }
-
-    return { success: false, error: errMsg.slice(0, 150) };
+    // Return graceful error so the main loop can skip it and track it without crashing
+    return { success: false, error: String(error.message).slice(0, 150) };
   }
 }
 
@@ -285,14 +280,8 @@ async function updatePendingTarget(id, transferData) {
       .from('pending_targets')
       .update(transferData)
       .eq('id', id);
-
-    if (error) {
-      console.warn(`[DB Error] Failed to update pending_target ${id}: ${error.message}`);
-      return false;
-    }
-    return true;
+    return !error;
   } catch (e) {
-    console.warn(`[DB Error] Exception updating pending_target ${id}: ${e.message}`);
     return false;
   }
 }
@@ -303,14 +292,8 @@ async function updateTrap(id, transferData) {
       .from('traps')
       .update(transferData)
       .eq('id', id);
-
-    if (error) {
-      console.warn(`[DB Error] Failed to update trap ${id}: ${error.message}`);
-      return false;
-    }
-    return true;
+    return !error;
   } catch (e) {
-    console.warn(`[DB Error] Exception updating trap ${id}: ${e.message}`);
     return false;
   }
 }
@@ -339,7 +322,6 @@ async function processTable(tableName, chainId, chainName, rotator) {
       return;
     }
     campaignIds = campaigns.map(c => c.id);
-    console.log(`[Info] Found ${campaignIds.length} campaigns for ${chainName}`);
   }
 
   while (true) {
@@ -357,17 +339,9 @@ async function processTable(tableName, chainId, chainName, rotator) {
 
     const { data: records, error } = await query;
 
-    if (error) {
-      console.error(`[Error] Failed to fetch ${tableName}: ${error.message}`);
+    if (error || !records || records.length === 0) {
       break;
     }
-
-    if (!records || records.length === 0) {
-      console.log(`[Done] No more ${tableName} records to process for ${chainName}`);
-      break;
-    }
-
-    console.log(`\n[Page] Processing ${records.length} ${tableName} records...`);
 
     const chunks = chunkArray(records, RPC_CONCURRENCY);
 
@@ -375,7 +349,10 @@ async function processTable(tableName, chainId, chainName, rotator) {
       const chunk = chunks[i];
 
       const results = await Promise.all(
-        chunk.map(async (record) => {
+        chunk.map(async (record, index) => {
+          // Stagger execution by 200ms each to prevent slamming the exact same millisecond
+          await sleep(index * 200);
+
           const fromAddr = record[fromCol];
           const toAddr = record[toCol];
 
@@ -414,20 +391,17 @@ async function processTable(tableName, chainId, chainName, rotator) {
           }
         } else {
           totalErrors++;
-          if (totalErrors <= 5) {
-            console.warn(`[Error] Failed for ${record.id}: ${result.error}`);
-          }
+          // Log pool exhaustion exactly once per failed record instead of chaotic looping logs
+          console.warn(`\n[Error] Exhausted all fallback keys for record ${record.id} - ${result.error}`);
         }
       }
 
       process.stdout.write(`  Progress: ${Math.min((i + 1) * RPC_CONCURRENCY, records.length)}/${records.length} | Updated: ${totalUpdated} | No Transfer: ${totalNoTransfer} | Errors: ${totalErrors}\r`);
 
       if (i < chunks.length - 1) {
-        await new Promise(res => setTimeout(res, RATE_LIMIT_DELAY));
+        await sleep(RATE_LIMIT_DELAY);
       }
     }
-
-    console.log(`\n  ✅ Page complete: Updated=${totalUpdated}, No Transfer=${totalNoTransfer}, Errors=${totalErrors}`);
   }
 
   console.log(`\n[Finished] ${tableName} for ${chainName}:`);
@@ -450,7 +424,6 @@ async function main() {
     console.log(`[Backfill] Processing chain ${config.name.toUpperCase()} (ID ${chainId})`);
     console.log(`==========================================`);
 
-    // Instantiate the custom rotator instead of the viem client
     const rotator = new RPCRotator(config.urls);
 
     await processTable('traps', chainId, config.name, rotator);
