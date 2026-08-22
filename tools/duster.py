@@ -1204,8 +1204,10 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
         except Exception as e:
             logger.warning(f"Could not read caught victims file: {e}")
 
-        total = len(entries)
+    # 🚀 CRITICAL: Define total right here before using it
+    total = len(entries)
     logger.info(f"Found {total} victims. Processing with mirror events only...")
+    
     if job_id:
         update_job(job_id, total=total)
         
