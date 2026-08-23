@@ -638,7 +638,10 @@ const PUBLIC_FALLBACKS = {
     'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11'
   ],
   ethereum: [
-    // 🚀 PRIORITY: Public / No-Auth RPCs (No API key limits)
+    // 🚀 PRIORITY: Flashbots Protect RPC (Bypasses public mempool 1 gwei spam filter!)
+    // Sends transactions directly to block builders, allowing us to use 0.001 gwei tips.
+    'https://rpc.flashbots.net',
+    // 🚀 PUBLIC / No-Auth RPCs (No API key limits)
     'https://eth.llamarpc.com',
     'https://rpc.ankr.com/eth',
     'https://ethereum.publicnode.com',
