@@ -12,6 +12,7 @@ import Link from 'next/link';
 import { TrendingUp } from 'lucide-react';
 import CopyButton from '@/components/CopyButton';
 import FundingKeyManager from '@/components/FundingKeyManager';
+import CounterPoisonToggle from '@/components/CounterPoisonToggle';
 
 export default async function CampaignPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
@@ -73,7 +74,10 @@ export default async function CampaignPage({ params }: { params: Promise<{ id: s
             <CopyButton text={id} />
           </p>
         </div>
-        <CampaignToggleButton campaignId={id} currentStatus={campaign.status} />
+        <div className="flex flex-col gap-2 items-end">
+          <CampaignToggleButton campaignId={id} currentStatus={campaign.status} />
+          <CounterPoisonToggle campaignId={id} initialStatus={campaign.counter_poison_enabled} />
+        </div>
         <div className="mb-6">
           <FundingKeyManager campaignId={id} />
         </div>

