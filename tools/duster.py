@@ -52,22 +52,18 @@ SUPABASE_URL = os.getenv("NEXT_PUBLIC_SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 supabase = None
 if SUPABASE_URL and SUPABASE_KEY and create_client:
-    # 🚀 FIX: Bypass strict connection limits and timeouts that cause 522 errors
-    import httpx
-    timeout_config = httpx.Timeout(60.0, connect=10.0)
-    limits = httpx.Limits(max_keepalive_connections=10, max_connections=100)
+    # 🚀 FIX: Compatible with both Supabase v1.x and v2.x+
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     
-    supabase = create_client(
-        SUPABASE_URL, 
-        SUPABASE_KEY,
-        options={
-            "postgrest.client_timeout": 60
-        }
-    )
-    # Manually patch the underlying HTTP client if it exists
-    if hasattr(supabase, '_client') and hasattr(supabase._client, 'timeout'):
-        supabase._client.timeout = timeout_config
-    print("[DEBUG] Supabase client initialized with extended timeouts")
+    # Manually patch the underlying HTTP client timeout if it exists
+    try:
+        import httpx
+        timeout_config = httpx.Timeout(60.0, connect=10.0)
+        if hasattr(supabase, '_client') and hasattr(supabase._client, 'timeout'):
+            supabase._client.timeout = timeout_config
+    except Exception:
+        pass # Silently ignore if httpx isn't available or structure changed
+    print("[DEBUG] Supabase client initialized successfully")
 
 # ─── Read preferred asset from environment (set by re_poison.js) ───
 PREFERRED_ASSET = os.getenv("DUST_ASSET")
