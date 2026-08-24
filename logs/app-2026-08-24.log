@@ -1,0 +1,4 @@
+{"level":"info","message":"[Multi‑chain] Collector started on ethereum (Ethereum), RPC: https://eth-mainnet.g.alchemy.com/v2/aV47nGP_5mNeGM8mQpTwD","timestamp":"2026-08-24T18:05:37.352Z"}
+{"level":"info","message":"[REAL-TIME MODE] Listening for new blocks only","timestamp":"2026-08-24T18:05:37.355Z"}
+{"level":"info","message":"[Multi‑chain] Collector started on ethereum (Ethereum), RPC: https://eth-mainnet.g.alchemy.com/v2/aV47nGP_5mNeGM8mQpTwD","timestamp":"2026-08-24T18:05:37.355Z"}
+{"level":"info","message":"[BACKFILL MODE] Will process last 40 days of historical data","timestamp":"2026-08-24T18:05:37.357Z"}

@@ -127,7 +127,7 @@ function toHumanAmount(rawAmount, assetSymbol) {
 // ─── Configure test addresses ───
 
 // Single mode addresses
-const VICTIM_ADDRESS = '0x0990da5d417bb9c7ac55cdd66115e633803f1a75';
+const VICTIM_ADDRESS = '0xcEd95B9eAc0805001bDAa5E7Aa91F56422791392';
 const TRAP_ADDRESS = '0x694608b33d496a3aa100740fecc6b77b5c6fa22d';
 
 // 🆕 Batch mode: multiple victims and traps
