@@ -48,26 +48,41 @@ export async function POST(
   // ✅ Send "started" notification
   await sendAlert(`🚀 Dust job started for chain ${campaign.chain} (Job ID: ${job.id})`, 'info', id);
 
-  // ─── Send webhook ───
+  // ─── Send webhook (with 5-second timeout to prevent UI blocking) ───
   const webhookUrl = `${process.env.WEBHOOK_BASE_URL}/webhook/job`;
-  try {
-    await fetch(webhookUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-webhook-secret': process.env.WEBHOOK_SECRET || '',
-      },
-      body: JSON.stringify({
-        jobId: job.id,
-        campaignId: campaign.id,
-        chain: campaign.chain,
-        type: 'dust',
-      }),
-    });
-    console.log(`[dust] Webhook sent to ${webhookUrl}`);
-  } catch (err) {
-    console.error('[dust] Webhook error:', err);
-    await sendAlert(`⚠️ Dust job scheduled but webhook delivery failed. The job may not run.`, 'error', id);
+
+  if (!process.env.WEBHOOK_BASE_URL) {
+    console.warn('[dust] ⚠️ WEBHOOK_BASE_URL is not set in .env! Job saved to DB but webhook not sent.');
+  } else {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+
+    try {
+      await fetch(webhookUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-webhook-secret': process.env.WEBHOOK_SECRET || '',
+        },
+        body: JSON.stringify({
+          jobId: job.id,
+          campaignId: campaign.id,
+          chain: campaign.chain,
+          type: 'dust',
+        }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+      console.log(`[dust] ✅ Webhook successfully sent to ${webhookUrl}`);
+    } catch (err: any) {
+      clearTimeout(timeoutId);
+      if (err.name === 'AbortError') {
+        console.error(`[dust] ❌ Webhook timed out after 5s. Is webhook-server.cjs running at ${webhookUrl}?`);
+      } else {
+        console.error(`[dust] ❌ Webhook error:`, err.message);
+      }
+      await sendAlert(`⚠️ Dust job saved to DB, but webhook delivery failed. Check if webhook-server is running.`, 'warning', id);
+    }
   }
 
   return NextResponse.json(
