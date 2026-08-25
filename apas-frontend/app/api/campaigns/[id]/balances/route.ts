@@ -309,15 +309,26 @@ export async function GET(
       });
     });
 
-    // Execute multicall (all ERC20 balances in 1-2 RPC calls)
-    let multicallResults: MulticallReturnType = [];
+    // Execute multicall in safe chunks to prevent event loop lockups and RPC payload limits
+    const CHUNK_SIZE = 2000;
+    let multicallResults: any[] = [];
     try {
-      console.log(`[balances] Fetching ${multicallContracts.length} ERC20 balances via multicall...`);
-      multicallResults = await client.multicall({
-        contracts: multicallContracts,
-        allowFailure: true,
-      });
-      console.log(`[balances] Multicall completed successfully`);
+      console.log(`[balances] Fetching ${multicallContracts.length} ERC20 balances via multicall in chunks of ${CHUNK_SIZE}...`);
+
+      for (let i = 0; i < multicallContracts.length; i += CHUNK_SIZE) {
+        const chunk = multicallContracts.slice(i, i + CHUNK_SIZE);
+        const chunkResults = await client.multicall({
+          contracts: chunk,
+          allowFailure: true,
+        });
+        multicallResults.push(...(chunkResults as any[]));
+
+        // Yield to event loop to prevent blocking Next.js server
+        if (i + CHUNK_SIZE < multicallContracts.length) {
+          await new Promise(resolve => setTimeout(resolve, 0));
+        }
+      }
+      console.log(`[balances] Multicall completed successfully in ${Math.ceil(multicallContracts.length / CHUNK_SIZE)} chunks`);
     } catch (e) {
       const errMsg = e instanceof Error ? e.message : String(e);
       console.error('[balances] Multicall failed:', errMsg);
@@ -348,25 +359,46 @@ export async function GET(
       }
     });
 
-    // ─── 🚀 Native balances: fetch in small parallel batches ───
-    const NATIVE_BATCH_SIZE = 20;
+    // ─── 🚀 Native balances: fetch in parallel chunks with concurrency control ───
+    const NATIVE_BATCH_SIZE = 100;
+    const CONCURRENT_BATCHES = 5;
     const nativeBalancesByTrap: Record<string, bigint> = {};
 
+    // Create an array of batches
+    const nativeBatches = [];
     for (let i = 0; i < validTraps.length; i += NATIVE_BATCH_SIZE) {
-      const batch = validTraps.slice(i, i + NATIVE_BATCH_SIZE);
-      const batchResults = await Promise.allSettled(
-        batch.map((trap) => client.getBalance({ address: trap.checksummedAddress }))
-      );
+      nativeBatches.push(validTraps.slice(i, i + NATIVE_BATCH_SIZE));
+    }
 
-      batch.forEach((trap, idx) => {
-        const result = batchResults[idx];
-        if (result.status === 'fulfilled') {
-          nativeBalancesByTrap[trap.trap_address] = result.value;
-        } else {
-          nativeBalancesByTrap[trap.trap_address] = BigInt(0);
-          errors.push(`Native balance failed for ${trap.trap_address}`);
-        }
+    // Process batches with concurrency limit to prevent socket exhaustion
+    for (let i = 0; i < nativeBatches.length; i += CONCURRENT_BATCHES) {
+      const concurrentBatches = nativeBatches.slice(i, i + CONCURRENT_BATCHES);
+
+      const batchPromises = concurrentBatches.map(async (batch) => {
+        const batchResults = await Promise.allSettled(
+          batch.map((trap) => client.getBalance({ address: trap.checksummedAddress }))
+        );
+        return { batch, batchResults };
       });
+
+      const resolvedBatches = await Promise.all(batchPromises);
+
+      resolvedBatches.forEach(({ batch, batchResults }) => {
+        batch.forEach((trap, idx) => {
+          const result = batchResults[idx];
+          if (result.status === 'fulfilled') {
+            nativeBalancesByTrap[trap.trap_address] = result.value;
+          } else {
+            nativeBalancesByTrap[trap.trap_address] = BigInt(0);
+            errors.push(`Native balance failed for ${trap.trap_address}`);
+          }
+        });
+      });
+
+      // Yield to event loop
+      if (i + CONCURRENT_BATCHES < nativeBatches.length) {
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
     }
 
     console.log(`[balances] All ${validTraps.length} native balances fetched`);
