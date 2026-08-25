@@ -1,10 +1,12 @@
+// apas-frontend/app/api/user/balance/route.ts
+
 import { NextRequest, NextResponse } from 'next/server';
 import { getAuthUser } from '@app-lib/auth';
 import { createServerSupabaseClient } from '@app-lib/supabaseServer';
 
 // Updated to accept any thenable/builder and safely convert it to a Promise
 const fetchWithTimeout = async (promise: any, ms: number) => {
-  const timeout = new Promise<never>((_, reject) => 
+  const timeout = new Promise<never>((_, reject) =>
     setTimeout(() => reject(new Error('Request timed out')), ms)
   );
   return Promise.race([Promise.resolve(promise), timeout]);
@@ -25,7 +27,7 @@ export async function GET(req: NextRequest) {
       .eq('id', user.id)
       .single();
 
-    const { data, error } = await fetchWithTimeout(dbPromise, 5000) as any;
+    const { data, error } = await fetchWithTimeout(dbPromise, 30000) as any;
 
     if (error) {
       return NextResponse.json({ error: error.message }, { status: 500 });
