@@ -22,17 +22,22 @@ export async function createServerSupabaseClient() {
           cookieStore.set({ name, value: '', ...options });
         },
       },
-      // 🔧 FIX: Add auth configuration to reduce token refresh calls
       auth: {
         autoRefreshToken: false,
         persistSession: false,
       },
-      // 🔧 FIX: Add timeout to all Supabase requests
+      // 🚀 FIX: Increased timeout to 60s + Auth/Realtime exclusions
       global: {
         fetch: (url, options = {}) => {
+          // NEVER apply timeouts to Auth or Realtime endpoints.
+          // Otherwise, it kills WebSocket/Long-polling connections!
+          if (typeof url === 'string' && (url.includes('/auth/v1') || url.includes('/realtime/v1'))) {
+            return fetch(url, options);
+          }
+
           return fetch(url, {
             ...options,
-            signal: AbortSignal.timeout(15000), // 15 second timeout
+            signal: AbortSignal.timeout(60000), // 🚀 60 seconds for heavy DB queries
           });
         },
       },
