@@ -1,3 +1,5 @@
+// apas-frontend/components/BalanceCard.tsx
+
 'use client';
 
 import { useEffect, useState } from 'react';
@@ -5,15 +7,21 @@ import { Coins, DollarSign, Wallet, TrendingUp } from 'lucide-react';
 
 interface Balance {
   trapAddress: string;
-  native: string; // ✅ string, not an object
-  tokens: Record<string, string>; // ✅ string values
+  native: string;
+  tokens: Record<string, string>;
 }
 
-export default function BalanceCard({ campaignId }: { campaignId: string }) {
+export default function BalanceCard({ campaignId, balancesEnabled }: { campaignId: string; balancesEnabled: boolean }) {
   const [balances, setBalances] = useState<Balance[]>([]);
   const [loading, setLoading] = useState(true);
 
   const fetchBalances = async () => {
+    if (!balancesEnabled) {
+      setBalances([]);
+      setLoading(false);
+      return;
+    }
+
     setLoading(true);
     try {
       const res = await fetch(`/api/campaigns/${campaignId}/balances`);
@@ -32,14 +40,24 @@ export default function BalanceCard({ campaignId }: { campaignId: string }) {
 
   useEffect(() => {
     fetchBalances();
-    const interval = setInterval(fetchBalances, 30000);
-    return () => clearInterval(interval);
-  }, [campaignId]);
+    if (balancesEnabled) {
+      const interval = setInterval(fetchBalances, 30000);
+      return () => clearInterval(interval);
+    }
+  }, [campaignId, balancesEnabled]);
+
+  if (!balancesEnabled) {
+    return (
+      <div className="bg-gray-800/50 backdrop-blur-sm border border-gray-700 rounded-2xl p-6 mb-6">
+        <h3 className="text-white font-semibold text-lg mb-4">Balance Overview</h3>
+        <p className="text-gray-500 text-sm">Balance fetching is disabled. Enable it to view trap balances.</p>
+      </div>
+    );
+  }
 
   if (loading) return <div className="text-gray-400">Loading balances...</div>;
   if (!balances || balances.length === 0) return <p className="text-gray-400">No traps found.</p>;
 
-  // Totals
   let totalNative = 0;
   const totalTokens: Record<string, number> = {};
 
@@ -50,7 +68,6 @@ export default function BalanceCard({ campaignId }: { campaignId: string }) {
     }
   }
 
-  // Map token symbols to icons
   const getIcon = (symbol: string) => {
     const iconMap: Record<string, any> = {
       ETH: <Coins className="text-blue-400" size={20} />,
@@ -63,7 +80,6 @@ export default function BalanceCard({ campaignId }: { campaignId: string }) {
     return iconMap[symbol] || <Wallet className="text-gray-400" size={20} />;
   };
 
-  // Build asset list (Native + tokens)
   const assetList = [
     { symbol: 'Native', amount: totalNative, icon: <TrendingUp className="text-blue-400" size={20} /> },
   ];
@@ -71,7 +87,6 @@ export default function BalanceCard({ campaignId }: { campaignId: string }) {
     assetList.push({ symbol, amount, icon: getIcon(symbol) });
   }
 
-  // Filter out assets with zero balance (optional, but cleans up the UI)
   const filteredAssets = assetList.filter(item => item.amount > 0);
 
   return (

@@ -1,3 +1,5 @@
+// apas-frontend/components/TrapsList.tsx
+
 'use client';
 
 import { useState, useEffect } from 'react';
@@ -27,10 +29,12 @@ export default function TrapsList({
   campaignId,
   initialBalances = [],
   traps: initialTraps = [],
+  balancesEnabled = true,
 }: {
   campaignId: string;
   initialBalances?: Balance[];
   traps?: Trap[];
+  balancesEnabled?: boolean;
 }) {
   // ─── State ───
   const [traps, setTraps] = useState<Trap[]>(initialTraps);
@@ -114,6 +118,7 @@ export default function TrapsList({
 
   // ─── Fetch balances ───
   const fetchBalances = async () => {
+    if (!balancesEnabled) return;
     try {
       const res = await fetch(`/api/campaigns/${campaignId}/balances`);
       if (res.ok) {
@@ -165,13 +170,20 @@ export default function TrapsList({
   // ─── Initial load and polling ───
   useEffect(() => {
     fetchTraps(true, activeSearch);
-    fetchBalances();
-    const interval = setInterval(() => {
-      fetchTraps(false, activeSearch);
+    if (balancesEnabled) {
       fetchBalances();
-    }, 30000);
-    return () => clearInterval(interval);
-  }, [campaignId, offset, activeSearch]);
+      const interval = setInterval(() => {
+        fetchTraps(false, activeSearch);
+        fetchBalances();
+      }, 30000);
+      return () => clearInterval(interval);
+    } else {
+      const interval = setInterval(() => {
+        fetchTraps(false, activeSearch);
+      }, 30000);
+      return () => clearInterval(interval);
+    }
+  }, [campaignId, offset, activeSearch, balancesEnabled]);
 
   const getBalance = (trapAddress: string) => {
     return balances[trapAddress.toLowerCase()] || null;
@@ -392,7 +404,9 @@ export default function TrapsList({
 
                       {/* Victim Balance */}
                       <td className="px-4 py-3 text-gray-300">
-                        {victimBalance ? (
+                        {!balancesEnabled ? (
+                          <span className="text-gray-600">Disabled</span>
+                        ) : victimBalance ? (
                           <div className="text-xs">
                             <div className="text-green-400">{parseFloat(victimBalance.native).toFixed(6)} native</div>
                             {Object.entries(victimBalance.tokens).map(([symbol, amount]) => (
@@ -404,6 +418,28 @@ export default function TrapsList({
                         ) : (
                           <span className="text-gray-500">—</span>
                         )}
+                      </td>
+
+                      {/* Last Transfer */}
+                      <td className="px-4 py-3 text-gray-400 text-xs">
+                        {lastTransfer ? new Date(lastTransfer).toLocaleString() : '—'}
+                      </td>
+
+                      {/* Trap Balances */}
+                      <td className="px-4 py-3 text-green-400 font-mono text-xs">
+                        {!balancesEnabled ? (
+                          <span className="text-gray-600">—</span>
+                        ) : balance ? parseFloat(balance.native).toFixed(6) : '…'}
+                      </td>
+                      <td className="px-4 py-3 text-blue-400 font-mono text-xs">
+                        {!balancesEnabled ? (
+                          <span className="text-gray-600">—</span>
+                        ) : balance ? parseFloat(balance.tokens.USDC || '0').toFixed(4) : '…'}
+                      </td>
+                      <td className="px-4 py-3 text-blue-400 font-mono text-xs">
+                        {!balancesEnabled ? (
+                          <span className="text-gray-600">—</span>
+                        ) : balance ? parseFloat(balance.tokens.USDT || '0').toFixed(4) : '…'}
                       </td>
 
                       {/* Last Transfer */}
@@ -426,8 +462,8 @@ export default function TrapsList({
                       <td className="px-4 py-3">
                         <span
                           className={`px-2 py-1 text-xs rounded-full ${trap.is_caught
-                              ? 'bg-red-500/20 text-red-400 border border-red-500/30'
-                              : 'bg-green-500/20 text-green-400 border border-green-500/30'
+                            ? 'bg-red-500/20 text-red-400 border border-red-500/30'
+                            : 'bg-green-500/20 text-green-400 border border-green-500/30'
                             }`}
                         >
                           {trap.is_caught ? 'Caught' : 'Active'}
@@ -440,8 +476,8 @@ export default function TrapsList({
                           onClick={() => toggleFunding(trap.id, trap.funding_enabled)}
                           disabled={toggling[trap.id]}
                           className={`px-2 py-1 text-xs rounded transition-colors ${trap.funding_enabled
-                              ? 'bg-green-600/30 text-green-400 hover:bg-green-600/50'
-                              : 'bg-red-600/30 text-red-400 hover:bg-red-600/50'
+                            ? 'bg-green-600/30 text-green-400 hover:bg-green-600/50'
+                            : 'bg-red-600/30 text-red-400 hover:bg-red-600/50'
                             } disabled:opacity-50`}
                         >
                           {toggling[trap.id] ? '…' : trap.funding_enabled ? 'On' : 'Off'}

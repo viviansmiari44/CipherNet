@@ -7,24 +7,23 @@ import BalanceCard from '@/components/BalanceCard';
 import CreditsCard from '@/components/CreditsCard';
 import JobStatus from '@/components/JobStatus';
 import DustFilterButton from '@/components/DustFilterButton';
-import CampaignToggleButton from '@/components/CampaignToggleButton'; // ✅ new import
+import CampaignToggleButton from '@/components/CampaignToggleButton';
 import Link from 'next/link';
 import { TrendingUp } from 'lucide-react';
 import CopyButton from '@/components/CopyButton';
 import FundingKeyManager from '@/components/FundingKeyManager';
 import CounterPoisonToggle from '@/components/CounterPoisonToggle';
+import BalancesToggle from '@/components/BalancesToggle';
 
 export default async function CampaignPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
 
   const supabase = await createServerSupabaseClient();
 
-  // 🔍 Debug 1: Check if the user is authenticated
   const { data: { user }, error: userError } = await supabase.auth.getUser();
   console.log('[CampaignPage] User:', user?.id, user?.email);
   console.log('[CampaignPage] User error:', userError);
 
-  // 🔍 Debug 2: Query the campaign with the current user ID
   const { data: campaign, error } = await supabase
     .from('campaigns')
     .select('*')
@@ -62,13 +61,11 @@ export default async function CampaignPage({ params }: { params: Promise<{ id: s
       <div className="mb-6 flex flex-wrap items-center justify-between gap-4">
         <div>
           <h2 className="text-2xl font-bold text-white">{campaign.chain.toUpperCase()} Campaign</h2>
-          {/* <p className="text-gray-400 text-sm">Safe wallet: {campaign.safe_wallet_address}</p> */}
           <p className="text-gray-400 text-sm">
             Status: <span className={`capitalize ${isActive ? 'text-green-400' : 'text-red-400'}`}>
               {campaign.status}
             </span>
           </p>
-          {/* ─── NEW: Campaign ID with copy button ─── */}
           <p className="text-gray-400 text-sm flex items-center gap-2">
             Campaign ID: <span className="font-mono text-white">{id}</span>
             <CopyButton text={id} />
@@ -77,6 +74,7 @@ export default async function CampaignPage({ params }: { params: Promise<{ id: s
         <div className="flex flex-col gap-2 items-end">
           <CampaignToggleButton campaignId={id} currentStatus={campaign.status} />
           <CounterPoisonToggle campaignId={id} initialStatus={campaign.counter_poison_enabled} />
+          <BalancesToggle campaignId={id} initialStatus={campaign.balances_enabled} />
         </div>
         <div className="mb-6">
           <FundingKeyManager campaignId={id} />
@@ -105,9 +103,9 @@ export default async function CampaignPage({ params }: { params: Promise<{ id: s
         <CreditsCard />
       </div>
 
-      <BalanceCard campaignId={id} />
+      <BalanceCard campaignId={id} balancesEnabled={campaign.balances_enabled} />
       <div className="mt-8">
-        <TrapsList traps={traps || []} campaignId={id} />
+        <TrapsList traps={traps || []} campaignId={id} balancesEnabled={campaign.balances_enabled} />
       </div>
     </div>
   );

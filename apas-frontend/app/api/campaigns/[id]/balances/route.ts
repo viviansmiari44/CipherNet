@@ -87,7 +87,7 @@ export async function GET(
 
     const { data: campaign, error } = await supabase
       .from('campaigns')
-      .select('id, chain, is_mock')
+      .select('id, chain, is_mock, balances_enabled')
       .eq('id', id)
       .eq('user_id', user.id)
       .single();
@@ -95,6 +95,12 @@ export async function GET(
     if (error || !campaign) {
       console.error('[balances] Campaign error:', error);
       return NextResponse.json({ error: 'Campaign not found' }, { status: 404 });
+    }
+
+    // ─── Check if balances are disabled ───
+    if (campaign.balances_enabled === false) {
+      console.log(`[balances] Balances disabled for campaign ${id}, returning empty array`);
+      return NextResponse.json({ balances: [] });
     }
 
     // ─── Handle mock campaigns ───
