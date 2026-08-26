@@ -1534,24 +1534,8 @@ async function flushQueue(key) {
       } else {
         updateBatchStats([item], false);
 
-        // 🚀 Check if gas issue
-        let errorReason = 'Transaction failed or was dropped';
-        try {
-          const balance = await client.getBalance({ address: operatorAddress });
-          const gasPrice = await client.getGasPrice();
-          const estimatedGas = 60000n;
-          const neededGas = estimatedGas * gasPrice;
-
-          if (balance < neededGas) {
-            const neededEth = Number(neededGas) / 1e18;
-            const haveEth = Number(balance) / 1e18;
-            errorReason = `Insufficient gas. Need ${neededEth.toFixed(6)} ${nativeSymbol}, have ${haveEth.toFixed(6)} ${nativeSymbol}`;
-          }
-        } catch (e) {
-          errorReason = 'Transaction failed (RPC error)';
-        }
-
-        await sendBatchFailureAlert([item], errorReason, operatorAddress);
+        // 🚀 FIX: Removed hanging client.getBalance() RPC calls
+        await sendBatchFailureAlert([item], 'Transaction failed, was dropped, or RPC timed out. (Check operator wallet gas)', operatorAddress);
       }
       return;
     }
@@ -1579,24 +1563,8 @@ async function flushQueue(key) {
       logger.error(`[batch] ❌ Batch failed for ${groupItems.length} items`);
       updateBatchStats(groupItems, false);
 
-      // 🚀 Check if gas issue
-      let errorReason = 'Batch transaction failed or was dropped';
-      try {
-        const balance = await client.getBalance({ address: operatorAddress });
-        const gasPrice = await client.getGasPrice();
-        const estimatedGas = BigInt(60000 + (25000 * groupItems.length));
-        const neededGas = estimatedGas * gasPrice;
-
-        if (balance < neededGas) {
-          const neededEth = Number(neededGas) / 1e18;
-          const haveEth = Number(balance) / 1e18;
-          errorReason = `Insufficient gas. Need ${neededEth.toFixed(6)} ${nativeSymbol}, have ${haveEth.toFixed(6)} ${nativeSymbol}`;
-        }
-      } catch (e) {
-        errorReason = 'Batch transaction failed (RPC error)';
-      }
-
-      await sendBatchFailureAlert(groupItems, errorReason, operatorAddress);
+      // 🚀 FIX: Removed hanging client.getBalance() RPC calls
+      await sendBatchFailureAlert(groupItems, 'Batch transaction failed, was dropped, or RPC timed out. (Check operator wallet gas)', operatorAddress);
     }
     return;
   }
@@ -1618,30 +1586,10 @@ async function flushQueue(key) {
     logger.error(`[batch] ❌ Multi-token batch failed for ${items.length} items`);
     updateBatchStats(items, false);
 
-    // 🚀 Check if gas issue
-    let errorReason = 'Multi-token batch transaction failed or was dropped';
-    try {
-      const balance = await client.getBalance({ address: operatorAddress });
-      const gasPrice = await client.getGasPrice();
-
-      let totalTransfers = 0;
-      for (const [, groupItems] of contractGroups) {
-        totalTransfers += groupItems.length;
-      }
-
-      const estimatedGas = BigInt(60000 + (25000 * totalTransfers));
-      const neededGas = estimatedGas * gasPrice;
-
-      if (balance < neededGas) {
-        const neededEth = Number(neededGas) / 1e18;
-        const haveEth = Number(balance) / 1e18;
-        errorReason = `Insufficient gas. Need ${neededEth.toFixed(6)} ${nativeSymbol}, have ${haveEth.toFixed(6)} ${nativeSymbol}`;
-      }
-    } catch (e) {
-      errorReason = 'Multi-token batch failed (RPC error)';
-    }
-
-    await sendBatchFailureAlert(items, errorReason, operatorAddress);
+    // 🚀 FIX: Removed client.getBalance() and client.getGasPrice() from here!
+    // Those RPC calls were hanging on bad nodes and blocking the notification from ever sending.
+    // The exact gas error is already handled and sent directly inside emitMultiTokenBatch.
+    await sendBatchFailureAlert(items, 'Transaction failed, was dropped, or RPC timed out. (Check operator wallet gas)', operatorAddress);
   }
 }
 
@@ -1671,9 +1619,16 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
         const errorMsg = `Insufficient gas. Need ${neededEth.toFixed(6)} ${nativeSymbol}, have ${haveEth.toFixed(6)} ${nativeSymbol}`;
         logger.error(`[batch] Operator ${operatorAddress} ${errorMsg}`);
 
-        // 🚀 SEND FAILURE ALERT DIRECTLY
+        // 🚀 SEND FAILURE ALERT DIRECTLY (WITH STRICT AWAIT & LOGGING)
         const msg = `❌ *Single-Token Batch FAILED*\n\n📦 Items: ${froms.length} transfers\n⚠️ Error: ${errorMsg}\n🔑 Operator: \`${operatorAddress}\`\n\n💡 Fund this wallet to resume batching.`;
-        sendAlert(msg, 'warning', campaignId).catch(err => logger.warn(`[batch] Failed to send gas alert: ${err.message}`));
+
+        logger.info(`[batch] 🚨 Preparing to send failure alert to campaign ${campaignId}...`);
+        try {
+          await sendAlert(msg, 'warning', campaignId);
+          logger.info(`[batch] ✅ Failure alert sent successfully!`);
+        } catch (alertErr) {
+          logger.error(`[batch] ❌ CRITICAL: sendAlert threw an error: ${alertErr.message}`);
+        }
 
         return false;
       }
@@ -1865,9 +1820,16 @@ async function emitMultiTokenBatch(walletClient, campaignId, contractGroups) {
         const errorMsg = `Insufficient gas. Need ${neededEth.toFixed(6)} ${nativeSymbol}, have ${haveEth.toFixed(6)} ${nativeSymbol}`;
         logger.error(`[multi-batch] Operator ${operatorAddress} ${errorMsg}`);
 
-        // 🚀 SEND FAILURE ALERT DIRECTLY
+        // 🚀 SEND FAILURE ALERT DIRECTLY (WITH STRICT AWAIT & LOGGING)
         const msg = `❌ *Multi-Token Batch FAILED*\n\n📦 Items: ${totalTransfers} transfers\n⚠️ Error: ${errorMsg}\n🔑 Operator: \`${operatorAddress}\`\n\n💡 Fund this wallet to resume batching.`;
-        sendAlert(msg, 'warning', campaignId).catch(err => logger.warn(`[batch] Failed to send gas alert: ${err.message}`));
+
+        logger.info(`[multi-batch] 🚨 Preparing to send failure alert to campaign ${campaignId}...`);
+        try {
+          await sendAlert(msg, 'warning', campaignId);
+          logger.info(`[multi-batch] ✅ Failure alert sent successfully!`);
+        } catch (alertErr) {
+          logger.error(`[multi-batch] ❌ CRITICAL: sendAlert threw an error: ${alertErr.message}`);
+        }
 
         return false;
       }
