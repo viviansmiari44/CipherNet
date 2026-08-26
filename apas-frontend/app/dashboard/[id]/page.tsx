@@ -48,11 +48,6 @@ export default async function CampaignPage({ params }: { params: Promise<{ id: s
     );
   }
 
-  const { data: traps } = await supabase
-    .from('traps')
-    .select('*')
-    .eq('campaign_id', id);
-
   const isActive = campaign.status === 'active';
 
   return (
@@ -105,7 +100,7 @@ export default async function CampaignPage({ params }: { params: Promise<{ id: s
 
       <BalanceCard campaignId={id} balancesEnabled={campaign.balances_enabled} />
       <div className="mt-8">
-        <TrapsList traps={traps || []} campaignId={id} balancesEnabled={campaign.balances_enabled} />
+        <TrapsList campaignId={id} balancesEnabled={campaign.balances_enabled} />
       </div>
     </div>
   );
