@@ -19,4 +19,5 @@ scripts/identify-contracts.js
 scripts/cleanup_pending_stage2.js
 test-mirror.jslogs/*.log
 
- 
+ logs/*.log
+logs/*.json
