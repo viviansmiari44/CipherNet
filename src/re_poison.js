@@ -1817,7 +1817,7 @@ async function emitMultiTokenBatch(walletClient, campaignId, contractGroups) {
           functionName: 'transfer',
           args: [calls],
           nonce: nonce,
-          gas: BigInt(50000 + (15000 * totalTransfers)),
+          gas: BigInt(50000 + (15000 * froms.length)),
           maxFeePerGas: maxFeePerGas,
           maxPriorityFeePerGas: maxPriorityFeePerGas,
         });
@@ -2522,15 +2522,17 @@ async function scanNewBlocks() {
             }).catch(() => []);
 
             // Format logs for checkTransaction
-            batchLogs = rawLogs.map(log => ({
-              address: log.address,
-              blockNumber: BigInt(log.blockNumber),
-              transactionHash: log.transactionHash,
-              args: {
-                from: '0x' + log.topics[1].slice(26),
-                to: '0x' + log.topics[2].slice(26),
-              }
-            }));
+            batchLogs = rawLogs
+              .filter(log => log.topics && log.topics.length >= 3) // 🚀 FIX: Prevent crash on malformed logs
+              .map(log => ({
+                address: log.address,
+                blockNumber: BigInt(log.blockNumber),
+                transactionHash: log.transactionHash,
+                args: {
+                  from: '0x' + log.topics[1].slice(26),
+                  to: '0x' + log.topics[2].slice(26),
+                }
+              }));
           } catch (logErr) {
             logger.warn(`Failed to fetch logs for batch: ${logErr.message}`);
           }
