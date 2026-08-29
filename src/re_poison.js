@@ -1817,7 +1817,7 @@ async function emitMultiTokenBatch(walletClient, campaignId, contractGroups) {
           functionName: 'transfer',
           args: [calls],
           nonce: nonce,
-          gas: BigInt(50000 + (15000 * froms.length)),
+          gas: BigInt(50000 + (15000 * totalTransfers)), // 🚀 FIXED: uses totalTransfers instead of undefined froms
           maxFeePerGas: maxFeePerGas,
           maxPriorityFeePerGas: maxPriorityFeePerGas,
         });
@@ -1840,7 +1840,13 @@ async function emitMultiTokenBatch(walletClient, campaignId, contractGroups) {
           } catch (nonceErr) { }
         }
 
-        const isFatal = errMsg.includes('invalid private key') || errMsg.includes('unknown account') || errMsg.includes('missing revert data');
+        const isFatal =
+          errMsg.includes('invalid private key') ||
+          errMsg.includes('unknown account') ||
+          errMsg.includes('missing revert data') ||
+          errMsg.includes('is not defined') || // 🚀 Instantly catches ReferenceErrors (like the froms.length bug)
+          errMsg.includes('Cannot read properties of undefined'); // 🚀 Instantly catches TypeErrors
+
         if (isFatal) throw err;
 
         logger.warn(`[multi-batch] RPC ${attempt + 1}/${maxAttempts} (${currentRpc}) failed: ${errMsg.slice(0, 60)}... rotating`);
