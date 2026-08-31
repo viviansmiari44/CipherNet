@@ -1166,7 +1166,8 @@ async function calculateSmartGasFees() {
     let finalMaxFee = baseFee + networkTip;
 
     if (baseFee <= targetMaxFee) {
-      finalMaxFee = baseFee + networkTip;
+      // 🚀 EIP-1559 FIX: Add 50% buffer to the ceiling. Actual cost is unchanged!
+      finalMaxFee = (baseFee * 150n) / 100n + networkTip;
       finalGwei = Number(baseFee) / 1e9;
       logger.info(`[gas-strategy] ✅ Base fee is cheap (${finalGwei.toFixed(2)} Gwei). Firing immediately!`);
     } else {
@@ -1178,7 +1179,7 @@ async function calculateSmartGasFees() {
           const currentBlock = await client.getBlock({ blockTag: 'latest' });
           const currentBaseFee = currentBlock.baseFeePerGas || 0n;
           if (currentBaseFee <= targetMaxFee) {
-            finalMaxFee = currentBaseFee + networkTip;
+            finalMaxFee = (currentBaseFee * 150n) / 100n + networkTip;
             finalGwei = Number(currentBaseFee) / 1e9;
             gasDropped = true;
             logger.info(`[gas-strategy] ✅ Base fee dropped to ${finalGwei.toFixed(2)} Gwei! Firing at cheap rate!`);
@@ -1192,7 +1193,8 @@ async function calculateSmartGasFees() {
         try {
           const fallbackBlock = await client.getBlock({ blockTag: 'latest' });
           const fallbackBaseFee = fallbackBlock.baseFeePerGas || baseFee;
-          finalMaxFee = fallbackBaseFee + networkTip;
+          // 🚀 CRITICAL EIP-1559 FIX: 50% ceiling buffer prevents mempool timeouts on sudden spikes
+          finalMaxFee = (fallbackBaseFee * 150n) / 100n + networkTip;
           finalGwei = Number(fallbackBaseFee) / 1e9;
           logger.warn(`[gas-strategy] ⚠️ Gas stayed high for 10 mins. Firing at current market rate (${finalGwei.toFixed(2)} Gwei) to prevent stuck nonces.`);
         } catch (e) {
