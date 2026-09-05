@@ -17,6 +17,7 @@ scripts/cleanup_traps_stage2.js
 scripts/diagnose_stage2.js
 scripts/identify-contracts.js
 scripts/cleanup_pending_stage2.js
+scripts/audit_cex_victims.js
 test-mirror.jslogs/*.log
 
  logs/*.log

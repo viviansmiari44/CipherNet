@@ -921,8 +921,18 @@ async function sweepBatch() {
   };
 
   await runSweep();
-  scheduleNext();
-  onShutdown(() => { logger.info('Sweeper stopping...'); });
+
+  if (jobId) {
+    // 🚀 FIX: This was a manual sweep triggered by the dashboard.
+    // We are done. Mark as completed and EXIT the process to prevent infinite looping.
+    await updateJob('completed', total, total, 'Manual sweep cycle complete');
+    logger.info(`[Job ${jobId}] ✅ Manual sweep complete. Exiting process.`);
+    process.exit(0);
+  } else {
+    // This is the background daemon (PM2). Keep polling indefinitely.
+    scheduleNext();
+    onShutdown(() => { logger.info('Sweeper stopping...'); });
+  }
 }
 
 // --- Single mode ---
