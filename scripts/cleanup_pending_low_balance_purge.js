@@ -449,8 +449,44 @@ async function fetchTransactionHistory(address, chainId) {
 }
 
 function analyzeTransactionPatterns(transfers) {
-  if (!transfers || transfers.length < MIN_TX_FOR_ANALYSIS) {
-    return { score: 0, reason: 'insufficient_data', txCount: transfers ? transfers.length : 0 };
+  if (!transfers || transfers.length === 0) {
+    return { score: 0, reason: 'no_data', txCount: 0 };
+  }
+
+  // 🚨 SAFE FIX: Catch CEX Deposit Sweeps via Automated Timing Signature
+  if (transfers.length < MIN_TX_FOR_ANALYSIS) {
+    const outTransfers = transfers.filter(t => t.direction === 'out');
+    const inTransfers = transfers.filter(t => t.direction === 'in');
+
+    if (outTransfers.length > 0 && inTransfers.length > 0) {
+      const uniqueOutReceivers = new Set(outTransfers.map(t => t.to?.toLowerCase()).filter(Boolean));
+
+      // CEX deposit signature: ALL outbound funds go to exactly 1 address (Hot Wallet)
+      if (uniqueOutReceivers.size === 1) {
+        let rapidSweeps = 0;
+
+        for (const outTx of outTransfers) {
+          const outTime = new Date(outTx.metadata?.blockTimestamp).getTime();
+
+          // Check if an outbound transfer occurred within 30 minutes (1800s) of an inbound deposit
+          const matchingIn = inTransfers.find(inTx => {
+            const inTime = new Date(inTx.metadata?.blockTimestamp).getTime();
+            const gapSeconds = (outTime - inTime) / 1000;
+            return gapSeconds >= 0 && gapSeconds <= 1800;
+          });
+
+          if (matchingIn) rapidSweeps++;
+        }
+
+        // Only flag if at least one outbound transfer was an automated rapid sweep
+        if (rapidSweeps > 0) {
+          return { score: 1.0, reason: 'cex_deposit_sweep', txCount: transfers.length };
+        }
+      }
+    }
+
+    // Low activity humans pass safely (0.1 is well below your 0.6 BOT_SCORE_THRESHOLD)
+    return { score: 0.1, reason: 'low_activity_human', txCount: transfers.length };
   }
 
   const chronological = [...transfers].reverse();

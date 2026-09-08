@@ -28,12 +28,12 @@ logger.info(`[Stage 2 Analyzer] Running for chain: ${chainName} (ID: ${chainId})
 
 const QUALIFIED_POLL_INTERVAL_MS = parseInt(process.env.QUALIFIED_POLL_INTERVAL_MS || '600000', 10);
 
-const BLOCKS_40_DAYS_MAP = {
-  ethereum: 288000n,
-  bsc: 1152000n,
-  polygon: 1728000n,
+const BLOCKS_365_DAYS_MAP = {
+  ethereum: 2628000n,  // 365 days * 24h * 60m * 60s / 12s per block
+  bsc: 10512000n,      // 365 days * 24h * 60m * 60s / 3s per block
+  polygon: 15768000n,  // 365 days * 24h * 60m * 60s / 2s per block
 };
-const BLOCKS_40_DAYS = BLOCKS_40_DAYS_MAP[chainName] || 288000n;
+const BLOCKS_365_DAYS = BLOCKS_365_DAYS_MAP[chainName] || 2628000n;
 
 // ─── Viem RPC Client ───
 const PUBLIC_FALLBACKS = {
@@ -523,9 +523,9 @@ async function fetchPendingTargets() {
     }
 
     const maxBlockBigInt = BigInt(maxBlockData[0].block_number);
-    const thresholdBlock = Math.max(0, Number(maxBlockBigInt - BLOCKS_40_DAYS));
+    const thresholdBlock = Math.max(0, Number(maxBlockBigInt - BLOCKS_365_DAYS));
 
-    logger.info(`Threshold block for 40-day window: ${thresholdBlock} (max block: ${maxBlockData[0].block_number})`);
+    logger.info(`Threshold block for 365-day window: ${thresholdBlock} (max block: ${maxBlockData[0].block_number})`);
 
     const BATCH_SIZE = 100;
     let totalInserted = 0;
