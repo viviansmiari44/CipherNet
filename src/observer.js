@@ -536,44 +536,23 @@ async function fetchPendingTargets() {
     while (true) {
       pageCount++;
 
-      // ─── Direct query (no RPC) — fetch raw rows, deduplicate in JS ───
-      // Fetch extra rows (3x batch size) to account for duplicate senders
-      const rawRows = await withRetry(async () => {
-        const { data, error } = await supabase
-          .from('token_transfers')
-          .select('sender, receiver, block_number')
-          .eq('chain_id', chainId)
-          .gte('block_number', thresholdBlock)
-          .order('block_number', { ascending: false })
-          .limit(BATCH_SIZE * 3);
+      // ─── Call the optimized SQL function directly ───
+      // This enforces the freq >= 2 rule and does the heavy lifting in Postgres.
+      const rows = await withRetry(async () => {
+        const { data, error } = await supabase.rpc('fetch_pending_targets', {
+          chain_id_param: chainId,
+          threshold_block: thresholdBlock.toString(),
+          offset_val: 0,
+          limit_val: BATCH_SIZE
+        });
         if (error) throw error;
         return data || [];
-      }, `FetchDirect_page_${pageCount}`);
+      }, `FetchRPC_page_${pageCount}`);
 
-      if (!rawRows || rawRows.length === 0) {
+      if (!rows || rows.length === 0) {
         logger.info(`No more transfers to process. Completed ${pageCount - 1} pages.`);
         break;
       }
-
-      // Deduplicate by (sender, receiver) pair in JS
-      const seenPairs = new Set();
-      const rows = [];
-      for (const row of rawRows) {
-        const senderLower = (row.sender || '').toLowerCase();
-        const receiverLower = (row.receiver || '').toLowerCase();
-        const key = `${senderLower}_${receiverLower}`;
-        if (!seenPairs.has(key) && senderLower && receiverLower) {
-          seenPairs.add(key);
-          rows.push({
-            sender: senderLower,
-            receiver: receiverLower,
-            block_number: row.block_number,
-          });
-          if (rows.length >= BATCH_SIZE) break;
-        }
-      }
-
-      if (rows.length === 0) break;
 
       logger.info(`Page ${pageCount}: Fetched ${rawRows.length} raw rows → ${rows.length} unique pairs. Running analysis...`);
 
@@ -604,7 +583,7 @@ async function fetchPendingTargets() {
               chain: chainName,
               counterparty: row.receiver,
               victim: sender,
-              last_transfer_block: row.block_number,
+              last_transfer_block: row.last_block, // 🚀 Matches the SQL function return column
               processed: false,
             };
           } catch (error) {
@@ -613,7 +592,7 @@ async function fetchPendingTargets() {
               chain: chainName,
               counterparty: row.receiver,
               victim: sender,
-              last_transfer_block: row.block_number,
+              last_transfer_block: row.last_block, // 🚀 Matches the SQL function return column
               processed: false,
             };
           }

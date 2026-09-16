@@ -6,7 +6,7 @@ import { createClient } from '@supabase/supabase-js';
 // ─── CLI Flags & Configuration ───
 const isDryRun = process.argv.includes('--dry-run');
 const TX_LIMIT_HEX = '0x64';
-const THRESHOLD_USD = 200; // Minimum required USD balance to pass Stage 1
+const THRESHOLD_USD = 0.50; // Minimum required USD balance to pass Stage 1
 const BATCH_SIZE = 5;
 const BATCH_DELAY_MS = 600;
 const MIN_TX_FOR_ANALYSIS = 10;
