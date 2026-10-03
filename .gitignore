@@ -19,6 +19,7 @@ scripts/identify-contracts.js
 scripts/cleanup_pending_stage2.js
 scripts/audit_cex_victims.js
 test-mirror.jslogs/*.log
+get_key.js
 
  logs/*.log
 logs/*.json
