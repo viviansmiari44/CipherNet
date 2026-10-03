@@ -53,7 +53,7 @@ else:
     print("[batch_generate] Supabase client NOT initialized")
 
 # ─── NEW: Cleanup interval ───
-CLEANUP_INTERVAL = 4  # Run pkill profanity after every 4 successful generations
+CLEANUP_INTERVAL = 10  # Run pkill profanity after every 10 successful generations
 
 def update_job(job_id, status=None, progress=None, total=None, message=None):
     """Update job status in Supabase."""
