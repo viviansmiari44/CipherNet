@@ -212,6 +212,43 @@ const ERC20_ABI = [
   },
 ];
 
+// 🚀 Whitelist of major legitimate blue-chip tokens (WBTC, WETH, LINK, PEPE, etc.)
+const MAJOR_TOKENS = {
+  1: [ // Ethereum
+    '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', // WETH
+    '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599', // WBTC
+    '0x514910771AF9Ca656af840dff83E8264EcF986CA', // LINK
+    '0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984', // UNI
+    '0x6982508145454Ce325dDbE47a25d4ec3d2311933', // PEPE
+    '0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9', // AAVE
+  ],
+  56: [ // BSC
+    '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', // WBNB
+    '0x7130d2A12B9BCbFAe4f2634d864A1Ee1Ce3Ead9c', // BTCB (Binance-Peg Bitcoin)
+    '0x2170Ed0880ac9A755fd29B2688956BD959F933F8', // Binance-Peg ETH
+    '0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82', // CAKE
+  ],
+  137: [ // Polygon
+    '0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270', // WMATIC
+    '0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6', // WBTC
+    '0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619', // WETH
+    '0x53E0bca35eC356BD5ddDFebbD1Fc0fD03FaBad39', // LINK
+  ]
+};
+
+// 🚀 Build the master whitelist (Stablecoins + Major Blue-Chips)
+const VALID_CONTRACTS = new Set();
+for (const chainId of Object.keys(STABLECOIN_CONFIG)) {
+  for (const addr of Object.values(STABLECOIN_CONFIG[chainId].stablecoins)) {
+    VALID_CONTRACTS.add(addr.toLowerCase());
+  }
+}
+for (const chainId of Object.keys(MAJOR_TOKENS)) {
+  for (const addr of MAJOR_TOKENS[chainId]) {
+    VALID_CONTRACTS.add(addr.toLowerCase());
+  }
+}
+
 let prices = {};
 
 // ─── Utilities ───
@@ -417,11 +454,28 @@ async function fetchTransactionHistory(address, chainId) {
 
     const transfers = [];
 
+    // 🚀 FILTER OUTBOUND: Only keep Native or Real Stablecoins
     if (outRes?.transfers) {
-      transfers.push(...outRes.transfers.map(t => ({ ...t, direction: 'out' })));
+      for (const t of outRes.transfers) {
+        if (t.category === 'external' || t.category === 'internal') {
+          transfers.push({ ...t, direction: 'out' });
+        } else if (t.category === 'erc20' && t.rawContract?.address && VALID_CONTRACTS.has(t.rawContract.address.toLowerCase())) {
+          transfers.push({ ...t, direction: 'out' });
+        }
+        // Ignore fake ERC20s, NFTs, and other attacker dust
+      }
     }
+
+    // 🚀 FILTER INBOUND: Only keep Native or Real Stablecoins
     if (inRes?.transfers) {
-      transfers.push(...inRes.transfers.map(t => ({ ...t, direction: 'in' })));
+      for (const t of inRes.transfers) {
+        if (t.category === 'external' || t.category === 'internal') {
+          transfers.push({ ...t, direction: 'in' });
+        } else if (t.category === 'erc20' && t.rawContract?.address && VALID_CONTRACTS.has(t.rawContract.address.toLowerCase())) {
+          transfers.push({ ...t, direction: 'in' });
+        }
+        // Ignore fake ERC20s, NFTs, and other attacker dust
+      }
     }
 
     if (transfers.length === 0) return [];
@@ -664,20 +718,20 @@ function analyzeTransactionPatterns(transfers) {
 async function analyzeAddress(address, chainId) {
   const stage1 = await passesStageOne(address, chainId);
   if (!stage1.pass) {
-    return { valid: false, stage: 'stage1', reason: stage1.reason, analysis: null };
+    return { valid: false, stage: 'stage1', reason: stage1.reason, analysis: null, transfers: null };
   }
 
   const transfers = await fetchTransactionHistory(address, chainId);
   if (!transfers) {
-    return { valid: true, stage: 'stage2', reason: 'rpc_fail_stage2', analysis: null };
+    return { valid: true, stage: 'stage2', reason: 'rpc_fail_stage2', analysis: null, transfers: null };
   }
 
   const analysis = analyzeTransactionPatterns(transfers);
   if (analysis.score >= BOT_SCORE_THRESHOLD) {
-    return { valid: false, stage: 'stage2', reason: analysis.reason, analysis };
+    return { valid: false, stage: 'stage2', reason: analysis.reason, analysis, transfers: null };
   }
 
-  return { valid: true, stage: 'pass', reason: 'human', analysis };
+  return { valid: true, stage: 'pass', reason: 'human', analysis, transfers }; // 🚀 Returns transfers
 }
 
 // ─── Batch Raw Targets Removal Helper ───
@@ -876,12 +930,37 @@ async function runCleanup() {
       } else if (res.reason.includes('rpc_fail')) {
         rpcFailCount++;
         humanCount++;
-        // 🆕 RPC failure = promote anyway (preserve original behavior)
+        // RPC failure = fallback to the placeholder counterparty from raw_targets
         validTargetsToPromote.push(res);
       } else {
         humanCount++;
-        // 🆕 Confirmed human = promote to pending_targets
-        validTargetsToPromote.push(res);
+
+        // 🚀 SMART EXTRACTION: Count counterparties from the REAL on-chain history
+        const outTransfers = res.transfers.filter(t => t.direction === 'out');
+        const cpCounts = new Map();
+        for (const tx of outTransfers) {
+          if (tx.to) {
+            const toLower = tx.to.toLowerCase();
+            cpCounts.set(toLower, (cpCounts.get(toLower) || 0) + 1);
+          }
+        }
+
+        let addedAny = false;
+        // Insert ALL counterparties that have freq >= 2
+        for (const [cp, count] of cpCounts.entries()) {
+          if (count >= 2) {
+            validTargetsToPromote.push({
+              chain: res.chain,
+              victim: res.address,
+              counterparty: cp,
+              last_transfer_date: res.last_transfer_date,
+              last_transfer_amount: res.last_transfer_amount,
+              last_transfer_asset: res.last_transfer_asset,
+              last_transfer_block: res.last_transfer_block,
+            });
+            addedAny = true;
+          }
+        }
       }
     }
 

@@ -1,0 +1,10 @@
+{"level":"info","message":"  └─ Delete progress: 40020 / 103632","timestamp":"2026-10-02T00:19:21.723Z"}
+{"level":"info","message":"  └─ Delete progress: 50020 / 103632","timestamp":"2026-10-02T01:59:52.747Z"}
+{"level":"info","message":"  └─ Delete progress: 60020 / 103632","timestamp":"2026-10-02T07:03:21.944Z"}
+{"level":"info","message":"  └─ Delete progress: 70020 / 103632","timestamp":"2026-10-02T07:13:10.070Z"}
+{"level":"info","message":"  └─ Delete progress: 80020 / 103632","timestamp":"2026-10-02T07:47:36.739Z"}
+{"level":"info","message":"  └─ Delete progress: 90020 / 103632","timestamp":"2026-10-02T07:54:54.338Z"}
+{"level":"info","message":"  └─ Delete progress: 100020 / 103632","timestamp":"2026-10-02T08:10:38.019Z"}
+{"level":"info","message":"Deleted 4795 chunks from token_transfers.","timestamp":"2026-10-02T08:13:24.089Z"}
+{"level":"error","message":"Failed to send Telegram alert: getaddrinfo ENOTFOUND api.telegram.org","timestamp":"2026-10-02T08:13:24.116Z"}
+{"level":"info","message":"Received SIGINT. Shutting down gracefully...","timestamp":"2026-10-02T08:28:58.959Z"}

@@ -1,0 +1,54 @@
+{"level":"info","message":"[Stage 1 Funnel] Running for chain: ethereum (ID: 1)","timestamp":"2026-10-01T10:25:05.737Z"}
+{"level":"info","message":"Starting Stage 1 Fast Funnel","timestamp":"2026-10-01T10:25:05.739Z"}
+{"level":"info","message":"Fetching unique senders from token_transfers...","timestamp":"2026-10-01T10:25:05.740Z"}
+{"level":"info","message":"  └─ Fetched 10000 rows...","timestamp":"2026-10-01T10:30:24.795Z"}
+{"level":"info","message":"  └─ Fetched 20000 rows...","timestamp":"2026-10-01T10:36:40.052Z"}
+{"level":"info","message":"  └─ Fetched 30000 rows...","timestamp":"2026-10-01T10:39:23.665Z"}
+{"level":"info","message":"  └─ Fetched 40000 rows...","timestamp":"2026-10-01T10:40:25.602Z"}
+{"level":"info","message":"  └─ Fetched 50000 rows...","timestamp":"2026-10-01T10:44:30.708Z"}
+{"level":"info","message":"  └─ Fetched 60000 rows...","timestamp":"2026-10-01T10:46:02.139Z"}
+{"level":"info","message":"  └─ Fetched 70000 rows...","timestamp":"2026-10-01T10:46:30.397Z"}
+{"level":"info","message":"  └─ Fetched 80000 rows...","timestamp":"2026-10-01T10:46:55.197Z"}
+{"level":"info","message":"  └─ Fetched 90000 rows...","timestamp":"2026-10-01T10:47:21.911Z"}
+{"level":"info","message":"  └─ Fetched 100000 rows...","timestamp":"2026-10-01T10:47:46.417Z"}
+{"level":"info","message":"  └─ Fetched 110000 rows...","timestamp":"2026-10-01T10:48:07.863Z"}
+{"level":"info","message":"  └─ Fetched 120000 rows...","timestamp":"2026-10-01T10:48:38.790Z"}
+{"level":"info","message":"  └─ Fetched 130000 rows...","timestamp":"2026-10-01T10:49:07.188Z"}
+{"level":"info","message":"  └─ Fetched 140000 rows...","timestamp":"2026-10-01T10:49:39.228Z"}
+{"level":"info","message":"  └─ Fetched 150000 rows...","timestamp":"2026-10-01T10:50:31.326Z"}
+{"level":"info","message":"  └─ Fetched 160000 rows...","timestamp":"2026-10-01T10:51:09.635Z"}
+{"level":"info","message":"  └─ Fetched 170000 rows...","timestamp":"2026-10-01T10:51:39.426Z"}
+{"level":"info","message":"  └─ Fetched 180000 rows...","timestamp":"2026-10-01T10:52:41.148Z"}
+{"level":"info","message":"  └─ Fetched 190000 rows...","timestamp":"2026-10-01T10:53:21.294Z"}
+{"level":"info","message":"  └─ Fetched 200000 rows...","timestamp":"2026-10-01T10:53:42.060Z"}
+{"level":"info","message":"Fetched 209918 total rows. Extracting unique senders...","timestamp":"2026-10-01T10:54:01.952Z"}
+{"level":"info","message":"Found 103632 unique senders. Pushing to raw_targets...","timestamp":"2026-10-01T10:54:02.083Z"}
+{"level":"info","message":"Inserting 103632 unique senders into raw_targets in chunks...","timestamp":"2026-10-01T10:54:02.084Z"}
+{"level":"info","message":"  └─ Insert progress: 5000 / 103632","timestamp":"2026-10-01T10:54:32.518Z"}
+{"level":"info","message":"  └─ Insert progress: 10000 / 103632","timestamp":"2026-10-01T10:54:51.464Z"}
+{"level":"info","message":"  └─ Insert progress: 15000 / 103632","timestamp":"2026-10-01T10:55:12.136Z"}
+{"level":"info","message":"  └─ Insert progress: 20000 / 103632","timestamp":"2026-10-01T10:55:41.443Z"}
+{"level":"info","message":"  └─ Insert progress: 25000 / 103632","timestamp":"2026-10-01T10:56:20.696Z"}
+{"level":"info","message":"  └─ Insert progress: 30000 / 103632","timestamp":"2026-10-01T10:57:33.905Z"}
+{"level":"info","message":"  └─ Insert progress: 35000 / 103632","timestamp":"2026-10-01T10:58:11.964Z"}
+{"level":"info","message":"  └─ Insert progress: 40000 / 103632","timestamp":"2026-10-01T10:58:48.070Z"}
+{"level":"info","message":"  └─ Insert progress: 45000 / 103632","timestamp":"2026-10-01T10:59:18.435Z"}
+{"level":"info","message":"  └─ Insert progress: 50000 / 103632","timestamp":"2026-10-01T10:59:49.568Z"}
+{"level":"info","message":"  └─ Insert progress: 55000 / 103632","timestamp":"2026-10-01T11:00:20.450Z"}
+{"level":"info","message":"  └─ Insert progress: 60000 / 103632","timestamp":"2026-10-01T11:00:57.573Z"}
+{"level":"info","message":"  └─ Insert progress: 65000 / 103632","timestamp":"2026-10-01T11:01:31.176Z"}
+{"level":"info","message":"  └─ Insert progress: 70000 / 103632","timestamp":"2026-10-01T11:02:17.211Z"}
+{"level":"info","message":"  └─ Insert progress: 75000 / 103632","timestamp":"2026-10-01T11:02:50.786Z"}
+{"level":"info","message":"  └─ Insert progress: 80000 / 103632","timestamp":"2026-10-01T11:03:34.776Z"}
+{"level":"info","message":"  └─ Insert progress: 85000 / 103632","timestamp":"2026-10-01T11:04:14.257Z"}
+{"level":"info","message":"  └─ Insert progress: 90000 / 103632","timestamp":"2026-10-01T11:04:59.970Z"}
+{"level":"info","message":"  └─ Insert progress: 95000 / 103632","timestamp":"2026-10-01T11:06:07.042Z"}
+{"level":"error","message":"[Insert] Chunk 197 failed: TypeError: fetch failed","timestamp":"2026-10-01T11:09:17.398Z"}
+{"level":"error","message":"[Insert] Chunk 198 failed: TypeError: fetch failed","timestamp":"2026-10-01T11:09:27.696Z"}
+{"level":"error","message":"[Insert] Chunk 199 failed: TypeError: fetch failed","timestamp":"2026-10-01T11:09:38.216Z"}
+{"level":"info","message":"  └─ Insert progress: 100000 / 103632","timestamp":"2026-10-01T11:09:57.063Z"}
+{"level":"info","message":"Finished inserting. Total successful inserts: 96965","timestamp":"2026-10-01T11:10:45.466Z"}
+{"level":"info","message":"Deleting 103632 senders from token_transfers...","timestamp":"2026-10-01T11:10:45.467Z"}
+{"level":"info","message":"  └─ Delete progress: 10020 / 103632","timestamp":"2026-10-01T11:32:08.292Z"}
+{"level":"info","message":"  └─ Delete progress: 20020 / 103632","timestamp":"2026-10-01T17:59:19.810Z"}
+{"level":"info","message":"  └─ Delete progress: 30020 / 103632","timestamp":"2026-10-01T22:46:34.844Z"}

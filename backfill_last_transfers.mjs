@@ -1,5 +1,6 @@
 // backfill_last_transfers.mjs
-// Usage: node backfill_last_transfers.mjs
+// Usage: normal mode (Only checks empty records) "node backfill_last_transfers.mjs"
+// Usage:  Update Mode (Re-checks EVERYTHING to guarantee amounts are 100% up to date): "node backfill_last_transfers.mjs update"
 // Backfills last_transfer_date, last_transfer_amount, last_transfer_asset for pending_targets and traps
 
 import 'dotenv/config';
@@ -124,6 +125,9 @@ const CHAIN_CONFIGS = {
   }
 };
 
+// ─── Mode Detection ───
+const isUpdateMode = process.argv[2] === 'update';
+
 // ─── Performance Settings ───
 const PAGE_SIZE = 100;              // Records fetched per page
 const RPC_CONCURRENCY = 5;          // Parallel Alchemy queries
@@ -143,14 +147,9 @@ async function showPreFlightSummary() {
     .from('traps').select('*', { count: 'exact', head: true }).eq('is_caught', false).is('last_transfer_date', null);
   const { count: processedTraps } = await supabaseAdmin
     .from('traps').select('*', { count: 'exact', head: true }).eq('is_caught', false).not('last_transfer_date', 'is', null);
-  const { count: noTransferTraps } = await supabaseAdmin
-    .from('traps').select('*', { count: 'exact', head: true }).eq('is_caught', false).eq('last_transfer_date', '1970-01-01T00:00:00.000Z');
-  const realCompletedTraps = Math.max(0, (processedTraps || 0) - (noTransferTraps || 0));
-
   console.log(`🪤 [TRAPS] Active Traps Overview:`);
   console.log(`   ⏳ Pending backfill (null data):        ${pendingTraps || 0}`);
-  console.log(`   ✅ Have REAL transfer data:             ${realCompletedTraps}`);
-  console.log(`   ⚠️  Processed but NO transfer found:     ${noTransferTraps || 0}`);
+  console.log(`   ✅ Have transfer data:                  ${processedTraps || 0}`);
   console.log(`   📊 Total active traps:                  ${totalActiveTraps || 0}`);
   console.log('');
 
@@ -161,18 +160,16 @@ async function showPreFlightSummary() {
     .from('pending_targets').select('*', { count: 'exact', head: true }).is('last_transfer_date', null);
   const { count: processedTargets } = await supabaseAdmin
     .from('pending_targets').select('*', { count: 'exact', head: true }).not('last_transfer_date', 'is', null);
-  const { count: noTransferTargets } = await supabaseAdmin
-    .from('pending_targets').select('*', { count: 'exact', head: true }).eq('last_transfer_date', '1970-01-01T00:00:00.000Z');
-  const realCompletedTargets = Math.max(0, (processedTargets || 0) - (noTransferTargets || 0));
 
   console.log(`🎯 [PENDING_TARGETS] Overview:`);
   console.log(`   ⏳ Pending backfill (null data):        ${pendingTargets || 0}`);
-  console.log(`   ✅ Have REAL transfer data:             ${realCompletedTargets}`);
-  console.log(`   ⚠️  Processed but NO transfer found:     ${noTransferTargets || 0}`);
+  console.log(`   ✅ Have transfer data:                  ${processedTargets || 0}`);
   console.log(`   📊 Total targets:                       ${totalTargets || 0}`);
-  console.log('');
 
-  console.log('🚀 Starting backfill process...\n');
+  if (isUpdateMode) {
+    console.log(`\n🔄 [UPDATE MODE ACTIVE] Will re-verify and update ALL records to ensure amounts are exact.`);
+  }
+  console.log('\n🚀 Starting backfill process...\n');
 }
 
 function chunkArray(array, size) {
@@ -212,7 +209,7 @@ async function fetchLastTransfer(client, fromAddress, toAddress, chainName) {
       let amount = '0';
       let asset = chainName === 'ethereum' ? 'ETH' : chainName === 'bsc' ? 'BNB' : 'MATIC';
 
-      if (transfer.category === 'external') {
+      if (transfer.category === 'external' || transfer.category === 'internal') {
         amount = transfer.value?.toString() || '0';
       } else if (transfer.category === 'erc20') {
         amount = transfer.rawContract?.value || '0';
@@ -327,94 +324,125 @@ async function processTable(tableName, chainId, chainName, client) {
     console.log(`[Info] Found ${campaignIds.length} campaigns for ${chainName}`);
   }
 
-  while (true) {
-    let query = supabaseAdmin
-      .from(tableName)
-      .select(`id, ${fromCol}, ${toCol}`)
-      .is('last_transfer_date', null)
-      .limit(PAGE_SIZE);
+  // 🚀 In update mode: Pass 1 refreshes rows WITH data first (so batch_generate starts immediately)
+  //                   Pass 2 fills rows with NULL data
+  // In normal mode:   Single pass fills NULL rows only
+  const passes = isUpdateMode
+    ? [
+      { label: 'Pass 1: Refreshing existing data', filterNotNull: true, useOffset: true },
+      { label: 'Pass 2: Filling null data', filterNotNull: false, useOffset: true }, // 🚀 FIX: Must use offset to prevent infinite loop on empty rows
+    ]
+    : [
+      { label: 'Backfill null data', filterNotNull: false, useOffset: true }, // 🚀 FIX: Must use offset to prevent infinite loop on empty rows
+    ];
 
-    // Apply correct filter based on table
-    if (tableName === 'pending_targets') {
-      query = query.eq('chain', chainName);
-    } else {
-      // traps table: filter by campaign_ids
-      query = query.in('campaign_id', campaignIds);
-    }
+  for (const pass of passes) {
+    console.log(`\n[${pass.label}] Starting ${tableName} for ${chainName}...`);
+    let offset = 0;
 
-    const { data: records, error } = await query;
+    while (true) {
+      let query = supabaseAdmin
+        .from(tableName)
+        .select(`id, ${fromCol}, ${toCol}`)
+        .order('id');
 
-    if (error) {
-      console.error(`[Error] Failed to fetch ${tableName}: ${error.message}`);
-      break;
-    }
+      if (pass.filterNotNull) {
+        // Only rows that already have transfer data
+        query = query.not('last_transfer_date', 'is', null);
+      } else {
+        // Only rows with no data yet
+        query = query.is('last_transfer_date', null);
+      }
 
-    if (!records || records.length === 0) {
-      console.log(`[Done] No more ${tableName} records to process for ${chainName}`);
-      break;
-    }
+      if (pass.useOffset) {
+        query = query.range(offset, offset + PAGE_SIZE - 1);
+      } else {
+        query = query.limit(PAGE_SIZE);
+      }
 
-    console.log(`\n[Page] Processing ${records.length} ${tableName} records...`);
+      // Apply correct filter based on table
+      if (tableName === 'pending_targets') {
+        query = query.eq('chain', chainName);
+      } else {
+        query = query.in('campaign_id', campaignIds);
+      }
 
-    const chunks = chunkArray(records, RPC_CONCURRENCY);
+      const { data: records, error } = await query;
 
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
+      if (error) {
+        console.error(`[Error] Failed to fetch ${tableName}: ${error.message}`);
+        break;
+      }
 
-      const results = await Promise.all(
-        chunk.map(async (record) => {
-          const fromAddr = record[fromCol];
-          const toAddr = record[toCol];
+      if (!records || records.length === 0) {
+        console.log(`[Done] No more ${tableName} records to process for ${chainName}`);
+        break;
+      }
 
-          if (!fromAddr || !toAddr) {
-            return { record, result: { success: false, error: 'Missing addresses' } };
-          }
+      console.log(`\n[Page] Processing ${records.length} ${tableName} records...`);
 
-          const result = await fetchLastTransfer(client, fromAddr, toAddr, chainName);
-          return { record, result };
-        })
-      );
+      const chunks = chunkArray(records, RPC_CONCURRENCY);
 
-      for (const { record, result } of results) {
-        totalProcessed++;
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
 
-        if (result.success) {
-          if (result.no_transfer) {
-            totalNoTransfer++;
-            await (tableName === 'pending_targets'
-              ? updatePendingTarget(record.id, { last_transfer_date: '1970-01-01T00:00:00.000Z' })
-              : updateTrap(record.id, { last_transfer_date: '1970-01-01T00:00:00.000Z' }));
+        const results = await Promise.all(
+          chunk.map(async (record) => {
+            const fromAddr = record[fromCol];
+            const toAddr = record[toCol];
+
+            if (!fromAddr || !toAddr) {
+              return { record, result: { success: false, error: 'Missing addresses' } };
+            }
+
+            const result = await fetchLastTransfer(client, fromAddr, toAddr, chainName);
+            return { record, result };
+          })
+        );
+
+        for (const { record, result } of results) {
+          totalProcessed++;
+
+          if (result.success) {
+            if (result.no_transfer) {
+              totalNoTransfer++;
+              // No longer stamping 1970. If no transfer is found on-chain, we simply skip updating.
+            } else {
+              totalUpdated++;
+              const updateData = {
+                last_transfer_date: result.last_transfer_date,
+                last_transfer_amount: result.last_transfer_amount,
+                last_transfer_asset: result.last_transfer_asset,
+                last_transfer_block: result.last_transfer_block
+              };
+
+              const success = tableName === 'pending_targets'
+                ? await updatePendingTarget(record.id, updateData)
+                : await updateTrap(record.id, updateData);
+
+              if (!success) totalErrors++;
+            }
           } else {
-            totalUpdated++;
-            const updateData = {
-              last_transfer_date: result.last_transfer_date,
-              last_transfer_amount: result.last_transfer_amount,
-              last_transfer_asset: result.last_transfer_asset,
-              last_transfer_block: result.last_transfer_block
-            };
-
-            const success = tableName === 'pending_targets'
-              ? await updatePendingTarget(record.id, updateData)
-              : await updateTrap(record.id, updateData);
-
-            if (!success) totalErrors++;
+            totalErrors++;
+            if (totalErrors <= 5) {
+              console.warn(`[Error] Failed for ${record.id}: ${result.error}`);
+            }
           }
-        } else {
-          totalErrors++;
-          if (totalErrors <= 5) {
-            console.warn(`[Error] Failed for ${record.id}: ${result.error}`);
-          }
+        }
+
+        process.stdout.write(`  Progress: ${Math.min((i + 1) * RPC_CONCURRENCY, records.length)}/${records.length} | Updated: ${totalUpdated} | No Transfer: ${totalNoTransfer} | Errors: ${totalErrors}\r`);
+
+        if (i < chunks.length - 1) {
+          await new Promise(res => setTimeout(res, RATE_LIMIT_DELAY));
         }
       }
 
-      process.stdout.write(`  Progress: ${Math.min((i + 1) * RPC_CONCURRENCY, records.length)}/${records.length} | Updated: ${totalUpdated} | No Transfer: ${totalNoTransfer} | Errors: ${totalErrors}\r`);
+      console.log(`\n  ✅ Page complete: Updated=${totalUpdated}, No Transfer=${totalNoTransfer}, Errors=${totalErrors}`);
 
-      if (i < chunks.length - 1) {
-        await new Promise(res => setTimeout(res, RATE_LIMIT_DELAY));
+      if (pass.useOffset) {
+        offset += PAGE_SIZE;
       }
     }
-
-    console.log(`\n  ✅ Page complete: Updated=${totalUpdated}, No Transfer=${totalNoTransfer}, Errors=${totalErrors}`);
   }
 
   console.log(`\n[Finished] ${tableName} for ${chainName}:`);

@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { createPublicClient, http, fallback, getAddress, parseAbiItem } from 'viem';
+import { createPublicClient, http, fallback, getAddress } from 'viem';
 import { mainnet, bsc, polygon } from 'viem/chains';
 import { createClient } from '@supabase/supabase-js';
 
@@ -8,716 +8,156 @@ import logger from '../lib/logger.js';
 import { sendAlert, formatAlert } from '../lib/notifier.js';
 import { setupGracefulShutdown, onShutdown } from '../lib/shutdown.js';
 
-// ─── Supabase client ───
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-if (!supabaseUrl || !supabaseKey) {
-  console.error('[analyzer] Missing Supabase credentials. Exiting.');
-  process.exit(1);
-}
+if (!supabaseUrl || !supabaseKey) { console.error('[analyzer] Missing Supabase credentials.'); process.exit(1); }
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// --- MULTI‑CHAIN CONFIG ---
 const chainName = config.chain || 'ethereum';
 const chainCfg = config.getChainConfig ? config.getChainConfig() : null;
-
 const CHAIN_IDS = { ethereum: 1, bsc: 56, polygon: 137 };
 const chainId = chainCfg?.chainId || CHAIN_IDS[chainName] || 1;
 
-logger.info(`[Stage 2 Analyzer] Running for chain: ${chainName} (ID: ${chainId})`);
-
+logger.info(`[Stage 1 Funnel] Running for chain: ${chainName} (ID: ${chainId})`);
 const QUALIFIED_POLL_INTERVAL_MS = parseInt(process.env.QUALIFIED_POLL_INTERVAL_MS || '600000', 10);
-
-const BLOCKS_365_DAYS_MAP = {
-  ethereum: 2628000n,  // 365 days * 24h * 60m * 60s / 12s per block
-  bsc: 10512000n,      // 365 days * 24h * 60m * 60s / 3s per block
-  polygon: 15768000n,  // 365 days * 24h * 60m * 60s / 2s per block
-};
-const BLOCKS_365_DAYS = BLOCKS_365_DAYS_MAP[chainName] || 2628000n;
-
-// ─── Viem RPC Client ───
-const PUBLIC_FALLBACKS = {
-  bsc: [
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_3_Bpj7ORVica5UbSitOXm',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_AMGRdQ1DjpCspfYgaJWk8',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_n0iXFk0U2atdbZFyJw3Vd',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_uG-HMTi_h9uFfpZ0IPtUC',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_Of_5h7lrnjaNskMMN1m_O',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_JXJn_G0u41v-ORLH-PLvm',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_6DY1YYDbhjfaDTRvVlb8E',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_FY7h0VVmtvSHzWHULlBYD',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_e2hNo6urdy-p9K3iCKBRz',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_wT_5s_3jEKZRUHS6-9qlB',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_xo7rkNtpCG3XTTte_34Oe',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_6gTznTT4QnX3_0IE9gkY-',
-    'https://bsc-dataseed.binance.org',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_z1J_ESjjLVZwSBLNoep84',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_-NvhHn24EgwhuMt38pZJr',
-    'https://rpc.ankr.com/bsc',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_8ToIPT9Z3R1iQ55nksx8b',
-    'https://bsc.publicnode.com',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_Qy6hQXdtdVlE7Z4uVxt_A',
-    'https://1rpc.io/bnb',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_rniHI4MxzjBfNZ4bxmDu5',
-    'https://bsc.drpc.org',
-    'https://bnb-mainnet.g.alchemy.com/v2/LW3i2zPypSVe0cl4BxCxI',
-    'https://bnb-mainnet.g.alchemy.com/v2/alch_WQp652MAlfKFbtD1A-zNh'
-  ],
-  polygon: [
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_6bgVHMAQFQbOqC7cHZ5tU',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_e1PIp-UVXQ1jZWINkbmDm',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_n9bFKwbW1lFSXd-CTjFA8',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_VXeIGTUmcC8G4X4a4Lx8e',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_adXxpjamb8lNBSSnH-dZF',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_vUHRCAI2B5z-NVbge5MjR',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_YXuYd2T6nO-_ASx3VyYd8',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_o4lfkzzsAyG0uEFq9cfx0',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_6vT8KHKebKLX2IzQCgHpo',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_C7D8h3Jq99k3QweZHq1Ip',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_1t_00WgSdtEqIYYRY8LdA',
-    'https://polygon-mainnet.g.alchemy.com/v2/CByFU5cCGAYyh8EHLamXD',
-    'https://polygon-rpc.com',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_UdSkrC6LFs2HGS0VUGg5O',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_tAPr1C9JUzQZYax5pslu5',
-    'https://rpc.ankr.com/polygon',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_Bq31mnvxmjdT70RCYLGLA',
-    'https://polygon.llamarpc.com',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_17XYrB1qagYO9Edwxj7Cw',
-    'https://polygon.publicnode.com',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_UQzY-saHkZZrowH7kylTu',
-    'https://1rpc.io/polygon',
-    'https://polygon-mainnet.g.alchemy.com/v2/c6MIVgnVjXC0kgDH4BItE',
-    'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11'
-  ],
-  ethereum: [
-    'https://eth-mainnet.g.alchemy.com/v2/alch_3smRQUoTzfj_NPiK6451s',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_xp0ppatuXONHI2pClS7_M',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_hmts-IFXko93muF8BaX5Q',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_8fJp6NiVdGxCOljdKCDZi',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_4euFfPOpJDglYNRQYKWhO',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_bjwK80RPIzP774OVkp-vE',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_LcoDsDwyyl7fbYUvffKYC',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_btTtYZmxG7VfNjY_jZIJr',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_IP1SsCj0wqzZqrvhH_Rv5',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_1O0yoHMsrXCOe3lOHu7dc',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_w2NDE7Pilr5cpIPb51Wsx',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_F5VimAPoBoESKZ566us-U',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_0hEit_izstW7cL9Gyz_T_',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_A0-PobPGMyEAZ31xva35A',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_D_FWof7AulPvkFHZnDlFn',
-    'https://ethereum.publicnode.com',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_x_oSlpf2bnfc6brp-BgzA',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_tp8k4HI9tVpUEBmsF3kXc',
-    'https://rpc.ankr.com/eth',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_7viyR-7wWLgc2i9suQ6hS',
-    'https://eth.llamarpc.com',
-    'https://eth-mainnet.g.alchemy.com/v2/ig-ZUQrtw2shXhW2NuT6W',
-    'https://1rpc.io/eth',
-    'https://eth-mainnet.g.alchemy.com/v2/alch_dFm-5A7LhWtYU3_4Y103o',
-    'https://eth.drpc.org',
-    'https://eth-mainnet.g.alchemy.com/v2/gODtbeuBQLkTJAm3e9tB1',
-    'https://eth-mainnet.g.alchemy.com/v2/GsO461DZvmNGh4O4Ss5Et'
-  ],
-};
-
-const viemChainMap = { ethereum: mainnet, bsc, polygon };
-const rpcUrls = PUBLIC_FALLBACKS[chainName] || PUBLIC_FALLBACKS.ethereum;
-
-const client = createPublicClient({
-  chain: viemChainMap[chainName] || mainnet,
-  transport: fallback(rpcUrls.map(url => http(url, { timeout: 15000 })), { rank: false }),
-});
-
-const transferEvent = parseAbiItem(
-  'event Transfer(address indexed from, address indexed to, uint256 value)'
-);
-
-const ONCHAIN_LOOKBACK_BLOCKS = {
-  ethereum: 7200n,
-  bsc: 10000n,
-  polygon: 10000n,
-};
-const LOOKBACK = ONCHAIN_LOOKBACK_BLOCKS[chainName] || 7200n;
-
-// ─── Stage 1 Constants ───
-const MIN_GAS_RESERVE_WEI = 2000000000000000n;
-const MAX_NONCE_LIMIT = 1000;
-const BOT_SCORE_THRESHOLD = 0.6;
 
 let isFetching = false;
 
-// ─── UTILITIES ───
 async function safeSendAlert(message) {
-  try {
-    await sendAlert(message);
-  } catch (err) {
-    logger.warn(`[Notifier] Failed to send Telegram alert: ${err.message}`);
-  }
+  try { await sendAlert(message); } catch (err) { logger.warn(`[Notifier] Failed: ${err.message}`); }
 }
 
 async function withRetry(fn, context, maxAttempts = 3, baseDelay = 1000) {
   let lastError;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try { return await fn(); }
-    catch (error) {
+    try { return await fn(); } catch (error) {
       lastError = error;
-      if (attempt < maxAttempts) {
-        const delay = baseDelay * Math.pow(2, attempt - 1);
-        logger.warn(`[${context}] Attempt ${attempt} failed: ${error.message}`);
-        await new Promise(resolve => setTimeout(resolve, delay));
-      } else break;
+      if (attempt < maxAttempts) { await new Promise(resolve => setTimeout(resolve, baseDelay * Math.pow(2, attempt - 1))); } else break;
     }
   }
   throw lastError;
 }
 
-async function promiseAllLimit(tasks, limit = 5) {
-  const results = [];
-  for (let i = 0; i < tasks.length; i += limit) {
-    results.push(...await Promise.all(tasks.slice(i, i + limit)));
-  }
-  return results;
-}
-
-// ─── STAGE 1: On-chain state checks ───
-async function passesStageOne(address) {
-  try {
-    const checksumAddr = getAddress(address);
-    const [code, nonce, balance] = await Promise.all([
-      client.getBytecode({ address: checksumAddr }),
-      client.getTransactionCount({ address: checksumAddr }),
-      client.getBalance({ address: checksumAddr }),
-    ]);
-
-    if (code && code !== '0x') return { pass: false, reason: 'is_contract' };
-    if (nonce >= MAX_NONCE_LIMIT) return { pass: false, reason: `high_nonce(${nonce})` };
-    if (balance < MIN_GAS_RESERVE_WEI) return { pass: false, reason: 'low_balance' };
-
-    return { pass: true, reason: 'eoa_ok' };
-  } catch (err) {
-    return { pass: true, reason: 'rpc_fail_stage1' };
-  }
-}
-
-// ─── STAGE 2: BEHAVIORAL ANALYZER WITH TTL CACHE ───
-const MAX_ANALYZED_CACHE = 10000;
-const ANALYZED_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
-const ANALYZED_CACHE = new Map();
-
-function setAnalyzedCache(key, passes) {
-  if (ANALYZED_CACHE.has(key)) {
-    ANALYZED_CACHE.delete(key);
-  } else if (ANALYZED_CACHE.size >= MAX_ANALYZED_CACHE) {
-    const oldest = ANALYZED_CACHE.keys().next().value;
-    ANALYZED_CACHE.delete(oldest);
-  }
-  ANALYZED_CACHE.set(key, { passes, expiresAt: Date.now() + ANALYZED_CACHE_TTL_MS });
-}
-
-async function passesBehavioralHeuristics(victimAddress) {
-  const cacheKey = victimAddress.toLowerCase();
-
-  const cached = ANALYZED_CACHE.get(cacheKey);
-  if (cached && Date.now() < cached.expiresAt) {
-    return cached.passes;
-  }
-
-  try {
-    const stage1 = await passesStageOne(victimAddress);
-    if (!stage1.pass) {
-      logger.debug(`[Analyzer] Stage 1 rejected ${cacheKey}: ${stage1.reason}`);
-      setAnalyzedCache(cacheKey, false);
-      return false;
-    }
-
-    logger.debug(`[Analyzer] Stage 1 passed ${cacheKey}, running behavioral analysis...`);
-
-    const checksumAddr = getAddress(victimAddress);
-
-    const { data: dbTxs, error: dbErr } = await supabase
-      .from('token_transfers')
-      .select('block_timestamp, receiver, block_number')
-      .eq('sender', cacheKey)
-      .eq('chain_id', chainId)
-      .order('block_timestamp', { ascending: true })
-      .limit(50);
-
-    const dbRows = (!dbErr && dbTxs) ? dbTxs : [];
-
-    let onChainLogs = [];
-    try {
-      const currentBlock = await client.getBlockNumber();
-      const fromBlock = currentBlock > LOOKBACK ? currentBlock - LOOKBACK : 0n;
-
-      const getLogsPromise = client.getLogs({
-        event: transferEvent,
-        args: { from: checksumAddr },
-        fromBlock,
-        toBlock: currentBlock,
-      });
-
-      const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error('getLogs timeout')), 10000);
-      });
-
-      onChainLogs = await Promise.race([getLogsPromise, timeoutPromise]);
-    } catch (logErr) {
-      logger.debug(`[Analyzer] getLogs failed for ${cacheKey}: ${logErr.message}. Using DB data only.`);
-      onChainLogs = [];
-    }
-
-    const allTimestamps = [];
-
-    for (const tx of dbRows) {
-      if (tx.block_timestamp) {
-        allTimestamps.push(new Date(tx.block_timestamp).getTime());
-      }
-    }
-
-    const onChainBlockSet = new Set(onChainLogs.map(l => Number(l.blockNumber)));
-    const onChainBlockNumbers = [...onChainBlockSet].sort((a, b) => a - b);
-
-    const blockTimeMs = chainName === 'ethereum' ? 12000 : chainName === 'bsc' ? 3000 : 2000;
-    const now = Date.now();
-    let currentBlockNum = 0;
-    try {
-      currentBlockNum = Number(await client.getBlockNumber());
-    } catch {
-      currentBlockNum = 0;
-    }
-
-    for (const bn of onChainBlockNumbers) {
-      const blocksAgo = currentBlockNum - bn;
-      const approxTime = now - (blocksAgo * blockTimeMs);
-      allTimestamps.push(approxTime);
-    }
-
-    allTimestamps.sort((a, b) => a - b);
-
-    if (allTimestamps.length < 5) {
-      setAnalyzedCache(cacheKey, true);
-      return true;
-    }
-
-    const intervals = [];
-    let zeroGapCount = 0;
-    let totalIntervalCount = 0;
-    let minInterval = Infinity;
-    let rapidCount = 0;
-    let rapidBurstCount = 0;
-
-    for (let i = 1; i < allTimestamps.length; i++) {
-      const gapMs = allTimestamps[i] - allTimestamps[i - 1];
-      const gapSeconds = gapMs / 1000;
-      totalIntervalCount++;
-
-      if (gapSeconds > 0 && gapSeconds < minInterval) minInterval = gapSeconds;
-      if (gapSeconds < 180) rapidCount++;
-      if (gapSeconds < 30) rapidBurstCount++;
-
-      if (gapMs > 30000) {
-        intervals.push(gapMs);
-      } else {
-        zeroGapCount++;
-      }
-    }
-
-    const zeroGapRatio = totalIntervalCount > 0 ? zeroGapCount / totalIntervalCount : 0;
-    const rapidRatio = totalIntervalCount > 0 ? rapidCount / totalIntervalCount : 0;
-
-    const blockCounts = new Map();
-    for (const log of onChainLogs) {
-      const bn = Number(log.blockNumber);
-      blockCounts.set(bn, (blockCounts.get(bn) || 0) + 1);
-    }
-
-    const blockCountsValues = [...blockCounts.values()];
-    const maxBatchSize = blockCountsValues.length > 0 ? Math.max(...blockCountsValues) : 0;
-    const batchBlockCount = blockCountsValues.filter(c => c >= 3).length;
-
-    const dbBlockCounts = new Map();
-    for (const row of dbRows) {
-      if (row.block_number) {
-        const bn = Number(row.block_number);
-        dbBlockCounts.set(bn, (dbBlockCounts.get(bn) || 0) + 1);
-      }
-    }
-    const dbMaxBatch = dbBlockCounts.size > 0 ? Math.max(...dbBlockCounts.values()) : 0;
-
-    const effectiveMaxBatch = Math.max(maxBatchSize, dbMaxBatch);
-
-    let maxBlockStreak = 0;
-    let currentStreak = 0;
-    for (let i = 1; i < onChainBlockNumbers.length; i++) {
-      const diff = onChainBlockNumbers[i] - onChainBlockNumbers[i - 1];
-      if (diff >= 1 && diff <= 2) {
-        currentStreak++;
-        if (currentStreak > maxBlockStreak) maxBlockStreak = currentStreak;
-      } else {
-        currentStreak = 0;
-      }
-    }
-
-    const spanMs = allTimestamps.length >= 2
-      ? allTimestamps[allTimestamps.length - 1] - allTimestamps[0]
-      : 0;
-    const spanDays = spanMs / (1000 * 60 * 60 * 24);
-
-    const hours = new Set();
-    for (const ts of allTimestamps) {
-      hours.add(new Date(ts).getUTCHours());
-    }
-    const hourCoverage = hours.size / 24;
-
-    const avgInterval = intervals.length > 0
-      ? intervals.reduce((a, b) => a + b, 0) / intervals.length / 1000
-      : 0;
-
-    const variance = intervals.length > 0
-      ? intervals.reduce((acc, v) => acc + Math.pow(v / 1000 - avgInterval, 2), 0) / intervals.length
-      : 0;
-    const cv = avgInterval === 0 ? 0 : Math.sqrt(variance) / avgInterval;
-
-    const dbReceivers = new Set(dbRows.map(t => (t.receiver || '').toLowerCase()));
-    const onChainReceivers = new Set(onChainLogs.map(l => l.args.to.toLowerCase()));
-    const allUniqueReceivers = new Set([...dbReceivers, ...onChainReceivers]);
-    const receiverCount = allUniqueReceivers.size;
-
-    const totalActivity = allTimestamps.length;
-    const transfersPerDay = spanDays > 0.001 ? totalActivity / spanDays : 0;
-
-    let score = 0;
-    const signals = [];
-
-    if (effectiveMaxBatch >= 3) {
-      score += 0.65;
-      signals.push(`extreme_batch(max=${effectiveMaxBatch})`);
-    } else if (effectiveMaxBatch === 2) {
-      score += 0.35;
-      signals.push(`batch(max=${effectiveMaxBatch})`);
-    }
-
-    if (batchBlockCount >= 3) {
-      score += 0.25;
-      signals.push(`sustained_batch(${batchBlockCount}blocks)`);
-    }
-
-    if (maxBlockStreak >= 3) {
-      score += 0.65;
-      signals.push(`extreme_block_streak(${maxBlockStreak})`);
-    } else if (maxBlockStreak >= 2) {
-      score += 0.40;
-      signals.push(`block_streak(${maxBlockStreak})`);
-    }
-
-    if (hourCoverage > 0.75 && spanDays < 30) {
-      score += 0.30;
-      signals.push(`24/7(${hours.size}h/${spanDays.toFixed(0)}d)`);
-    }
-
-    if (avgInterval < 300 && cv < 0.45 && intervals.length >= 5) {
-      score += 0.35;
-      signals.push(`robotic(avg=${avgInterval.toFixed(0)}s,cv=${cv.toFixed(2)})`);
-    }
-
-    if (receiverCount === 1) {
-      const humanLike = spanDays > 90;
-      if (humanLike) {
-        score += 0.10;
-        signals.push(`single_recv_humanlike(${spanDays.toFixed(0)}d)`);
-      } else if (totalActivity >= 30) {
-        score += 0.60;
-        signals.push(`single_recv_sweeper(${totalActivity}tx)`);
-      } else {
-        score += 0.50;
-        signals.push(`single_recv(${totalActivity}tx)`);
-      }
-    } else if (receiverCount <= 2) {
-      score += 0.20;
-      signals.push(`low_div(${receiverCount})`);
-    }
-
-    if (avgInterval < 60 && avgInterval > 0) {
-      score += 0.25;
-      signals.push(`rapid(${avgInterval.toFixed(0)}s)`);
-    }
-
-    if (zeroGapRatio > 0.40) {
-      score += 0.20;
-      signals.push(`zero_gap(${(zeroGapRatio * 100).toFixed(0)}%)`);
-    }
-
-    if (spanDays <= 4 && totalActivity >= 60) {
-      score += 0.55;
-      signals.push(`high_density(${totalActivity}tx/${spanDays.toFixed(1)}d)`);
-    } else if (spanDays <= 7 && totalActivity >= 30) {
-      score += 0.35;
-      signals.push(`dense(${totalActivity}tx/${spanDays.toFixed(1)}d)`);
-    }
-
-    if (totalActivity >= 30 && transfersPerDay >= 15) {
-      score += 0.60;
-      signals.push(`high_daily_vol(${transfersPerDay.toFixed(0)}/day)`);
-    } else if (totalActivity >= 20 && transfersPerDay >= 8) {
-      score += 0.40;
-      signals.push(`daily_vol(${transfersPerDay.toFixed(0)}/day)`);
-    }
-
-    if (totalIntervalCount > 10 && rapidRatio > 0.50) {
-      score += 0.50;
-      signals.push(`mostly_rapid(${(rapidRatio * 100).toFixed(0)}%)`);
-    }
-
-    if (rapidBurstCount >= 10) {
-      score += 0.40;
-      signals.push(`rapid_bursts(${rapidBurstCount}x)`);
-    }
-
-    if (receiverCount > 10 && spanDays > 30) {
-      score -= 0.40;
-      signals.push(`human_diversity(${receiverCount} contracts)`);
-    }
-
-    score = Math.max(0, Math.min(score, 1.0));
-    const isHuman = score < BOT_SCORE_THRESHOLD;
-
-    if (!isHuman) {
-      logger.debug(`[Analyzer] Bot detected ${cacheKey}: score=${score.toFixed(2)}, signals=[${signals.join(', ')}]`);
-    }
-
-    setAnalyzedCache(cacheKey, isHuman);
-    return isHuman;
-
-  } catch (err) {
-    logger.error(`[Analyzer] Error analyzing ${victimAddress}: ${err.message}`);
-    setAnalyzedCache(cacheKey, true);
-    return true;
-  }
-}
-
-// ─── MAIN EXECUTION ───
 async function fetchPendingTargets() {
-  if (isFetching) {
-    logger.warn('Stage 2 analysis still running from previous interval. Skipping.');
-    return;
-  }
+  if (isFetching) return;
   isFetching = true;
 
   try {
-    logger.info('Fetching qualified pairs and running Stage 1 + Stage 2 heuristics...');
+    logger.info('Fetching unique senders from token_transfers...');
 
-    const maxBlockData = await withRetry(async () => {
-      const { data, error } = await supabase
-        .from('token_transfers')
-        .select('block_number')
-        .eq('chain_id', chainId)
-        .order('block_number', { ascending: false })
-        .limit(1);
-      if (error) throw error;
-      return data;
-    }, 'GetMaxBlock');
-
-    if (!maxBlockData || maxBlockData.length === 0) {
-      logger.info('No transfers found in database for this chain yet.');
-      return;
-    }
-
-    const maxBlockBigInt = BigInt(maxBlockData[0].block_number);
-    const thresholdBlock = Math.max(0, Number(maxBlockBigInt - BLOCKS_365_DAYS));
-
-    logger.info(`Threshold block for 365-day window: ${thresholdBlock} (max block: ${maxBlockData[0].block_number})`);
-
-    const BATCH_SIZE = 100;
-    let totalInserted = 0;
-    let totalFiltered = 0;
-    let totalDeleted = 0;
-    let pageCount = 0;
+    // Fetch ALL rows using cursor pagination to avoid OFFSET timeouts
+    const PAGE_SIZE = 1000;
+    let allRows = [];
+    let cursorBlock = null;
+    let fetchPage = 0;
 
     while (true) {
-      pageCount++;
-
-      // ─── Call the optimized SQL function directly ───
-      // This enforces the freq >= 2 rule and does the heavy lifting in Postgres.
-      const rows = await withRetry(async () => {
-        const { data, error } = await supabase.rpc('fetch_pending_targets', {
-          chain_id_param: chainId,
-          threshold_block: thresholdBlock.toString(),
-          offset_val: 0,
-          limit_val: BATCH_SIZE
-        });
+      fetchPage++;
+      const pageData = await withRetry(async () => {
+        let query = supabase.from('token_transfers').select('sender, receiver, block_number').eq('chain_id', chainId).order('block_number', { ascending: false }).limit(PAGE_SIZE);
+        if (cursorBlock !== null) query = query.lt('block_number', cursorBlock);
+        const { data, error } = await query;
         if (error) throw error;
         return data || [];
-      }, `FetchRPC_page_${pageCount}`);
+      }, `FetchPage_${fetchPage}`);
 
-      if (!rows || rows.length === 0) {
-        logger.info(`No more transfers to process. Completed ${pageCount - 1} pages.`);
-        break;
-      }
+      if (!pageData || pageData.length === 0) break;
+      allRows = allRows.concat(pageData);
+      if (allRows.length % 10000 === 0) logger.info(`  └─ Fetched ${allRows.length} rows...`);
+      cursorBlock = pageData[pageData.length - 1].block_number;
+      if (pageData.length < PAGE_SIZE) break;
+    }
 
-      logger.info(`Page ${pageCount}: Fetched ${rawRows.length} raw rows → ${rows.length} unique pairs. Running analysis...`);
+    if (allRows.length === 0) { logger.info('No transfers found.'); return; }
+    logger.info(`Fetched ${allRows.length} total rows. Extracting unique senders...`);
 
-      const TIMEOUT_MS = 90000;
-
-      const evaluationResults = await promiseAllLimit(
-        rows.map(async (row, index) => {
-          const sender = row.sender;
-
-          try {
-            logger.info(`[Analyzer] Processing ${index + 1}/${rows.length}: ${sender}`);
-
-            const timeoutPromise = new Promise((_, reject) => {
-              setTimeout(() => reject(new Error('Analysis timeout')), TIMEOUT_MS);
-            });
-
-            const isHuman = await Promise.race([
-              passesBehavioralHeuristics(sender),
-              timeoutPromise
-            ]);
-
-            if (!isHuman) {
-              logger.debug(`[Analyzer] Rejected bot: ${sender}`);
-              return null;
-            }
-
-            return {
-              chain: chainName,
-              counterparty: row.receiver,
-              victim: sender,
-              last_transfer_block: row.last_block, // 🚀 Matches the SQL function return column
-              processed: false,
-            };
-          } catch (error) {
-            logger.warn(`[Analyzer] Failed to analyze ${sender}: ${error.message}`);
-            return {
-              chain: chainName,
-              counterparty: row.receiver,
-              victim: sender,
-              last_transfer_block: row.last_block, // 🚀 Matches the SQL function return column
-              processed: false,
-            };
-          }
-        }),
-        10
-      );
-
-      const insertData = evaluationResults.filter(r => r !== null);
-      const filteredCount = rows.length - insertData.length;
-      totalFiltered += filteredCount;
-
-      // 1. Insert human targets into pending_targets
-      if (insertData.length > 0) {
-        const insertedCount = await withRetry(async () => {
-          const { data, error } = await supabase
-            .from('raw_targets')
-            .upsert(insertData, {
-              onConflict: 'chain,counterparty,victim',
-              ignoreDuplicates: true,
-            })
-            .select();
-          if (error) throw error;
-          return data ? data.length : 0;
-        }, `BulkUpsertTargets_page_${pageCount}`);
-
-        totalInserted += insertedCount;
-        logger.info(`Page ${pageCount}: +${insertedCount} human targets | ${filteredCount} bots filtered`);
-      } else {
-        logger.info(`Page ${pageCount}: All ${rows.length} rejected by heuristics.`);
-      }
-
-      // 2. Delete ALL evaluated senders from token_transfers
-      //    This ensures the next query gets fresh data
-      const evaluatedSenders = [...new Set(rows.map(r => r.sender))];
-
-      if (evaluatedSenders.length > 0) {
-        try {
-          let pageDeleted = 0;
-          const DELETE_CHUNK_SIZE = 50;
-
-          for (let i = 0; i < evaluatedSenders.length; i += DELETE_CHUNK_SIZE) {
-            const chunk = evaluatedSenders.slice(i, i + DELETE_CHUNK_SIZE);
-
-            const { error, count } = await supabase
-              .from('token_transfers')
-              .delete({ count: 'exact' })
-              .eq('chain_id', chainId)
-              .in('sender', chunk);
-
-            if (error) {
-              logger.error(`[Cleanup] Failed to delete senders: ${error.message}`);
-            } else {
-              pageDeleted += count || 0;
-            }
-          }
-
-          totalDeleted += pageDeleted;
-          logger.info(`Page ${pageCount}: Deleted ${pageDeleted} transfer records for ${evaluatedSenders.length} senders`);
-        } catch (deleteError) {
-          logger.error(`[Cleanup] Error deleting from token_transfers: ${deleteError.message}`);
-        }
-      }
-
-      // Progress logging every 10 pages
-      if (pageCount % 10 === 0) {
-        logger.info(`[Progress] Page ${pageCount} | Inserted: ${totalInserted} | Filtered: ${totalFiltered} | Deleted: ${totalDeleted}`);
-      }
-
-      // Safety limit
-      if (pageCount > 10000) {
-        logger.warn('Reached pagination safety limit (10000 pages). Stopping.');
-        break;
+    // Extract unique senders and keep ONE placeholder receiver for the DB schema
+    const uniqueSendersMap = new Map();
+    for (const row of allRows) {
+      const sender = (row.sender || '').toLowerCase();
+      if (!sender) continue;
+      if (!uniqueSendersMap.has(sender)) {
+        uniqueSendersMap.set(sender, {
+          chain: chainName,
+          victim: sender,
+          counterparty: (row.receiver || '').toLowerCase(), // Placeholder
+          last_transfer_block: row.block_number,
+          processed: false
+        });
       }
     }
 
-    // ─── Summary ───
-    const { count: totalCount, error: countError } = await supabase
-      .from('raw_targets')
-      .select('*', { count: 'exact', head: true })
-      .eq('chain', chainName);
+    const insertData = Array.from(uniqueSendersMap.values());
+    const allSenders = Array.from(uniqueSendersMap.keys());
 
-    const totalInDb = countError ? 'Unknown' : totalCount;
+    logger.info(`Found ${insertData.length} unique senders. Pushing to raw_targets...`);
 
-    logger.info(`[Stage 2] Run complete. Added: ${totalInserted} | Filtered: ${totalFiltered} bots | Deleted: ${totalDeleted} records | Total raw: ${totalInDb}`);
+    // ═══════════════════════════════════════════════════════════
+    // 🚀 FIXED: Insert into raw_targets in chunks of 500
+    // This prevents the massive "canceling statement due to statement timeout"
+    // ═══════════════════════════════════════════════════════════
+    if (insertData.length > 0) {
+      logger.info(`Inserting ${insertData.length} unique senders into raw_targets in chunks...`);
+      const INSERT_CHUNK_SIZE = 500;
+      let totalInserted = 0;
 
-    if (totalInserted > 0 || totalFiltered > 0 || totalDeleted > 0) {
-      await safeSendAlert(
-        `📊 [${chainName.toUpperCase()}] Stage 2: +${totalInserted} human targets confirmed, ${totalFiltered} bots filtered, ${totalDeleted} raw transfers cleaned. Total raw: ${totalInDb}`
-      );
+      for (let i = 0; i < insertData.length; i += INSERT_CHUNK_SIZE) {
+        const chunk = insertData.slice(i, i + INSERT_CHUNK_SIZE);
+        try {
+          const { data, error } = await supabase
+            .from('raw_targets')
+            .upsert(chunk, { onConflict: 'chain,counterparty,victim', ignoreDuplicates: true })
+            .select();
+
+          if (error) {
+            logger.error(`[Insert] Chunk ${Math.floor(i / INSERT_CHUNK_SIZE) + 1} failed: ${error.message}`);
+          } else {
+            totalInserted += data ? data.length : 0;
+            if ((Math.floor(i / INSERT_CHUNK_SIZE) + 1) % 10 === 0) {
+              logger.info(`  └─ Insert progress: ${Math.min(i + INSERT_CHUNK_SIZE, insertData.length)} / ${insertData.length}`);
+            }
+          }
+        } catch (e) {
+          logger.error(`[Insert] Chunk ${Math.floor(i / INSERT_CHUNK_SIZE) + 1} threw error: ${e.message}`);
+        }
+      }
+      logger.info(`Finished inserting. Total successful inserts: ${totalInserted}`);
+    }
+
+    // Delete ALL processed senders from token_transfers to advance the queue
+    logger.info(`Deleting ${allSenders.length} senders from token_transfers...`);
+    const DELETE_CHUNK_SIZE = 20;
+    let successfulChunks = 0;
+    for (let i = 0; i < allSenders.length; i += DELETE_CHUNK_SIZE) {
+      const chunk = allSenders.slice(i, i + DELETE_CHUNK_SIZE);
+      const { error } = await supabase.from('token_transfers').delete().eq('chain_id', chainId).in('sender', chunk);
+      if (!error) successfulChunks++;
+
+      // Progress logging every 500 delete chunks (10,000 senders)
+      if (Math.floor(i / DELETE_CHUNK_SIZE) > 0 && Math.floor(i / DELETE_CHUNK_SIZE) % 500 === 0) {
+        logger.info(`  └─ Delete progress: ${Math.min(i + DELETE_CHUNK_SIZE, allSenders.length)} / ${allSenders.length}`);
+      }
+    }
+    logger.info(`Deleted ${successfulChunks} chunks from token_transfers.`);
+
+    if (insertData.length > 0) {
+      await safeSendAlert(`📊 [${chainName.toUpperCase()}] Stage 1: Pushed ${insertData.length} unique senders to raw_targets. Cleaned ${allSenders.length} senders from token_transfers.`);
     }
 
   } catch (error) {
-    logger.error(`[Stage 2] Fatal error: ${error.message}`);
-    await safeSendAlert(formatAlert('error', { source: 'Stage2Analyzer', error: error.message }));
+    logger.error(`[Stage 1] Fatal error: ${error.message}`);
+    await safeSendAlert(formatAlert('error', { source: 'Stage1', error: error.message }));
   } finally {
     isFetching = false;
   }
 }
 
 async function startObserver() {
-  logger.info('Starting Stage 2 Behavioral Analyzer (continuous mode)');
-  logger.info(`Polling interval: ${QUALIFIED_POLL_INTERVAL_MS / 1000}s | Chain: ${chainName} | Lookback: ${LOOKBACK} blocks`);
-
-  try {
-    await fetchPendingTargets();
-  } catch (err) {
-    logger.error(`[Stage 2] Initial fetch failed: ${err.message}. Will retry on next interval.`);
-  }
-
-  setInterval(async () => {
-    try {
-      await fetchPendingTargets();
-    } catch (err) {
-      logger.error(`[Stage 2] Polling error: ${err.message}`);
-    }
-  }, QUALIFIED_POLL_INTERVAL_MS);
+  logger.info('Starting Stage 1 Fast Funnel');
+  try { await fetchPendingTargets(); } catch (err) { }
+  setInterval(async () => { try { await fetchPendingTargets(); } catch (err) { } }, QUALIFIED_POLL_INTERVAL_MS);
 }
 
 setupGracefulShutdown();
-onShutdown(async () => {
-  logger.info('[Stage 2] Analyzer shutting down gracefully.');
-});
-
-startObserver().catch(async (err) => {
-  logger.error(`[Stage 2] Fatal startup error: ${err.message}`);
-  await safeSendAlert(formatAlert('error', { source: 'Stage2Startup', error: err.message }));
-  process.exit(1);
-});
+onShutdown(async () => { logger.info('[Stage 1] Shutting down.'); });
+startObserver().catch(async (err) => { process.exit(1); });
