@@ -507,7 +507,7 @@ def notify_gas_strategy(campaign_id, used_fallback, final_gwei):
         if used_fallback:
             msg = (
                 f"⚠️ *Gas Strategy: Fallback Used*\n\n"
-                f"The network stayed congested for 10 minutes.\n\n"
+                f"The network stayed congested for 90 minutes.\n\n"
                 f"⛽ *Firing at Market Rate:* `{final_gwei:.2f} Gwei`\n\n"
                 f"💡 _This ensures your nonces don't get stuck, but costs slightly more._"
             )
@@ -564,11 +564,11 @@ def get_smart_gas_params(w3, context="[gas-strategy]", campaign_id=None):
             final_max_fee = base_fee + network_tip
             logger.info(f"{context} ✅ Base fee is cheap ({base_fee_gwei:.2f} Gwei). Firing immediately!")
         else:
-            logger.info(f"{context} ⏳ Base fee is {base_fee_gwei:.2f} Gwei. Waiting up to 10 mins for it to drop to <{target_gwei} Gwei...")
+            logger.info(f"{context} ⏳ Base fee is {base_fee_gwei:.2f} Gwei. Waiting up to 90 mins for it to drop to <{target_gwei} Gwei...")
             
             gas_dropped = False
-            for i in range(50): # 50 blocks * 12s = 10 mins
-                time.sleep(12)
+            for i in range(90): # 90 iterations * 60s = 90 mins (1.5 hours)
+                time.sleep(60)
                 
                 try:
                     current_block = call_with_retry(w3.eth.get_block, "latest")
@@ -582,7 +582,7 @@ def get_smart_gas_params(w3, context="[gas-strategy]", campaign_id=None):
                         logger.info(f"{context} ✅ Base fee dropped to {current_gwei:.2f} Gwei! Firing at cheap rate!")
                         break
                     
-                    if i % 5 == 0:
+                    if i % 10 == 0:
                         logger.info(f"{context} ⏳ Still waiting... Current base fee: {current_gwei:.2f} Gwei")
                 except Exception as e:
                     logger.warning(f"{context} Failed to check base fee: {e}")
@@ -596,7 +596,7 @@ def get_smart_gas_params(w3, context="[gas-strategy]", campaign_id=None):
                     final_max_fee = fallback_base_fee + network_tip
                     fallback_gwei = float(w3.from_wei(fallback_base_fee, 'gwei'))
                     final_gwei = fallback_gwei
-                    logger.warning(f"{context} ⚠️ Gas stayed high for 10 mins. Firing at current market rate ({fallback_gwei:.2f} Gwei) to prevent stuck nonces.")
+                    logger.warning(f"{context} ⚠️ Gas stayed high for 90 mins. Firing at current market rate ({fallback_gwei:.2f} Gwei) to prevent stuck nonces.")
                 except Exception as e:
                     final_max_fee = base_fee + network_tip
                     logger.warning(f"{context} ⚠️ Gas check failed. Firing at original base fee.")
