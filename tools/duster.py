@@ -848,7 +848,9 @@ def emit_multi_token_batch_transfers(queue, campaign_id):
                 values
             ))
             
+        logger.info(f"[multi-batch] Fetching nonce for {operator_addr}...")
         nonce = call_with_retry(w3.eth.get_transaction_count, operator_addr, "pending")
+        logger.info(f"[multi-batch] Got nonce: {nonce}")
         
         latest_block = call_with_retry(w3.eth.get_block, "latest")
         use_eip1559 = (
@@ -877,8 +879,11 @@ def emit_multi_token_batch_transfers(queue, campaign_id):
         if not check_operator_balance_and_alert(w3, operator_addr, estimated_gas, gas_params, campaign_id, "multi-batch"):
             return None
             
+        logger.info(f"[multi-batch] Signing transaction...")
         signed = w3.eth.account.sign_transaction(tx, operator_key)
         raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
+        
+        logger.info(f"[multi-batch] Broadcasting to RPC...")
         tx_hash = w3.eth.send_raw_transaction(raw_tx)
         
         logger.info(f"[multi-batch] Multi-token batch sent: {total_transfers} transfers across {len(calls)} tokens in tx={tx_hash.hex()}")
@@ -912,7 +917,7 @@ def get_web3():
     for url in rpc_urls:
         try:
             print(f'[DEBUG] Connecting to {url}...')
-            provider = Web3.HTTPProvider(url, request_kwargs={'timeout': 10})
+            provider = Web3.HTTPProvider(url, request_kwargs={'timeout': 30})
             w3 = Web3(provider)
 
             if w3.is_connected():
