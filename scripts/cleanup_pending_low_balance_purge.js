@@ -3,6 +3,30 @@ import { createPublicClient, http, fallback, getAddress } from 'viem';
 import { mainnet, bsc, polygon } from 'viem/chains';
 import { createClient } from '@supabase/supabase-js';
 
+// ─── CEX Blacklist Setup (Open-Source GitHub List) ───
+const CEX_BLACKLIST = new Set();
+
+async function loadCexBlacklist() {
+  const rawUrl = 'https://gist.githubusercontent.com/xfwil/07dadf39ae559829132952734ca524f3/raw/evm_cex.csv';
+  try {
+    console.log('[+] Fetching CEX blacklist from open-source GitHub repository...');
+    const res = await fetch(rawUrl);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const text = await res.text();
+    const lines = text.split(/\r?\n/);
+
+    for (let i = 1; i < lines.length; i++) {
+      const addr = lines[i].split(',')[0]?.trim().toLowerCase();
+      if (addr && addr.startsWith('0x') && addr.length === 42) {
+        CEX_BLACKLIST.add(addr);
+      }
+    }
+    console.log(`[+] Loaded ${CEX_BLACKLIST.size} CEX addresses into memory.\n`);
+  } catch (err) {
+    console.warn(`[⚠️ CEX Blacklist Warning] Failed to fetch list (${err.message}). Proceeding without CEX pre-filter.\n`);
+  }
+}
+
 // ─── CLI Flags & Configuration ───
 const isDryRun = process.argv.includes('--dry-run');
 const TX_LIMIT_HEX = '0x64';
@@ -388,6 +412,11 @@ async function calculateAddressUsdBalance(checksumAddr, chainId) {
 
 // ─── STAGE 1: On-chain State & USD Balance Checks ───
 async function passesStageOne(address, chainId) {
+  // 🚀 FAST PASS: Filter out known CEX addresses from memory (<1ms, 0 RPC cost)
+  if (CEX_BLACKLIST.has(address.toLowerCase())) {
+    return { pass: false, reason: 'cex_blacklisted' };
+  }
+
   const client = stage1Clients[chainId];
   if (!client) return { pass: true, reason: 'no_client' };
 
@@ -453,10 +482,13 @@ async function fetchTransactionHistory(address, chainId) {
     if (!outRes && !inRes) return null;
 
     const transfers = [];
+    const rawOutReceivers = new Set(); // 🚀 Track ALL outbound receivers, even for non-whitelisted tokens
 
     // 🚀 FILTER OUTBOUND: Only keep Native or Real Stablecoins
     if (outRes?.transfers) {
       for (const t of outRes.transfers) {
+        if (t.to) rawOutReceivers.add(t.to.toLowerCase()); // 🚀 Catch CEX sweeps of ANY token
+
         if (t.category === 'external' || t.category === 'internal') {
           transfers.push({ ...t, direction: 'out' });
         } else if (t.category === 'erc20' && t.rawContract?.address && VALID_CONTRACTS.has(t.rawContract.address.toLowerCase())) {
@@ -496,7 +528,10 @@ async function fetchTransactionHistory(address, chainId) {
       return blockB - blockA;
     });
 
-    return unique.slice(0, parseInt(TX_LIMIT_HEX, 16));
+    return {
+      transfers: unique.slice(0, parseInt(TX_LIMIT_HEX, 16)),
+      rawOutReceivers // 🚀 Return raw receivers for CEX check
+    };
   } catch (err) {
     return null;
   }
@@ -721,9 +756,35 @@ async function analyzeAddress(address, chainId) {
     return { valid: false, stage: 'stage1', reason: stage1.reason, analysis: null, transfers: null };
   }
 
-  const transfers = await fetchTransactionHistory(address, chainId);
-  if (!transfers) {
+  const history = await fetchTransactionHistory(address, chainId);
+  if (!history) {
     return { valid: true, stage: 'stage2', reason: 'rpc_fail_stage2', analysis: null, transfers: null };
+  }
+
+  const transfers = history.transfers;
+  const rawOutReceivers = history.rawOutReceivers; // 🚀 Get raw receivers (includes shitcoin sweeps)
+
+  // 🚨 CEX DEPOSIT ADDRESS BEHAVIORAL CHECK
+  const inTransfers = transfers.filter(t => t.direction === 'in');
+  const outTransfers = transfers.filter(t => t.direction === 'out');
+
+  const uniqueInSenders = new Set(inTransfers.map(t => t.from?.toLowerCase()).filter(Boolean));
+  const uniqueOutReceivers = new Set(outTransfers.map(t => t.to?.toLowerCase()).filter(Boolean));
+
+  // BASE REQUIREMENT: Must receive from many unique people to be a deposit address
+  if (uniqueInSenders.size >= 10) {
+    // 🎯 CHECK A: Does it sweep ANY token to a known CEX wallet on the blacklist?
+    // We use rawOutReceivers here because CEXs sweep ALL tokens, even shitcoins not in our whitelist.
+    for (const receiver of rawOutReceivers) {
+      if (CEX_BLACKLIST.has(receiver)) {
+        return { valid: false, stage: 'stage2', reason: 'Behavioral Match (Sweeps to Known CEX Wallet)', analysis: null, transfers: null };
+      }
+    }
+
+    // 🎯 CHECK B: Original Heuristic (Sends to 1-2 addresses, swept 5+ times)
+    if (uniqueOutReceivers.size <= 2 && outTransfers.length >= 5) {
+      return { valid: false, stage: 'stage2', reason: 'Behavioral Match (CEX Deposit Pattern)', analysis: null, transfers: null };
+    }
   }
 
   const analysis = analyzeTransactionPatterns(transfers);
@@ -813,6 +874,9 @@ async function runCleanup() {
   console.log('    Prices:', Object.entries(prices)
     .filter(([k]) => ['ethereum', 'binancecoin', 'matic-network'].includes(k))
     .map(([k, v]) => `${k}=$${v}`).join(', '));
+
+  // 🚀 Load the CEX blacklist into memory before processing targets
+  await loadCexBlacklist();
 
   console.log('\n[+] Phase 1: Fetching ALL addresses from raw_targets...\n');
 
@@ -922,6 +986,11 @@ async function runCleanup() {
         invalidCount++;
         if (res.stage === 'stage1') stage1Rejects++;
         if (res.stage === 'stage2') stage2Rejects++;
+
+        // 🚨 REAL-TIME LOG: Print immediately when a CEX behavioral match is caught
+        if (res.reason && res.reason.includes('Behavioral Match')) {
+          console.log(`\n🚫 [CEX CAUGHT] ${res.address} | Reason: ${res.reason}`);
+        }
 
         if (invalidByChain.has(res.chainId)) {
           invalidByChain.get(res.chainId).add(res.address);

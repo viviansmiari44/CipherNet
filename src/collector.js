@@ -186,7 +186,7 @@ async function isContractAddress(address) {
 }
 
 // ─── STAGE 1 HEURISTICS CACHE & FUNCTION ───
-const MIN_GAS_RESERVE_WEI = 2000000000000000n; // 0.002 Native Token in Wei
+const MIN_GAS_RESERVE_WEI = 500000000000000n; // 0.0005 Native Token in Wei
 const MAX_STAGE_ONE_CACHE = 50000;
 const STAGE_ONE_CACHE = new Map();
 
@@ -585,7 +585,7 @@ async function startCollector() {
               const tokenMeta = MONITORED_TOKENS[tokenAddress];
               if (!tokenMeta) continue;
 
-              const minTransferValue = getMinTransferValue(tokenMeta.decimals, tokenMeta.symbol, 3000);
+              const minTransferValue = getMinTransferValue(tokenMeta.decimals, tokenMeta.symbol, 200);
               if (log.args.value < minTransferValue) continue;
 
               // Skip mint events (from = 0x0) and burn events (to = 0x0)
