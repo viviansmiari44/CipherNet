@@ -224,8 +224,8 @@ async function auditTraps() {
             }
 
             // 🚀 AUTO-DELETE EVERY 500 FOUND (Only in Live Mode)
-            if (isLiveMode && cexTrapsFound.length >= 500) {
-                console.log(`\n[🧹 AUTO-DELETE TRIGGERED] Reached 500 CEX victims. Deleting batch...`);
+            if (isLiveMode && cexTrapsFound.length >= 3) {
+                console.log(`\n[🧹 AUTO-DELETE TRIGGERED] Reached 3 CEX victims. Deleting batch...`);
                 const deleted = await deleteCexBatch(cexTrapsFound);
                 totalDeletedOverall += deleted;
                 cexTrapsFound.length = 0; // Clear the array for the next batch

