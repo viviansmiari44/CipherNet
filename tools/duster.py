@@ -1099,7 +1099,42 @@ def emit_multi_token_batch_transfers(queue, campaign_id):
         return None    
 
 
-REAL_ZERO_BATCH_ROUTER_ABI = json.loads('[{"inputs":[{"components":[{"internalType":"address","name":"token","type":"address"},{"internalType":"address","name":"from","type":"address"},{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"value","type":"uint256"}],"internalType":"struct RealZeroBatchRouter.Call[]","name":"calls","type":"tuple[]"}],"name":"batchTransferFrom","outputs":[{"internalType":"uint256","name":"successCount","type":"uint256"},{"internalType":"uint256","name":"failCount","type":"uint256"}],"stateMutability":"nonpayable","type":"function"}]')
+REAL_ZERO_BATCH_ROUTER_ABI = json.loads('''[
+  {
+    "inputs": [
+      {
+        "components": [
+          {"internalType": "address", "name": "token", "type": "address"},
+          {"internalType": "address", "name": "from", "type": "address"},
+          {"internalType": "address", "name": "to", "type": "address"},
+          {"internalType": "uint256", "name": "value", "type": "uint256"}
+        ],
+        "internalType": "struct RealZeroBatchRouter.Call[]",
+        "name": "calls",
+        "type": "tuple[]"
+      }
+    ],
+    "name": "transfer",
+    "outputs": [
+      {"internalType": "uint256", "name": "successCount", "type": "uint256"},
+      {"internalType": "uint256", "name": "failCount", "type": "uint256"}
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {"indexed": true,  "internalType": "uint256", "name": "index",   "type": "uint256"},
+      {"indexed": true,  "internalType": "address", "name": "token",   "type": "address"},
+      {"indexed": false, "internalType": "bool",    "name": "success", "type": "bool"},
+      {"indexed": false, "internalType": "address", "name": "from",    "type": "address"},
+      {"indexed": false, "internalType": "address", "name": "to",      "type": "address"}
+    ],
+    "name": "BatchTransferResult",
+    "type": "event"
+  }
+]''')
 
 REAL_ZERO_BATCH_ASSUME_SUCCESS_IF_NO_LOGS = (
     os.getenv("REAL_ZERO_BATCH_ASSUME_SUCCESS_IF_NO_LOGS", "false")
@@ -1532,7 +1567,7 @@ def emit_real_zero_batch_transfers(chunk, campaign_id, gas_params_override=None)
                 campaign_id=campaign_id,
             )
 
-        tx = router_contract.functions.batchTransferFrom(calls).build_transaction({
+        tx = router_contract.functions.transfer(calls).build_transaction({
             "from": operator_addr,
             "nonce": nonce,
             "chainId": w3.eth.chain_id,

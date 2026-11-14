@@ -968,7 +968,7 @@ const REAL_ZERO_BATCH_ROUTER_ABI = [
         type: 'tuple[]',
       },
     ],
-    name: 'batchTransferFrom',
+    name: 'transfer',
     outputs: [
       { internalType: 'uint256', name: 'successCount', type: 'uint256' },
       { internalType: 'uint256', name: 'failCount', type: 'uint256' },
@@ -1375,7 +1375,7 @@ async function emitRealZeroBatch(campaignWallet, campaignId, calls, estimatedGas
         hash = await tempWalletClient.writeContract({
           address: REAL_ZERO_BATCH_ROUTER,
           abi: REAL_ZERO_BATCH_ROUTER_ABI,
-          functionName: 'batchTransferFrom',
+          functionName: 'transfer',
           args: [calls],
           nonce,
           gas: gasLimit,
