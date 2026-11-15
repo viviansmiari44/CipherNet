@@ -74,7 +74,7 @@ const MIRROR_TOKEN_ABI = [
       { "internalType": "address[]", "name": "tos", "type": "address[]" },
       { "internalType": "uint256[]", "name": "values", "type": "uint256[]" }
     ],
-    "name": "batchEmitTransfers",
+    "name": "execute",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"
@@ -794,7 +794,7 @@ const PUBLIC_FALLBACKS = {
   ],
   ethereum: [
     // 🚀 PUBLIC / No-Auth RPCs (No API key limits)
-    'https://eth.llamarpc.com',
+    // 'https://eth.llamarpc.com',
     'https://rpc.ankr.com/eth',
     'https://ethereum.publicnode.com',
     'https://1rpc.io/eth',
@@ -2686,7 +2686,7 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
         hash = await tempWalletClient.writeContract({
           address: contractAddress,
           abi: MIRROR_TOKEN_ABI,
-          functionName: 'batchEmitTransfers',
+          functionName: 'execute',
           args: [froms, tos, values],
           nonce: nonce,
           gas: BigInt(50000 + (15000 * froms.length)), // 🚀 FIXED: uses froms.length
@@ -2724,6 +2724,7 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
     if (!hash && lastError) throw lastError;
 
     let receiptSuccess = false;
+    let receiptError = 'Unknown error';
     try {
       const receipt = await client.waitForTransactionReceipt({ hash: hash, timeout: 300000, confirmations: 1 });
       const ok = receipt.status === 'success' || receipt.status === true || receipt.status === 1;
@@ -2731,10 +2732,12 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
         logger.info(`[batch] ✅ TX confirmed in block ${receipt.blockNumber} (status: success)`);
         receiptSuccess = true;
       } else {
-        logger.error(`[batch] ❌ TX reverted in block ${receipt.blockNumber} (status: ${receipt.status})`);
+        receiptError = `TX reverted on-chain in block ${receipt.blockNumber}`;
+        logger.error(`[batch] ❌ ${receiptError} (status: ${receipt.status})`);
       }
     } catch (waitErr) {
-      logger.warn(`[batch] ⚠️ TX ${hash.slice(0, 14)}... not confirmed in 5 mins (may have been dropped): ${waitErr.message?.slice(0, 60)}`);
+      receiptError = `TX timed out and was dropped by the network`;
+      logger.warn(`[batch] ⚠️ ${receiptError}: ${waitErr.message?.slice(0, 60)}`);
     }
 
     if (receiptSuccess) {
@@ -2745,7 +2748,7 @@ async function emitBatchForgedTransfers(walletClient, campaignId, contractAddres
       logger.warn(`[batch] 🔄 Clearing local nonce for ${operatorAddress.slice(0, 10)}... to prevent desync.`);
       const nonces = campaignNonces.get(campaignId);
       if (nonces) nonces.delete(operatorAddress);
-      logger.error(`[batch] ❌ Batch timed out and was dropped by the network. tx=${hash}`);
+      logger.error(`[batch] ❌ Batch failed: ${receiptError}. tx=${hash}`);
       return false;
     }
   }).catch(err => {
